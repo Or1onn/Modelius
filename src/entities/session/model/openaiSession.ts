@@ -1,7 +1,10 @@
-// openaiSession.ts — stored ChatGPT (Codex) OAuth session: read/refresh/clear the
-// token and report connection state. The login *flow* lives in features/connect-openai.
+// openaiSession.ts — stored ChatGPT (Codex) OAuth: access + refresh tokens in the OS
+// keychain (separate entries to stay under the Windows Credential Manager blob limit),
+// non-secret presence meta (expiresAt/accountId/hasRefresh) in localStorage so connection
+// checks stay sync. Login flow lives in features/connect-openai.
 import { invoke } from "@tauri-apps/api/core";
 import { clearModelCache } from "@/shared/lib/modelCache";
+import { secretGet, secretSet, secretDelete } from "@/shared/api/secrets";
 
 // OAuth client/flow constants — shared with the connect feature.
 export const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -9,7 +12,9 @@ export const AUTH_URL = "https://auth.openai.com/oauth/authorize";
 export const REDIRECT_URI = "http://localhost:1455/auth/callback";
 export const SCOPES = "openid profile email offline_access";
 
-const TOKEN_KEY = "orchestro.openai.oauth";
+const ACCESS_KEY = "orchestro.openai.access";
+const REFRESH_KEY = "orchestro.openai.refresh";
+const META_KEY = "orchestro.oauthmeta.openai"; // localStorage: non-secret presence + accountId
 export const OPENAI_OAUTH_EVT = "orchestro-openai-oauth-changed";
 
 export interface OpenAIToken {
@@ -26,26 +31,55 @@ export interface TokenResponse {
   expires_in?: number;
 }
 
-function read(): OpenAIToken | null {
+interface OAuthMeta {
+  expiresAt?: number;
+  accountId: string;
+  hasRefresh: boolean;
+}
+
+function readMeta(): OAuthMeta | null {
   try {
-    const raw = localStorage.getItem(TOKEN_KEY);
-    return raw ? (JSON.parse(raw) as OpenAIToken) : null;
+    const raw = localStorage.getItem(META_KEY);
+    return raw ? (JSON.parse(raw) as OAuthMeta) : null;
   } catch {
     return null;
   }
 }
 
-function write(token: OpenAIToken | null): void {
-  try {
-    if (token) localStorage.setItem(TOKEN_KEY, JSON.stringify(token));
-    else localStorage.removeItem(TOKEN_KEY);
-  } catch {
-    /* ignore */
+async function read(): Promise<OpenAIToken | null> {
+  const accessToken = await secretGet(ACCESS_KEY);
+  if (!accessToken) return null;
+  const refreshToken = (await secretGet(REFRESH_KEY)) ?? undefined;
+  const meta = readMeta();
+  return { accessToken, refreshToken, accountId: meta?.accountId ?? "", expiresAt: meta?.expiresAt };
+}
+
+async function write(token: OpenAIToken | null): Promise<void> {
+  if (token) {
+    await secretSet(ACCESS_KEY, token.accessToken);
+    if (token.refreshToken) await secretSet(REFRESH_KEY, token.refreshToken);
+    else await secretDelete(REFRESH_KEY);
+    try {
+      localStorage.setItem(
+        META_KEY,
+        JSON.stringify({ expiresAt: token.expiresAt, accountId: token.accountId, hasRefresh: !!token.refreshToken })
+      );
+    } catch {
+      /* ignore */
+    }
+  } else {
+    await secretDelete(ACCESS_KEY);
+    await secretDelete(REFRESH_KEY);
+    try {
+      localStorage.removeItem(META_KEY);
+    } catch {
+      /* ignore */
+    }
   }
   window.dispatchEvent(new Event(OPENAI_OAUTH_EVT));
 }
 
-// Pull the ChatGPT account id out of the id_token JWT claims.
+// ChatGPT account id from the id_token JWT claims.
 function accountIdFromIdToken(idToken?: string): string {
   if (!idToken) return "";
   try {
@@ -66,24 +100,22 @@ function fromResponse(data: TokenResponse, prev?: OpenAIToken): OpenAIToken {
   };
 }
 
-// Persist a freshly exchanged token — used by the connect flow after login.
-export function saveOpenAIToken(data: TokenResponse): void {
-  write(fromResponse(data));
+// Persist a freshly exchanged token (connect flow, post-login).
+export async function saveOpenAIToken(data: TokenResponse): Promise<void> {
+  await write(fromResponse(data));
 }
 
-// A stored token counts as connected only if it's still usable: renewable via a
-// refresh token, or not yet past its expiry. An expired token with no refresh is
-// a dead session and must read as disconnected.
+// Sync presence from non-secret meta: usable if it has a refresh token or isn't expired.
 export function hasOpenAIOAuth(): boolean {
-  const token = read();
-  if (!token) return false;
-  if (token.refreshToken) return true;
-  if (token.expiresAt === undefined) return true;
-  return Date.now() < token.expiresAt;
+  const meta = readMeta();
+  if (!meta) return false;
+  if (meta.hasRefresh) return true;
+  if (meta.expiresAt === undefined) return true;
+  return Date.now() < meta.expiresAt;
 }
 
-export function disconnectOpenAIOAuth(): void {
-  write(null);
+export async function disconnectOpenAIOAuth(): Promise<void> {
+  await write(null);
   clearModelCache();
 }
 
@@ -99,25 +131,25 @@ async function refresh(token: OpenAIToken): Promise<OpenAIToken | null> {
       },
     });
     const next = fromResponse(data, token);
-    write(next);
+    await write(next);
     return next;
   } catch {
     return null;
   }
 }
 
-// Returns the usable access token + account id, refreshing first if near-expiry.
+// Usable access token + account id, refreshing first if near-expiry.
 export async function getOpenAIAuth(): Promise<{ token: string; accountId: string } | null> {
-  let token = read();
+  const token = await read();
   if (!token) return null;
   const expiringSoon = token.expiresAt !== undefined && Date.now() + 60_000 >= token.expiresAt;
   if (expiringSoon) {
     const refreshed = await refresh(token);
     if (!refreshed) {
-      write(null); // refresh failed → session is dead; drop it so the UI flips to disconnected
+      await write(null); // refresh failed → drop so UI flips to disconnected
       return null;
     }
-    token = refreshed;
+    return { token: refreshed.accessToken, accountId: refreshed.accountId };
   }
   return { token: token.accessToken, accountId: token.accountId };
 }

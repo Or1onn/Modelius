@@ -1,4 +1,4 @@
-// tokens.ts — token-budget + number-format helpers used across the app.
+// tokens.ts — token-budget + number-format helpers.
 
 // Rough token estimate (~4 chars/token) — good enough to budget the window.
 export const estimateTokens = (s: string) => Math.ceil(s.length / 4);

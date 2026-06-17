@@ -1,4 +1,4 @@
-// SearchModal.tsx — ⌘K палитра: чаты по заголовку/превью (мгновенно) + полнотекст сообщений (лениво).
+// SearchModal.tsx — ⌘K palette: chats by title/preview (instant) + full-text messages (lazy).
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { getChats, loadChatBody } from "@/entities/chat/model/chats";
@@ -20,18 +20,18 @@ export function SearchModal({
   const [query, setQuery] = useState("");
   const [sel, setSel] = useState(0);
   const [loading, setLoading] = useState(false);
-  const [tick, setTick] = useState(0); // bump to recompute results once bodies arrive
+  const [tick, setTick] = useState(0); // bump to recompute once bodies arrive
   const bodies = useRef<Map<string, Message[]>>(new Map()); // chatId → messages (full-text cache)
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // On open: reset, focus, and lazily load every chat body once for content search.
+  // On open: reset, focus, lazily load every chat body once for content search.
   useEffect(() => {
     if (!open) return;
     setQuery("");
     setSel(0);
     inputRef.current?.focus();
-    // Load only bodies we haven't cached yet (picks up chats added since last open).
+    // Only load uncached bodies (picks up chats added since last open).
     const missing = getChats().map((c) => c.id).filter((id) => !bodies.current.has(id));
     if (missing.length === 0) return;
     setLoading(true);
@@ -66,7 +66,7 @@ export function SearchModal({
       if (snip) out.push({ id: c.id, title: c.title, snip });
     }
     return out;
-    // tick re-runs this once async bodies populate the cache.
+    // tick re-runs this once async bodies land in the cache.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query, tick]);
 

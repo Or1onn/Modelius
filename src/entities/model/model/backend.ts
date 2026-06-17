@@ -1,12 +1,13 @@
-// backend.ts — value shapes shared across the streaming/routing features: the
-// resolved live backend, a user-pickable model option, and the wire message types.
+// backend.ts — wire shapes shared across streaming/routing: resolved backend, model option, message types.
 
-// A live backend resolved for a routing decision. "none" → nothing connected, so
-// the caller falls back to the scripted demo answer.
+// A live backend for a routing decision. "none" → nothing connected (caller falls back to demo answer).
+// "compat" = an OpenAI-compatible endpoint (Gemini/Groq via key, or local Ollama).
 export interface Backend {
-  kind: "openai" | "chatgpt" | "anthropic" | "none";
+  kind: "openai" | "chatgpt" | "anthropic" | "compat" | "none";
   model: string;
-  label?: string; // human model name, injected into the system prompt for self-id
+  label?: string; // human model name, injected for self-id
+  providerId?: string; // provider id whose stored key to use — compat only (omitted for keyless Ollama)
+  baseUrl?: string; // compat only: the fixed endpoint root (e.g. Ollama, Gemini, Groq)
 }
 
 // A manually selectable model, tied to a ready-to-use backend.
@@ -17,21 +18,22 @@ export interface ModelOption {
   backend: Backend;
 }
 
-// A user image attachment carried alongside the text: base64 `data` (no data: prefix).
+// A user image attachment: base64 `data` (no data: prefix).
 export interface ImagePart {
   mime: string;
   data: string;
 }
 
+// Wire message replayed to a provider. Answer-only by design: no reasoning trace, so a
+// mid-chat model switch can't feed one model another's (or its own) chain-of-thought. Keep it so.
 export interface ChatMsg {
   role: "user" | "assistant" | "system";
   content: string;
   images?: ImagePart[];
 }
 
-// A streamed delta, tagged so the UI can separate reasoning from the answer.
-// A "usage" delta arrives once at the end carrying real token counts; `metered`
-// marks whether this turn is billed per-token (API key) vs a flat-fee subscription.
+// A streamed delta, tagged so the UI can separate reasoning from the answer. The final
+// "usage" delta carries real token counts; `metered` = billed per-token (key) vs flat-fee (sub).
 export type Delta =
   | { kind: "text" | "thinking"; text: string }
   | { kind: "usage"; inputTokens: number; outputTokens: number; cacheRead?: number; cacheWrite?: number; metered: boolean };

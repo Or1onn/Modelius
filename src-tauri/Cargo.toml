@@ -24,4 +24,8 @@ tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
+keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
+chacha20poly1305 = "0.10"
+rand = "0.8"
+base64 = "0.22"
 

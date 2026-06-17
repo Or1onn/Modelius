@@ -1,5 +1,4 @@
-// registry.ts — the model/provider registry and the core routing value types.
-// Single source of truth for model capability/cost/speed and the Decision shape.
+// registry.ts — model/provider registry + core routing value types (single source of truth).
 
 export interface Provider {
   id: string;
@@ -15,12 +14,12 @@ export interface Model {
   abbr: string;
   provider: string;
   cost: number; // blended USD per 1K tokens
-  cap: number; // capability score 0..100
-  spd: number; // speed score 0..100
+  cap: number; // capability 0..100
+  spd: number; // speed 0..100
   latency: number;
   ctx: string;
   local?: boolean;
-  vision?: boolean; // accepts image inputs — routing requires this when an image is attached
+  vision?: boolean; // accepts images — routing requires it when an image is attached
 }
 
 export type PolicyId = "cost" | "quality" | "speed" | "privacy";
@@ -32,7 +31,7 @@ export interface Policy {
   icon: string;
 }
 
-// ----- Provider palette (brand-ish, tuned for dark UI) -----
+// ----- Provider palette (tuned for dark UI) -----
 export const PROVIDERS: Record<string, Provider> = {
   openai: { id: "openai", name: "OpenAI", color: "#10A37F", short: "OA", local: false },
   anthropic: { id: "anthropic", name: "Anthropic", color: "#D97757", short: "AN", local: false },
@@ -57,7 +56,21 @@ export const MODELS: Model[] = [
   { id: "qwen-2-5-local", name: "Qwen 2.5 14B", abbr: "Qw", provider: "ollama", cost: 0, cap: 76, spd: 50, latency: 1.5, ctx: "32K", local: true },
 ];
 
-export const MODEL_BY_ID: Record<string, Model> = Object.fromEntries(MODELS.map((m) => [m.id, m]));
+// Live current-gen models for connected backends. liveRoutingPool() swaps these in for the
+// demo registry above, so the routed pick is a model the backend can actually serve.
+export const LIVE_ANTHROPIC: Model[] = [
+  { id: "claude-opus-4-8", name: "Claude Opus 4.8", abbr: "Op", provider: "anthropic", cost: 0.009, cap: 99, spd: 62, latency: 1.8, ctx: "200K", vision: true },
+  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", abbr: "Sn", provider: "anthropic", cost: 0.006, cap: 94, spd: 80, latency: 0.9, ctx: "200K", vision: true },
+  { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", abbr: "Hk", provider: "anthropic", cost: 0.002, cap: 84, spd: 92, latency: 0.5, ctx: "200K", vision: true },
+];
+export const LIVE_CODEX: Model[] = [
+  { id: "gpt-5.5", name: "GPT-5.5", abbr: "55", provider: "openai", cost: 0.007, cap: 97, spd: 68, latency: 1.4, ctx: "200K", vision: true },
+  { id: "gpt-5.4-mini", name: "GPT-5.4 mini", abbr: "5m", provider: "openai", cost: 0.001, cap: 84, spd: 90, latency: 0.6, ctx: "200K", vision: true },
+];
+
+export const MODEL_BY_ID: Record<string, Model> = Object.fromEntries(
+  [...MODELS, ...LIVE_ANTHROPIC, ...LIVE_CODEX].map((m) => [m.id, m])
+);
 
 export const POLICIES: Record<PolicyId, Policy> = {
   cost: { id: "cost", label: "Cost", blurb: "Minimize spend — routes to the cheapest capable model", icon: "leaf" },
@@ -69,6 +82,7 @@ export const POLICIES: Record<PolicyId, Policy> = {
 export interface Classification {
   kind: "trivial" | "general" | "code" | "complex";
   label: string;
+  difficulty?: number; // 0–100; absent on Decisions persisted before it existed
 }
 
 export interface Candidate {
@@ -91,8 +105,7 @@ export interface Decision {
   latency: number;
 }
 
-// An image attached to a user turn: `data` is base64 (no data: prefix) for the API,
-// `dataUrl` is the full data URL kept for the in-thread thumbnail.
+// Image on a user turn: `data` base64 for the API, `dataUrl` for the in-thread thumbnail.
 export interface ImageRef {
   name: string;
   mime: string;
@@ -103,18 +116,18 @@ export interface ImageRef {
 export interface Message {
   role: "user" | "assistant";
   text: string;
-  images?: ImageRef[]; // user image attachments (vision input)
+  images?: ImageRef[]; // vision input
   decision?: Decision;
   shown?: string;
   streaming?: boolean;
-  reasoning?: string; // accumulated thinking/reasoning trace, shown in a collapsible block
-  // Set when a model was picked manually (overriding the routed one) — drives the
-  // assistant header badge for models that aren't in the registry (e.g. Codex).
+  reasoning?: string; // thinking trace, shown in a collapsible block
+  // Set on a manual model pick — drives the header badge for off-registry models (e.g. Codex).
   modelLabel?: string;
   modelProvider?: string;
-  memory?: string[]; // facts this turn added to long-term memory (shows a "Memory updated" note)
-  // Real measured stats for this turn (vs the estimates carried in `decision`).
+  memory?: string[]; // facts this turn added to memory ("Memory updated" note)
+  // Real measured stats (vs the estimates in `decision`).
   usage?: { inputTokens: number; outputTokens: number; cacheRead?: number; cacheWrite?: number };
-  latencyMs?: number; // wall-clock from send to last token
-  cost?: number; // real USD — set only for metered (API-key) turns; absent on subscription/offline
+  latencyMs?: number; // wall-clock send → last token
+  cost?: number; // real USD — metered turns only; absent on subscription/offline
+  priceSource?: "live" | "table"; // where `cost`'s rate came from (OpenRouter live vs static table)
 }

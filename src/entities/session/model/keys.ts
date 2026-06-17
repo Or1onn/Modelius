@@ -1,9 +1,12 @@
-// keys.ts — persisted, reactive API-key store (localStorage-backed).
-// Keys never leave the device except to the model provider's own API.
+// keys.ts — API keys: the secret value lives in the OS keychain; a non-secret last-6
+// fingerprint is mirrored in localStorage so presence/identity checks stay synchronous
+// for the UI and the router. The key value itself is fetched async only when needed.
 import { useEffect, useReducer } from "react";
 import { clearModelCache } from "@/shared/lib/modelCache";
+import { secretGet, secretSet, secretDelete } from "@/shared/api/secrets";
 
-const PREFIX = "orchestro.key.";
+const KEY = "orchestro.key."; // keychain entry name
+const META = "orchestro.keymeta."; // localStorage: { last6 } — non-secret
 const EVT = "orchestro-keys-changed";
 
 function envKey(provider: string): string {
@@ -12,42 +15,74 @@ function envKey(provider: string): string {
   return "";
 }
 
-export function getKey(provider: string): string {
-  // A key entered in-app (stored) takes precedence; env is only a seed fallback.
+interface KeyMeta {
+  last6: string;
+}
+
+function readMeta(provider: string): KeyMeta | null {
   try {
-    const stored = localStorage.getItem(PREFIX + provider);
-    if (stored) return stored;
+    const raw = localStorage.getItem(META + provider);
+    return raw ? (JSON.parse(raw) as KeyMeta) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeMeta(provider: string, meta: KeyMeta | null): void {
+  try {
+    if (meta) localStorage.setItem(META + provider, JSON.stringify(meta));
+    else localStorage.removeItem(META + provider);
   } catch {
     /* ignore */
   }
-  return envKey(provider);
 }
 
+// Async: the real key from the keychain, env as a seed fallback.
+export async function getKey(provider: string): Promise<string> {
+  const stored = await secretGet(KEY + provider);
+  return stored ?? envKey(provider);
+}
+
+// Sync presence — backed by non-secret meta (or an env seed). Safe in render/router.
 export function hasKey(provider: string): boolean {
-  return getKey(provider).length > 0;
+  return readMeta(provider) !== null || envKey(provider).length > 0;
 }
 
-export function setKey(provider: string, key: string): void {
-  try {
-    localStorage.setItem(PREFIX + provider, key.trim());
-  } catch {
-    /* ignore */
-  }
+// Sync last-6 fingerprint for cache keys + masked display (no secret exposed).
+export function keyLast6(provider: string): string | null {
+  const m = readMeta(provider);
+  if (m) return m.last6;
+  const env = envKey(provider);
+  return env ? env.slice(-6) : null;
+}
+
+export async function setKey(provider: string, key: string): Promise<void> {
+  const k = key.trim();
+  await secretSet(KEY + provider, k);
+  writeMeta(provider, { last6: k.slice(-6) });
   clearModelCache();
   window.dispatchEvent(new Event(EVT));
 }
 
-export function clearKey(provider: string): void {
-  try {
-    localStorage.removeItem(PREFIX + provider);
-  } catch {
-    /* ignore */
-  }
+export async function clearKey(provider: string): Promise<void> {
+  await secretDelete(KEY + provider);
+  writeMeta(provider, null);
   clearModelCache();
   window.dispatchEvent(new Event(EVT));
 }
 
-// Lightweight format validation — catches obvious paste mistakes, not validity.
+// Identify a provider from the key's signature (prefix). null = unrecognized.
+// Order matters: sk-ant- is a stricter prefix than sk-.
+export function detectProvider(key: string): string | null {
+  const k = key.trim();
+  if (/^sk-ant-/.test(k)) return "anthropic";
+  if (/^sk-/.test(k)) return "openai";
+  if (/^AIza/.test(k)) return "google";
+  if (/^gsk_/.test(k)) return "groq";
+  return null;
+}
+
+// Format check only — catches paste mistakes, not validity.
 export function validateKey(provider: string, key: string): boolean {
   const k = key.trim();
   if (provider === "openai") return /^sk-/.test(k) && k.length >= 20;
@@ -66,7 +101,7 @@ export function maskKey(k: string): string {
   return k.slice(0, 6) + "••••••••" + k.slice(-4);
 }
 
-// Subscribe to key changes (same-tab via custom event, other tabs via storage).
+// Subscribe to key changes (same-tab: custom event; cross-tab: storage).
 export function useKeyStore() {
   const [, force] = useReducer((x: number) => x + 1, 0);
   useEffect(() => {

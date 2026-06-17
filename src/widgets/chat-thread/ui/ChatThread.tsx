@@ -1,15 +1,13 @@
-// ChatThread.tsx — the scrolling message list: user bubbles/cards, assistant
-// markdown answers, reasoning + memory notes, and the routing/compacting rows.
+// ChatThread.tsx — scrolling message list: user/assistant turns, reasoning + memory notes, routing rows.
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { ModelBadge } from "@/entities/model/ui/ModelBadge";
 import { Markdown, segmentBody } from "@/shared/lib/markdown";
 import { fmtCompact } from "@/shared/lib/tokens";
-import { POLICIES, PROVIDERS, type PolicyId, type Message } from "@/entities/model/model/registry";
+import { POLICIES, type PolicyId, type Message } from "@/entities/model/model/registry";
 import { isLargeBlock, isFileArtifact, makeArtifact, wrapFence, type Artifact } from "@/entities/artifact/model/artifacts";
 
-// A code block, surfaced as a clickable card instead of inline code — click opens it
-// in the right-side ArtifactPanel. `generating` = the block is still streaming.
+// A code block as a clickable card; click opens it in the ArtifactPanel. `generating` = still streaming.
 function ArtifactCard({ art, onOpen, generating }: { art: Artifact; onOpen: () => void; generating?: boolean }) {
   return (
     <button className={"artifact-card" + (generating ? " generating" : "")} onClick={onOpen} title="Open artifact">
@@ -32,8 +30,8 @@ function ArtifactCard({ art, onOpen, generating }: { art: Artifact; onOpen: () =
   );
 }
 
-// A user message: large pasted code blocks become artifact cards, the surrounding
-// prose stays in plain bubbles. No big blocks → a single bubble (the common case).
+// A user message: large pasted code blocks become cards, prose stays in bubbles.
+// No big blocks → a single bubble (the common case).
 function UserContent({
   text,
   images,
@@ -51,7 +49,7 @@ function UserContent({
     </div>
   ) : null;
   const segs = segmentBody(text);
-  // A block is a card if it's large OR an attached file (a file stays an artifact at any size).
+  // Card if large OR an attached file (a file stays an artifact at any size).
   const asArtifact = (code: string) => isLargeBlock(code) || isFileArtifact(code);
   if (!segs.some((s) => s.kind === "code" && asArtifact(s.code)))
     return (
@@ -60,8 +58,7 @@ function UserContent({
         {text && <div className="bubble-user">{text}</div>}
       </div>
     );
-  // Artifact cards float ABOVE the prose; codeIdx stays in document order so the
-  // panel still resolves the right block.
+  // Cards float ABOVE prose; codeIdx stays in document order so the panel resolves the right block.
   const cards: ReactNode[] = [];
   const rest: ReactNode[] = [];
   let codeIdx = -1;
@@ -89,10 +86,8 @@ function UserContent({
   );
 }
 
-// An assistant answer: prose renders as markdown; a code block renders as an artifact
-// card once it's large (≥15 lines / 4 KB) and as an inline code block otherwise — the
-// same size test while streaming, so a small block shows inline from its first token
-// instead of flashing as a card before the fence closes.
+// An assistant answer: prose as markdown; a code block as a card when large (≥15 lines / 4 KB),
+// else inline. Same size test while streaming, so a small block stays inline from its first token.
 function AssistantBody({ text, streaming, onOpen }: { text: string; streaming: boolean; onOpen: (blockIndex: number) => void }) {
   const segs = segmentBody(text);
   let codeIdx = -1;
@@ -100,7 +95,7 @@ function AssistantBody({ text, streaming, onOpen }: { text: string; streaming: b
     <>
       {segs.map((s, k) => {
         if (s.kind === "text") {
-          // Drop a lone, still-streaming fence opener ("```ts" with no newline yet).
+          // Drop a lone streaming fence opener ("```ts" with no newline yet).
           if (streaming && k === segs.length - 1 && /^```[^\n]*$/.test(s.text.trim())) return null;
           return <Markdown key={k} text={s.text} />;
         }
@@ -117,19 +112,7 @@ function AssistantBody({ text, streaming, onOpen }: { text: string; streaming: b
   );
 }
 
-// Header badge for a manually-picked model (works for ids not in the registry).
-function ManualBadge({ label, provider }: { label: string; provider?: string }) {
-  const color = (provider && PROVIDERS[provider]?.color) || "var(--accent)";
-  return (
-    <span className="model-badge" style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "2px 9px 2px 7px", fontSize: 11 }}>
-      <span style={{ width: 6, height: 6, borderRadius: 99, background: color, flexShrink: 0 }} />
-      {label}
-    </span>
-  );
-}
-
-// Collapsible reasoning trace shown above an assistant answer. Open by default
-// while streaming so the thinking is visible as it arrives.
+// Collapsible reasoning trace above an answer; open by default while streaming.
 function ReasoningBlock({ text, streaming }: { text: string; streaming: boolean }) {
   const [open, setOpen] = useState(true);
   return (
@@ -144,8 +127,7 @@ function ReasoningBlock({ text, streaming }: { text: string; streaming: boolean 
   );
 }
 
-// "Memory updated" note under an assistant turn: shows which durable facts were
-// saved to long-term memory this turn. Click to expand the list.
+// "Memory updated" note: durable facts saved this turn. Click to expand.
 function MemoryNote({ facts }: { facts: string[] }) {
   const [open, setOpen] = useState(false);
   return (
@@ -172,16 +154,18 @@ export function ChatThread({
   phase,
   compacting,
   policy,
+  manual = false,
   onOpenBlock,
 }: {
   messages: Message[];
   phase: "idle" | "routing" | "streaming";
   compacting: boolean;
   policy: PolicyId;
+  manual?: boolean; // a specific model is picked → "Thinking…" instead of the routing line
   onOpenBlock: (msgIndex: number, blockIndex: number) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const pinnedRef = useRef(true); // user at the bottom → follow the stream; scrolling up unpins
+  const pinnedRef = useRef(true); // at bottom → follow the stream; scrolling up unpins
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -207,9 +191,9 @@ export function ChatThread({
             <div key={i} className="row-asst">
               <div className="asst-head">
                 {msg.modelLabel ? (
-                  <ManualBadge label={msg.modelLabel} provider={msg.modelProvider} />
+                  <ModelBadge label={msg.modelLabel} provider={msg.modelProvider} size="sm" />
                 ) : (
-                  <ModelBadge modelId={msg.decision!.chosen.id} size="sm" />
+                  <ModelBadge modelId={msg.decision!.chosen.id} model={msg.decision!.chosen} size="sm" />
                 )}
                 <span className="asst-meta">
                   <Icon name="bolt" size={11} style={{ opacity: 0.6 }} />
@@ -220,11 +204,21 @@ export function ChatThread({
                     ↑ {fmtCompact(msg.usage.inputTokens)} ↓ {fmtCompact(msg.usage.outputTokens)}
                   </span>
                 )}
-                {/* $ only for metered turns; on subscription/offline (usage but no cost) show nothing.
-                    While streaming there's no usage yet — don't flash the routed estimate (it'd vanish
-                    at completion on a subscription). The estimate branch is only for static seed turns. */}
+                {/* $ only for metered turns; subscription/offline (usage, no cost) shows nothing.
+                    No estimate while streaming (would vanish at completion on a subscription).
+                    The estimate branch is only for static seed turns. */}
                 {msg.cost != null ? (
-                  <span className="asst-meta mono">${msg.cost.toFixed(4)}</span>
+                  <span className="asst-meta mono">
+                    ${msg.cost.toFixed(4)}
+                    {msg.priceSource && (
+                      <span
+                        className={"price-src " + msg.priceSource}
+                        title={msg.priceSource === "live" ? "Live price — OpenRouter catalog" : "Estimated from the built-in price table"}
+                      >
+                        {msg.priceSource === "live" ? "live" : "≈ table"}
+                      </span>
+                    )}
+                  </span>
                 ) : !msg.usage && !msg.streaming ? (
                   <span className="asst-meta mono">
                     {msg.decision!.chosenCost === 0 ? "free" : "$" + msg.decision!.chosenCost.toFixed(4)}
@@ -256,7 +250,7 @@ export function ChatThread({
           <div className="row-asst">
             <div className="routing-inline">
               <span className="ri-pulse" />
-              Routing under {POLICIES[policy].label} policy…
+              {manual ? "Thinking…" : `Routing under ${POLICIES[policy].label} policy…`}
             </div>
           </div>
         )}

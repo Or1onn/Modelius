@@ -1,7 +1,7 @@
 // errors.ts — turn raw provider/API errors into short, friendly user-facing text.
 
-// Backend stream errors arrive as "Provider STATUS[ (retry-after: Ns)]: <body>"
-// (body is usually the provider's JSON). Anything else is already a plain message.
+// Stream errors arrive as "Provider STATUS[ (retry-after: Ns)]: <body>" (body usually JSON);
+// anything else is already a plain message.
 export function humanizeError(raw: string): string {
   if (/failed to fetch|networkerror|fetch failed/i.test(raw)) {
     return "Network error — check your connection and try again.";
@@ -12,7 +12,7 @@ export function humanizeError(raw: string): string {
   const [, provider, statusStr, retry, body] = m;
   const status = Number(statusStr);
 
-  // Pull the provider's own error type/message out of the JSON body if present.
+  // Pull the provider's error type/message from the JSON body if present.
   let apiType = "";
   let apiMsg = "";
   try {

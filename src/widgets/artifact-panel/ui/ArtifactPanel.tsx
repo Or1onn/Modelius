@@ -6,10 +6,9 @@ import { formatBytes, type Artifact } from "@/entities/artifact/model/artifacts"
 export function ArtifactPanel({ artifact, onClose, generating }: { artifact: Artifact; onClose: () => void; generating?: boolean }) {
   const [copied, setCopied] = useState(false);
   const bodyRef = useRef<HTMLDivElement>(null);
-  const pinnedRef = useRef(true); // following the stream; scrolling up to read unpins
+  const pinnedRef = useRef(true); // following the stream; scrolling up unpins
 
-  // Follow the stream: keep the newest code in view while it's still generating —
-  // but only while the user is still at the bottom (don't yank them back if they scrolled up).
+  // Keep newest code in view while generating, but only if still pinned (don't yank back).
   useEffect(() => {
     const el = bodyRef.current;
     if (generating && el && pinnedRef.current) el.scrollTop = el.scrollHeight;

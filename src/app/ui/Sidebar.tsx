@@ -1,5 +1,4 @@
-// Sidebar.tsx — left nav: logo, top actions (new chat / search), screen nav,
-// grouped conversation history, and the user footer.
+// Sidebar.tsx — left nav: logo, actions, screen nav, chat history, user footer.
 import { Icon } from "@/shared/ui/Icon";
 import { useChatStore } from "@/entities/chat/model/chats";
 import { ChatGroup, groupHistory, type ScreenId } from "@/app/ui/ChatGroup";
@@ -19,6 +18,7 @@ export function Sidebar({
   setScreen,
   onNewChat,
   onOpenSearch,
+  onCollapse,
   activeChatId,
   onOpenChat,
   onDeleteChat,
@@ -27,6 +27,7 @@ export function Sidebar({
   setScreen: (s: ScreenId) => void;
   onNewChat: () => void;
   onOpenSearch: () => void;
+  onCollapse: () => void;
   activeChatId: string;
   onOpenChat: (id: string) => void;
   onDeleteChat: (id: string) => void;
@@ -40,8 +41,8 @@ export function Sidebar({
           <span className="sb-mark-core" />
         </span>
         <span className="sb-word">Orchestro</span>
-        <button className="sb-collapse" title="Collapse sidebar">
-          <Icon name="providers" size={15} />
+        <button className="sb-collapse" title="Collapse sidebar" onClick={onCollapse}>
+          <Icon name="panelLeftClose" size={16} />
         </button>
       </div>
 

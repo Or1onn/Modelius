@@ -1,6 +1,4 @@
-// openaiAuth.ts — "Sign in with ChatGPT" OAuth (Codex flow) login: open the
-// browser, capture the localhost callback via Rust, exchange the code. The stored
-// session (read/refresh/clear) lives in entities/session.
+// openaiAuth.ts — "Sign in with ChatGPT" OAuth (Codex flow) login.
 import { useEffect, useReducer } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -33,7 +31,7 @@ export async function connectOpenAI(): Promise<void> {
   const { verifier, challenge } = await generatePkce();
   const state = base64url(crypto.getRandomValues(new Uint8Array(16)));
 
-  // Start the loopback listener first, then send the user to the browser.
+  // Start the loopback listener before opening the browser.
   const codePromise = invoke<string>("openai_await_callback", { state });
 
   const url = new URL(AUTH_URL);
@@ -61,7 +59,7 @@ export async function connectOpenAI(): Promise<void> {
     },
   });
 
-  saveOpenAIToken(data);
+  await saveOpenAIToken(data);
 }
 
 // Subscribe to connect/disconnect changes (same-tab + cross-tab).

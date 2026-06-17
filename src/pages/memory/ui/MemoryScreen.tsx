@@ -1,5 +1,4 @@
-// MemoryScreen.tsx — long-term memory manager: review, edit, toggle, and delete
-// the durable facts the assistant remembers about the user across chats.
+// MemoryScreen.tsx — manage the durable facts the assistant remembers: review, edit, toggle, delete.
 import { useState } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { useMemoryStore, MEMORY_KINDS, type MemoryKind } from "@/entities/memory/model/memory";

@@ -2,8 +2,11 @@
 // command handlers. The commands themselves live in the domain modules below.
 mod anthropic;
 mod artifacts;
+mod compat;
 mod openai;
+mod secrets;
 mod stream;
+mod vault;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -28,8 +31,15 @@ pub fn run() {
             openai::openai_await_callback,
             openai::openai_oauth_token,
             openai::openai_responses_stream,
+            compat::compat_list_models,
+            compat::compat_chat_stream,
             artifacts::artifact_write,
-            artifacts::artifact_read
+            artifacts::artifact_read,
+            secrets::secret_set,
+            secrets::secret_get,
+            secrets::secret_delete,
+            vault::vault_encrypt,
+            vault::vault_decrypt
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

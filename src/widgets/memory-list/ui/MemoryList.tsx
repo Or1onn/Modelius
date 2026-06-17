@@ -58,7 +58,7 @@ function MemoryRow({ m }: { m: Memory }) {
   );
 }
 
-// The remembered facts, grouped by kind. Empty groups are skipped.
+// Remembered facts grouped by kind; empty groups skipped.
 export function MemoryList({ memories }: { memories: Memory[] }) {
   return (
     <>

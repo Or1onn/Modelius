@@ -1,6 +1,6 @@
 // demo.ts — scripted offline answers used when no backend is configured.
 
-// ----- Scripted answers (dev-flavored, predictable) -----
+// ----- Scripted answers -----
 export function answerFor(text: string): string {
   const t = (text || "").toLowerCase();
   if (/regex|email/.test(t))

@@ -1,13 +1,11 @@
-// ChatGroup.tsx — a collapsible date group of chats in the sidebar, plus the
-// date-bucketing helper and the screen-id type shared across the shell.
+// ChatGroup.tsx — collapsible sidebar date-group + the bucketing helper and shared ScreenId.
 import { useState } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import type { ChatIndexEntry } from "@/entities/chat/model/chats";
 
 export type ScreenId = "chat" | "providers" | "memory";
 
-// Bucket chats by updatedAt into the three date groups the reference uses,
-// relative to the local calendar day. Empty groups are dropped by ChatGroup.
+// Bucket chats by updatedAt into Today/Yesterday/Earlier (local day). Empty groups dropped by ChatGroup.
 export type HistGroup = { id: string; label: string; items: ChatIndexEntry[]; defaultOpen: boolean };
 
 export function groupHistory(chats: ChatIndexEntry[]): HistGroup[] {
@@ -28,7 +26,7 @@ export function groupHistory(chats: ChatIndexEntry[]): HistGroup[] {
   ];
 }
 
-// A collapsible date group of chats, with the reference's chevron + tree-line indent.
+// Collapsible date group of chats.
 export function ChatGroup({
   group,
   activeChatId,

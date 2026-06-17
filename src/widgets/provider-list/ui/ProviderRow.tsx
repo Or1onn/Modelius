@@ -1,17 +1,20 @@
-// ProviderRow.tsx — a provider settings row plus its inline connect/manage panels.
-// All flows are real: persisted keys, OAuth accounts, and live model fetching.
+// ProviderRow.tsx — provider settings row + inline connect/manage panels (real keys/OAuth/live models).
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { MODELS, PROVIDERS } from "@/entities/model/model/registry";
+import { ProviderLogo } from "@/entities/model/ui/ProviderLogo";
 import { useKeyStore, validateKey, keyHint, maskKey } from "@/entities/session/model/keys";
 import { listModels, peekModels, type RemoteModel } from "@/entities/session/api/providerModels";
+import { listOllamaModels, refreshOllama, peekOllamaModels } from "@/entities/session/model/ollamaSession";
+import { listKeyProviderModels, peekKeyProviderModels } from "@/entities/session/model/keyProviders";
 import { listClaudeAccountModels, peekClaudeAccountModels } from "@/features/pick-backend/model/pickBackend";
 import { CODEX_MODELS } from "@/entities/model/model/apiIds";
 import { useAnthropicAuth } from "@/features/connect-anthropic/model/anthropicAuth";
 import { useOpenAIAuth } from "@/features/connect-openai/model/openaiAuth";
 
-const OAUTH = new Set(["anthropic", "openai"]); // providers with an account sign-in
-const LIVE = new Set(["openai", "anthropic"]); // providers whose key can fetch a live model list
+const OAUTH = new Set(["anthropic", "openai"]); // have account sign-in
+const LIVE = new Set(["openai", "anthropic"]); // key can fetch a live model list
+const KEY_LIVE = new Set(["google", "groq"]); // key fetches a live list over the OpenAI-compat endpoint
 
 const TAGLINES: Record<string, string> = {
   anthropic: "Claude · claude.ai",
@@ -22,17 +25,21 @@ const TAGLINES: Record<string, string> = {
 };
 const KEY_PREFIX: Record<string, string> = { openai: "sk-", anthropic: "sk-ant-", google: "AIza", groq: "gsk_" };
 
+// Providers-page connection labels (registry name stays for badges elsewhere).
+const PROVIDER_LABEL: Record<string, string> = { openai: "Codex" };
+const labelOf = (pid: string) => PROVIDER_LABEL[pid] ?? PROVIDERS[pid].name;
+
 function logoStyle(brand: string) {
   return {
     color: brand,
-    background: `color-mix(in oklab, ${brand} 14%, transparent)`,
-    borderColor: `color-mix(in oklab, ${brand} 30%, transparent)`,
+    background: `color-mix(in oklab, ${brand} 14%, var(--surface-2))`,
+    borderColor: `color-mix(in oklab, ${brand} 28%, transparent)`,
   };
 }
 
 const modelsOf = (pid: string) => MODELS.filter((m) => m.provider === pid);
 
-// Cost tier (1–3) derived from the provider's flagship (priciest) model; 0 = local.
+// Cost tier (1–3) from the provider's priciest model; 0 = local.
 function costTier(pid: string) {
   if (PROVIDERS[pid].local) return 0;
   const ms = modelsOf(pid);
@@ -58,7 +65,7 @@ function CostNode({ pid }: { pid: string }) {
 function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => void }) {
   const p = PROVIDERS[pid];
   const { setKey } = useKeyStore();
-  // OAuth hooks are called unconditionally (rules of hooks); only the relevant one is used.
+  // OAuth hooks called unconditionally (rules of hooks); only the relevant one is used.
   const { beginAnthropicLogin, completeAnthropicLogin } = useAnthropicAuth();
   const { connectOpenAI } = useOpenAIAuth();
 
@@ -71,7 +78,7 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
     ref.current?.focus();
   }, []);
 
-  // OAuth state (anthropic uses a paste-code step; openai is one-click loopback).
+  // OAuth state (anthropic = paste-code step; openai = one-click loopback).
   const [anthStage, setAnthStage] = useState<"idle" | "awaiting" | "exchanging">("idle");
   const [code, setCode] = useState("");
   const [connecting, setConnecting] = useState(false);
@@ -82,13 +89,13 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
     setShake(true);
     setTimeout(() => setShake(false), 450);
   }
-  function verify() {
+  async function verify() {
     const v = val.trim();
     if (!validateKey(pid, v)) {
       fail();
       return;
     }
-    setKey(pid, v);
+    await setKey(pid, v);
     setState("success");
     setTimeout(onConnected, 520);
   }
@@ -137,7 +144,7 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
             anthStage === "idle" ? (
               <button className="pv-oauth" onClick={startAnth}>
                 <span className="pv-oauth-chip" style={{ background: p.color }}>
-                  {p.short}
+                  <ProviderLogo pid={pid} short={p.short} />
                 </span>
                 Connect Claude account
               </button>
@@ -188,7 +195,7 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
                 <span className="mini-spin" />
               ) : (
                 <span className="pv-oauth-chip" style={{ background: p.color }}>
-                  {p.short}
+                  <ProviderLogo pid={pid} short={p.short} />
                 </span>
               )}
               {connecting ? "Waiting for browser…" : "Sign in with ChatGPT"}
@@ -200,10 +207,11 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
               {oauthErr}
             </div>
           )}
-          <div className="pv-or">or use a key</div>
         </>
       )}
 
+      {!OAUTH.has(pid) && (
+        <>
       <div>
         <div className="field-label">
           <Icon name="key" size={13} />
@@ -263,6 +271,8 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
           </>
         )}
       </button>
+        </>
+      )}
     </div>
   );
 }
@@ -281,14 +291,28 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
   const [show, setShow] = useState(false);
   const [confirm, setConfirm] = useState(false);
 
-  // Live model list: account models for OAuth, the key's real list for live keys, else registry.
-  const willFetch = viaOAuth || (LIVE.has(pid) && viaKey);
-  // Seed from the model cache so a warm list renders immediately (no loading flash);
-  // the effect below still revalidates in the background. null = cold → show loading.
+  // Key value is in the keychain (async); load it for the masked/revealed display.
+  const [keyVal, setKeyVal] = useState("");
+  useEffect(() => {
+    if (!viaKey || viaOAuth) return;
+    let alive = true;
+    void getKey(pid).then((k) => {
+      if (alive) setKeyVal(k);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [viaKey, viaOAuth, pid, getKey]);
+
+  // Live model list: installed models for Ollama, account models for OAuth, key's real list for live keys, else registry.
+  const willFetch = local || viaOAuth || ((LIVE.has(pid) || KEY_LIVE.has(pid)) && viaKey);
+  // Seed from cache for instant render (no loading flash); effect revalidates. null = cold → loading.
   const [live, setLive] = useState<RemoteModel[] | null>(() => {
+    if (local) return peekOllamaModels();
     if (viaOAuth && pid === "openai") return CODEX_MODELS.map((m) => ({ id: m.id, name: m.name }));
     if (viaOAuth && pid === "anthropic") return peekClaudeAccountModels();
     if (LIVE.has(pid) && viaKey) return peekModels(pid);
+    if (KEY_LIVE.has(pid) && viaKey) return peekKeyProviderModels(pid);
     return [];
   });
   useEffect(() => {
@@ -296,8 +320,10 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
     let alive = true;
     (async () => {
       try {
-        if (viaOAuth && pid === "anthropic") setLive(alive ? await listClaudeAccountModels() : []);
+        if (local) setLive(alive ? await listOllamaModels() : []);
+        else if (viaOAuth && pid === "anthropic") setLive(alive ? await listClaudeAccountModels() : []);
         else if (viaOAuth && pid === "openai") setLive(CODEX_MODELS.map((m) => ({ id: m.id, name: m.name })));
+        else if (KEY_LIVE.has(pid) && viaKey) setLive(alive ? await listKeyProviderModels(pid) : []);
         else setLive(await listModels(pid));
       } catch {
         if (alive) setLive([]);
@@ -309,10 +335,20 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  async function recheckOllama() {
+    setLive(null);
+    try {
+      setLive(await refreshOllama());
+    } catch {
+      setLive([]);
+    }
+  }
+
   function disconnect() {
-    if (viaKey) clearKey(pid);
+    // Prefer disconnecting the account; a key (managed in the API Keys section) is left intact.
     if (pid === "anthropic" && anthConnected) disconnectAnthropicOAuth();
-    if (pid === "openai" && oaiConnected) disconnectOpenAIOAuth();
+    else if (pid === "openai" && oaiConnected) disconnectOpenAIOAuth();
+    else if (viaKey) clearKey(pid);
     onDisconnected();
   }
 
@@ -326,14 +362,17 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
           <span className="manage-row-k">Runtime</span>
           <span className="manage-row-v">
             <Icon name="cpu" size={13} />
-            localhost:11434 · {reg.length} models
+            localhost:11434 · {live === null ? "checking…" : `${live.length} model${live.length === 1 ? "" : "s"}`}
+            <button className="key-eye" style={{ width: 26 }} title="Recheck" onClick={recheckOllama}>
+              <Icon name="refresh" size={14} />
+            </button>
           </span>
         </div>
-      ) : viaKey ? (
+      ) : viaKey && !viaOAuth ? (
         <div className="manage-row">
           <span className="manage-row-k">API Key</span>
           <span className="manage-row-v">
-            {show ? getKey(pid) : maskKey(getKey(pid))}
+            {show ? keyVal : maskKey(keyVal)}
             <button className="key-eye" style={{ width: 26 }} tabIndex={-1} onClick={() => setShow((s) => !s)}>
               <Icon name={show ? "eyeOff" : "eye"} size={15} />
             </button>
@@ -344,7 +383,7 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
           <span className="manage-row-k">Account</span>
           <span className="manage-row-v">
             <Icon name="link" size={13} style={{ color: p.color }} />
-            {pid === "anthropic" ? "Claude account connected" : "ChatGPT account connected"}
+            {pid === "anthropic" ? "Claude account connected" : "Codex account connected"}
           </span>
         </div>
       )}
@@ -355,6 +394,11 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
             <span className="mini-spin" />
             Fetching models…
           </div>
+        </div>
+      ) : local && live.length === 0 ? (
+        <div className="key-hint" style={{ marginTop: 4 }}>
+          <Icon name="alert" size={13} />
+          Ollama isn't reachable. Start it (<code>ollama serve</code>) and pull a model (<code>ollama pull llama3.2</code>), then recheck.
         </div>
       ) : (
         <div className="manage-models">
@@ -392,7 +436,7 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
       {!local &&
         (confirm ? (
           <div className="manage-confirm">
-            <span className="manage-confirm-t">Disconnect {p.name}? The router will stop using its models.</span>
+            <span className="manage-confirm-t">Disconnect {labelOf(pid)}? The router will stop using its models.</span>
             <button className="mc-btn cancel" onClick={() => setConfirm(false)}>
               Cancel
             </button>
@@ -403,7 +447,7 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
         ) : (
           <button className="pv-disconnect" onClick={() => setConfirm(true)}>
             <Icon name="xCircle" size={14} />
-            Disconnect {p.name}
+            Disconnect {labelOf(pid)}
           </button>
         ))}
     </div>
@@ -429,10 +473,10 @@ export function ProviderRow({
     <div className="pv-rowblock">
       <div className="pv-row clickable" onClick={onToggle}>
         <span className="prov-logo pv-logo40" style={logoStyle(p.color)}>
-          {p.short}
+          <ProviderLogo pid={pid} short={p.short} />
         </span>
         <div className="pv-rowmain">
-          <div className="pv-rowname">{p.name}</div>
+          <div className="pv-rowname">{labelOf(pid)}</div>
           <div className="pv-desc">
             <span className="pv-desc-tag">{TAGLINES[pid]}</span>
             <span className="pv-sep">·</span>

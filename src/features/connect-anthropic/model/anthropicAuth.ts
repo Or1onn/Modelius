@@ -1,9 +1,8 @@
-// anthropicAuth.ts — "Connect Claude account" OAuth (PKCE) login: open the
-// browser, the user pastes the resulting code, exchange it. The stored session
-// (read/refresh/clear) lives in entities/session.
+// anthropicAuth.ts — "Connect Claude account" OAuth (PKCE) login flow.
 import { useEffect, useReducer } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { secretGet, secretSet, secretDelete } from "@/shared/api/secrets";
 import {
   CLIENT_ID,
   AUTH_URL,
@@ -16,7 +15,7 @@ import {
   type TokenResponse,
 } from "@/entities/session/model/anthropicSession";
 
-const PKCE_KEY = "orchestro.anthropic.pkce";
+const PKCE_KEY = "orchestro.anthropic.pkce"; // keychain (transient, deleted after exchange)
 
 // ----- PKCE -----
 function base64url(bytes: Uint8Array): string {
@@ -30,15 +29,10 @@ async function generatePkce(): Promise<{ verifier: string; challenge: string }> 
   return { verifier, challenge: base64url(new Uint8Array(digest)) };
 }
 
-// Opens the browser for authorization. The user copies the resulting code and
-// pastes it into completeLogin(). The PKCE verifier is stashed in between.
+// Open browser; user pastes the code into completeLogin(). PKCE verifier stashed between.
 export async function beginAnthropicLogin(): Promise<void> {
   const { verifier, challenge } = await generatePkce();
-  try {
-    localStorage.setItem(PKCE_KEY, verifier);
-  } catch {
-    /* ignore */
-  }
+  await secretSet(PKCE_KEY, verifier);
 
   const url = new URL(AUTH_URL);
   url.searchParams.set("code", "true");
@@ -53,15 +47,9 @@ export async function beginAnthropicLogin(): Promise<void> {
   await openUrl(url.toString());
 }
 
-// Exchanges the pasted "code#state" for tokens and stores them.
+// Exchange the pasted "code#state" for tokens.
 export async function completeAnthropicLogin(raw: string): Promise<void> {
-  const verifier = (() => {
-    try {
-      return localStorage.getItem(PKCE_KEY) || "";
-    } catch {
-      return "";
-    }
-  })();
+  const verifier = (await secretGet(PKCE_KEY)) || "";
   if (!verifier) throw new Error("Start the connection first, then paste the code.");
 
   const [code, state] = raw.trim().split("#");
@@ -78,12 +66,8 @@ export async function completeAnthropicLogin(raw: string): Promise<void> {
     },
   });
 
-  saveAnthropicToken(data);
-  try {
-    localStorage.removeItem(PKCE_KEY);
-  } catch {
-    /* ignore */
-  }
+  await saveAnthropicToken(data);
+  await secretDelete(PKCE_KEY);
 }
 
 // Subscribe to connect/disconnect changes (same-tab + cross-tab).

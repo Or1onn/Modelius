@@ -1,51 +1,61 @@
-// artifacts.ts — content-addressed verbatim store for large code blocks, kept out of lossy summarization.
+// artifacts.ts — content-addressed verbatim store for large code blocks.
 import { invoke } from "@tauri-apps/api/core";
 import { isTauri } from "@/shared/api/tauri";
+import { vaultEncrypt, vaultDecrypt } from "@/shared/api/secrets";
 
-// A large fenced block is pulled out of the transcript into an artifact so the
-// summarizer never paraphrases code. Identity is the content hash, so the same
-// code always maps to the same id (free dedup) and create-time / summarize-time
-// agree on the id without storing a substring→id map.
-// Dynamic-length fence: ≥3 backticks, closed by a length-matched run (\1), so a block
-// whose code itself contains ``` round-trips (the outer fence is longer than any inner run).
+// Dynamic-length fence (\1 closes the open run) so code containing ``` round-trips.
 const FENCE = /(`{3,})([^\n`]*)\n([\s\S]*?)\n\1/g;
 const PREFIX = "orchestro.artifact."; // localStorage fallback key prefix
 const REF = /\[\[(code-[0-9a-f]{8})\]\]/g; // [[code-XXXX]] reference tokens
 
-// lang is carried per session (the disk/localStorage file holds pure code only).
-// Repopulated whenever we parse a block; defaults to "" after a reload.
+// Per-session lang map (disk file holds pure code only); "" after reload until re-parsed.
 const langOf = new Map<string, string>();
 
-// A user-supplied filename for an artifact (from an attached/pasted file), keyed by
-// content id. The fenced block carries only lang+code, so the filename would otherwise
-// be lost on send → re-render; this restores it as the title. Persisted to localStorage
-// (survives reload) and bounded to TITLE_CAP entries — oldest-written evicted first.
-// Eviction is safe: a dropped title just degrades to a content-derived one.
+// User-supplied filename → used as artifact title (fenced block carries only lang+code).
+// Persisted, bounded to TITLE_CAP (oldest evicted); a dropped title degrades to content-derived.
 const TITLES_KEY = PREFIX + "titles";
 const TITLE_CAP = 500;
 
-function loadTitles(): Map<string, string> {
-  try {
-    const raw = localStorage.getItem(TITLES_KEY);
-    if (raw) return new Map(Object.entries(JSON.parse(raw) as Record<string, string>));
-  } catch {
-    /* malformed/unavailable — start empty */
-  }
-  return new Map();
+// Titles are user content (filenames) → persisted as a vault-encrypted blob, loaded into
+// the in-RAM Map once at startup. Reads stay synchronous; writes persist async.
+const titleOf = new Map<string, string>();
+let titlesHydrated = false;
+let titlesHydrating: Promise<void> | null = null;
+
+export function hydrateTitles(): Promise<void> {
+  if (titlesHydrated) return Promise.resolve();
+  if (!titlesHydrating)
+    titlesHydrating = (async () => {
+      try {
+        const raw = localStorage.getItem(TITLES_KEY);
+        if (raw) {
+          const obj = JSON.parse(await vaultDecrypt(raw)) as Record<string, string>;
+          for (const [k, v] of Object.entries(obj)) titleOf.set(k, v);
+        }
+      } catch {
+        /* malformed/unavailable — start empty */
+      }
+      titlesHydrated = true;
+    })();
+  return titlesHydrating;
 }
 
-const titleOf = loadTitles();
+function persistTitles(): void {
+  void (async () => {
+    try {
+      localStorage.setItem(TITLES_KEY, await vaultEncrypt(JSON.stringify(Object.fromEntries(titleOf))));
+    } catch {
+      /* quota/full — names just won't survive reload */
+    }
+  })();
+}
 
 export function rememberArtifactTitle(id: string, title: string): void {
-  if (titleOf.get(id) === title) return; // unchanged — skip the write
-  titleOf.delete(id); // re-insert so this id counts as most-recent (Map keeps insertion order)
+  if (titleOf.get(id) === title) return; // unchanged
+  titleOf.delete(id); // re-insert → most-recent (Map keeps insertion order)
   titleOf.set(id, title);
   while (titleOf.size > TITLE_CAP) titleOf.delete(titleOf.keys().next().value as string);
-  try {
-    localStorage.setItem(TITLES_KEY, JSON.stringify(Object.fromEntries(titleOf)));
-  } catch {
-    /* quota/full — names just won't survive reload */
-  }
+  persistTitles();
 }
 
 // djb2 → 8 hex chars. Deterministic, no Date.now/random.
@@ -57,8 +67,7 @@ function hash8(s: string): string {
 
 export const artifactId = (code: string) => "code-" + hash8(code.trim());
 
-// True if this block is a remembered file attachment (titleOf only holds real filenames),
-// so an attached file renders as a card regardless of size — a file is always an artifact.
+// Remembered file attachment (titleOf holds only real filenames) → always a card, any size.
 export const isFileArtifact = (code: string) => titleOf.has(artifactId(code));
 
 export const ARTIFACT_MIN_BYTES = 4096; // 4 KB
@@ -83,15 +92,14 @@ export const wrapFence = (lang: string, code: string) => {
   return `${f}${lang}\n${code}\n${f}`;
 };
 
-// Big enough to be worth storing verbatim; small inline snippets stay in the text.
-// Large = many lines OR a large byte size (a few very long lines, e.g. minified JSON).
+// Large = many lines OR large byte size (e.g. minified JSON); else stays inline.
 export const isLargeBlock = (code: string) =>
   code.split("\n").length >= 15 || byteSize(code) >= ARTIFACT_MIN_BYTES;
 
 // A pasted blob is turned into an artifact purely by size (≥4 KB).
 export const isLargePaste = (text: string) => byteSize(text) >= ARTIFACT_MIN_BYTES;
 
-// A large block surfaced to the UI as a Claude-style artifact card + viewer panel.
+// A large block surfaced as an artifact card + viewer panel.
 export interface Artifact {
   id: string;
   lang: string;
@@ -137,8 +145,7 @@ function sniffLang(code: string): string {
   return "";
 }
 
-// Refine a fence label into a canonical id: normalize, sniff when absent, then
-// upgrade ts/js → tsx/jsx when the code contains JSX. Single source of the label.
+// Canonical lang id: normalize, sniff when absent, upgrade ts/js → tsx/jsx for JSX.
 export function detectLang(raw: string, code: string): string {
   const norm = raw.trim().toLowerCase();
   let lang = LANG_ALIAS[norm] ?? norm;
@@ -147,8 +154,7 @@ export function detectLang(raw: string, code: string): string {
   return lang;
 }
 
-// Best-effort human title for the card: the main (exported) declared symbol named
-// like a file (Symbol.ext), else any declared symbol, else the first real line.
+// Card title: exported symbol as Symbol.ext, else any declared symbol, else first real line.
 function artifactTitle(lang: string, code: string): string {
   const sym =
     code.match(/export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|interface|type|enum|struct)\s+([A-Za-z_$][\w$]*)/) ||
@@ -162,9 +168,7 @@ function artifactTitle(lang: string, code: string): string {
   return (lang || "code") + " snippet";
 }
 
-// Build the view model from a fenced block. id matches the verbatim store (same
-// hash as extractAndSave), so a card and its persisted artifact agree. lang is
-// refined via detectLang; pass `title` to override (e.g. "Pasted" for a paste chip).
+// View model from a fenced block. id matches the verbatim store; pass `title` to override.
 export function makeArtifact(lang: string, code: string, title?: string): Artifact {
   const clean = code.replace(/\n$/, "");
   const id = artifactId(clean);
@@ -220,7 +224,7 @@ async function saveArtifact(id: string, code: string): Promise<void> {
     }
   }
   try {
-    localStorage.setItem(PREFIX + id, code);
+    localStorage.setItem(PREFIX + id, await vaultEncrypt(code));
   } catch {
     /* quota/full — drop silently, summary still carries the reference */
   }
@@ -235,7 +239,8 @@ export async function loadArtifact(id: string): Promise<string | null> {
       return null;
     }
   }
-  return localStorage.getItem(PREFIX + id);
+  const raw = localStorage.getItem(PREFIX + id);
+  return raw === null ? null : vaultDecrypt(raw);
 }
 
 // Create-time: persist every large block in `text`. Idempotent (content-addressed).
@@ -251,8 +256,7 @@ export async function extractAndSave(text: string): Promise<string[]> {
   return ids;
 }
 
-// Summarize-time: swap each large block for its [[id]] token so the summarizer
-// never sees code to paraphrase. Small blocks stay inline.
+// Summarize-time: swap each large block for its [[id]] token; small blocks stay inline.
 export function redactCode(text: string): { text: string; ids: string[] } {
   const blocks = parseCodeBlocks(text);
   if (!blocks.length) return { text, ids: [] };

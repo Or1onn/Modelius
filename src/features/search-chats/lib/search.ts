@@ -1,7 +1,7 @@
 // search.ts — case/diacritic-insensitive substring match + snippet for chat search.
 
-// Fold to a lowercase, diacritic-stripped form while keeping a map back to the
-// original char indices (per-char NFD can change length, so we can't assume 1:1).
+// Fold to lowercase diacritic-stripped form + map back to original indices
+// (NFD can change length, so no 1:1 assumption).
 function fold(s: string): { norm: string; map: number[] } {
   let norm = "";
   const map: number[] = [];
@@ -21,8 +21,7 @@ export function matches(text: string, q: string): boolean {
   return fold(text).norm.includes(needle);
 }
 
-// A context window around the first match, with the original casing preserved.
-// Returns null when there's no match. Whitespace is collapsed for readability.
+// Context window around the first match, original casing; null if no match. Whitespace collapsed.
 export function snippet(
   text: string,
   q: string,
@@ -36,7 +35,7 @@ export function snippet(
   if (idx < 0) return null;
 
   const start = map[idx];
-  const end = map[idx + needle.length - 1] + 1; // exclusive, include the last matched char
+  const end = map[idx + needle.length - 1] + 1; // exclusive
   const from = Math.max(0, start - ctx);
   const to = Math.min(clean.length, end + ctx);
   return {

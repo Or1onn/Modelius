@@ -1,19 +1,18 @@
-// markdown.tsx — GitHub-flavored markdown rendering + the fenced-block splitter
-// shared by the chat thread (prose vs. code segments, copy-to-clipboard).
+// markdown.tsx — GFM rendering + the fenced-block splitter shared by the chat thread.
 import { useState, isValidElement, type MouseEvent, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Icon } from "@/shared/ui/Icon";
 
-// Open links in the system browser instead of navigating the webview away.
+// Open links in the system browser, not the webview.
 export function openExternal(e: MouseEvent<HTMLAnchorElement>, href?: string) {
   if (!href) return;
   e.preventDefault();
   openUrl(href).catch(() => window.open(href, "_blank"));
 }
 
-// Flatten a markdown node tree back into its raw text (for copy-to-clipboard).
+// Flatten a markdown node tree back into raw text (for copy-to-clipboard).
 export function nodeText(node: ReactNode): string {
   if (node == null || typeof node === "boolean") return "";
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -24,9 +23,8 @@ export function nodeText(node: ReactNode): string {
 
 export type Seg = { kind: "text"; text: string } | { kind: "code"; lang: string; code: string; open: boolean };
 
-// Split a markdown body into prose and fenced code segments, INCLUDING a trailing
-// unterminated fence (open: true) so a streaming code block is one unit from the
-// first token instead of leaking a few raw lines before crossing a size threshold.
+// Split a body into prose and fenced code segments, INCLUDING a trailing unterminated
+// fence (open: true) so a streaming code block is one unit from its first token.
 export function segmentBody(text: string): Seg[] {
   const segs: Seg[] = [];
   let pos = 0;
@@ -42,7 +40,7 @@ export function segmentBody(text: string): Seg[] {
     const fence = text.slice(open, fenceEnd); // full opener run (≥3 backticks)
     const nl = text.indexOf("\n", fenceEnd);
     if (nl === -1) {
-      // Opener still streaming ("```ts" with no newline yet) — keep as text for now.
+      // Opener still streaming ("```ts" with no newline yet) — keep as text.
       segs.push({ kind: "text", text: text.slice(open) });
       break;
     }
@@ -62,9 +60,8 @@ export function segmentBody(text: string): Seg[] {
 export const codeSegs = (text: string) =>
   segmentBody(text).filter((s): s is Extract<Seg, { kind: "code" }> => s.kind === "code");
 
-// Fenced code block: language label (from the ```lang fence) + a copy button.
-// Overrides react-markdown's `pre`. Only small/inline blocks reach here — large and
-// streaming blocks are intercepted upstream by AssistantBody/UserContent as cards.
+// Fenced code block: lang label + copy button; overrides react-markdown's `pre`.
+// Only small/inline blocks reach here — large/streaming ones become cards upstream.
 function CodeBlock({ children }: { children?: ReactNode }) {
   const [copied, setCopied] = useState(false);
   const codeEl = isValidElement<{ className?: string; children?: ReactNode }>(children) ? children : null;
@@ -107,8 +104,7 @@ const MD_COMPONENTS: Components = {
   pre: CodeBlock,
 };
 
-// GitHub-flavored markdown rendering for assistant messages. Styling lives in
-// styles.css under `.asst-body`; tolerant of the partial markdown seen mid-stream.
+// GFM rendering for assistant messages; tolerant of partial markdown mid-stream.
 export function Markdown({ text }: { text: string }) {
   return (
     <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>

@@ -1,9 +1,10 @@
 // openai.rs — "Sign in with ChatGPT" (Codex OAuth): loopback callback capture,
 // token exchange/refresh, and the Responses API streaming proxy.
-use crate::stream::{err_prefix, StreamEvent};
+use crate::stream::{check_stream_status, json_or_err, pump_sse, StreamEvent};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 fn percent_decode(s: &str) -> String {
@@ -111,13 +112,7 @@ pub async fn openai_oauth_token(form: HashMap<String, String>) -> Result<serde_j
         .send()
         .await
         .map_err(|e| e.to_string())?;
-
-    let status = res.status();
-    let text = res.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!("openai token {}: {}", status.as_u16(), text));
-    }
-    serde_json::from_str(&text).map_err(|e| e.to_string())
+    json_or_err(res, "openai token").await
 }
 
 // Stream a completion from the ChatGPT subscription backend (Responses API).
@@ -141,63 +136,51 @@ pub async fn openai_responses_stream(
         builder = builder.header("chatgpt-account-id", account_id);
     }
 
-    let mut res = builder.send().await.map_err(|e| e.to_string())?;
-
-    let status = res.status();
-    if !status.is_success() {
-        let prefix = err_prefix("ChatGPT", status.as_u16(), res.headers());
-        let text = res.text().await.unwrap_or_default();
-        let _ = on_event.send(StreamEvent::Error(format!("{}: {}", prefix, text)));
+    let res = builder.send().await.map_err(|e| e.to_string())?;
+    let Some(res) = check_stream_status(res, "ChatGPT", &on_event).await else {
         return Ok(());
-    }
+    };
 
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(bytes) = res.chunk().await.map_err(|e| e.to_string())? {
-        buf.extend_from_slice(&bytes);
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("data:") else { continue };
-            let data = rest.trim();
-            if data.is_empty() || data == "[DONE]" {
-                continue;
-            }
-            let Ok(j) = serde_json::from_str::<serde_json::Value>(data) else { continue };
-            match j.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-                "response.output_text.delta" => {
-                    if let Some(t) = j.get("delta").and_then(|v| v.as_str()) {
-                        let _ = on_event.send(StreamEvent::Chunk(t.to_string()));
-                    }
-                }
-                "response.reasoning_summary_text.delta" => {
-                    if let Some(t) = j.get("delta").and_then(|v| v.as_str()) {
-                        let _ = on_event.send(StreamEvent::Thinking(t.to_string()));
-                    }
-                }
-                "response.completed" => {
-                    let _ = on_event.send(StreamEvent::Usage {
-                        input_tokens: j.pointer("/response/usage/input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                        output_tokens: j.pointer("/response/usage/output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                        cache_read: 0,
-                        cache_write: 0,
-                    });
-                    let _ = on_event.send(StreamEvent::Done);
-                    return Ok(());
-                }
-                "response.failed" | "error" => {
-                    let msg = j
-                        .pointer("/response/error/message")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| j.get("message").and_then(|v| v.as_str()))
-                        .unwrap_or("response failed");
-                    let _ = on_event.send(StreamEvent::Error(msg.to_string()));
-                    return Ok(());
-                }
-                _ => {}
-            }
+    pump_sse(res, |data| {
+        if data == "[DONE]" {
+            return ControlFlow::Continue(());
         }
-    }
+        let Ok(j) = serde_json::from_str::<serde_json::Value>(data) else { return ControlFlow::Continue(()) };
+        match j.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "response.output_text.delta" => {
+                if let Some(t) = j.get("delta").and_then(|v| v.as_str()) {
+                    let _ = on_event.send(StreamEvent::Chunk(t.to_string()));
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                if let Some(t) = j.get("delta").and_then(|v| v.as_str()) {
+                    let _ = on_event.send(StreamEvent::Thinking(t.to_string()));
+                }
+            }
+            "response.completed" => {
+                let _ = on_event.send(StreamEvent::Usage {
+                    input_tokens: j.pointer("/response/usage/input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                    output_tokens: j.pointer("/response/usage/output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                    cache_read: 0,
+                    cache_write: 0,
+                });
+                let _ = on_event.send(StreamEvent::Done);
+                return ControlFlow::Break(());
+            }
+            "response.failed" | "error" => {
+                let msg = j
+                    .pointer("/response/error/message")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| j.get("message").and_then(|v| v.as_str()))
+                    .unwrap_or("response failed");
+                let _ = on_event.send(StreamEvent::Error(msg.to_string()));
+                return ControlFlow::Break(());
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    })
+    .await?;
 
     let _ = on_event.send(StreamEvent::Done);
     Ok(())
