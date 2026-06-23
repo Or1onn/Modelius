@@ -33,6 +33,7 @@ pub fn run() {
             openai::openai_responses_stream,
             compat::compat_list_models,
             compat::compat_chat_stream,
+            stream::cancel_stream,
             artifacts::artifact_write,
             artifacts::artifact_read,
             secrets::secret_set,

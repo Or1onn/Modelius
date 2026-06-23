@@ -18,6 +18,7 @@ export interface ChatIndexEntry {
   preview: string; // first user message snippet
   createdAt: number;
   updatedAt: number;
+  pinned?: boolean; // user-pinned → floats to its own section
 }
 
 let indexCache: ChatIndexEntry[] = [];
@@ -48,6 +49,10 @@ export function getChats(): ChatIndexEntry[] {
   return indexCache.slice().sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+// A title set by the user via rename is sticky: it survives index rebuilds from session
+// persistence (which would otherwise re-derive the title from the chat content).
+const renamed = new Set<string>();
+
 function saveIndex(list: ChatIndexEntry[]): void {
   indexCache = list;
   window.dispatchEvent(new Event(EVT));
@@ -63,14 +68,35 @@ function saveIndex(list: ChatIndexEntry[]): void {
 export function upsertChat(entry: ChatIndexEntry): void {
   const list = getChats();
   const i = list.findIndex((c) => c.id === entry.id);
-  if (i >= 0) list[i] = entry;
-  else list.push(entry);
+  if (i >= 0) {
+    // Carry over user-set state that session persistence doesn't know about.
+    const prev = list[i];
+    list[i] = {
+      ...entry,
+      pinned: entry.pinned ?? prev.pinned,
+      title: renamed.has(entry.id) ? prev.title : entry.title,
+    };
+  } else list.push(entry);
   saveIndex(list);
 }
 
 export function deleteChat(id: string): void {
+  renamed.delete(id);
   saveIndex(getChats().filter((c) => c.id !== id));
   void deleteChatBody(id);
+}
+
+// Pin/unpin a chat (floats it into the Pinned section).
+export function pinChat(id: string, pinned: boolean): void {
+  saveIndex(getChats().map((c) => (c.id === id ? { ...c, pinned } : c)));
+}
+
+// Rename a chat; the new title becomes sticky against later content-derived rebuilds.
+export function renameChat(id: string, title: string): void {
+  const t = title.trim();
+  if (!t) return;
+  renamed.add(id);
+  saveIndex(getChats().map((c) => (c.id === id ? { ...c, title: t } : c)));
 }
 
 // Subscribe to index changes (same-tab: custom event; cross-tab: storage).
@@ -85,7 +111,7 @@ export function useChatStore() {
       window.removeEventListener("storage", h);
     };
   }, []);
-  return { getChats, upsertChat, deleteChat };
+  return { getChats, upsertChat, deleteChat, pinChat, renameChat };
 }
 
 // ---- Body (SQLite under Tauri / localStorage fallback) ----

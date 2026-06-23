@@ -2,8 +2,8 @@
 // Streaming runs at module scope, not in ChatScreen, so a generation survives a chat/screen
 // switch. ChatScreen subscribes and renders. In the page: drives streamLLM.
 import { useCallback, useSyncExternalStore } from "react";
-import { route } from "@/features/route-request/model/route";
-import { answerFor } from "@/shared/fixtures/demo";
+import { route, classify } from "@/features/route-request/model/route";
+import { classifyRequest } from "@/features/route-request/model/classifyRequest";
 import { SYSTEM_PROMPT, SUMMARY_PROMPT, MEMORY_EXTRACT_PROMPT, TITLE_PROMPT } from "@/shared/config/prompts";
 import { estimateTokens, ctxTokens } from "@/shared/lib/tokens";
 import { costOf, priceSource as priceSource_ } from "@/entities/model/lib/pricing";
@@ -66,6 +66,7 @@ interface Session {
   memoryTurns: number; // finished assistant turns, for throttling memory extraction
   titleTried: boolean;
   saveTimer: number | null;
+  abort: AbortController | null; // active stream's canceller; set while streaming, else null
   listeners: Set<() => void>;
   view: SessionView;
 }
@@ -123,6 +124,7 @@ function ensure(chatId: string, demo: boolean): Session {
     memoryTurns: 0,
     titleTried: false,
     saveTimer: null,
+    abort: null,
     listeners: new Set(),
     view: null as unknown as SessionView,
   };
@@ -264,42 +266,92 @@ function maybeGenerateTitle(s: Session): void {
   });
 }
 
-export function sendMessage(chatId: string, p: SendParams): void {
-  const s = sessions.get(chatId);
-  if (!s || s.phase !== "idle") return;
-  s.dirty = true; // user acted → now worth persisting
+// Route a turn and kick off streaming. `history` is the thread state the API sees (excludes the
+// current user turn). `appendUser` is false on regenerate, where the user turn already exists.
+async function dispatch(s: Session, p: SendParams, history: Message[], appendUser: boolean): Promise<void> {
   const { policy, modelSel, thinking, effort, fullText, images: imgs } = p;
 
   // An attached image forces a vision-capable model regardless of policy. Context pressure
   // (history + summary + this turn) floors the pool to models whose window can hold it.
   const ctxUsed =
-    s.messages.reduce((n, m) => n + estimateTokens(m.text), estimateTokens(s.summary)) + estimateTokens(fullText);
-  const decision = route(fullText, policy, {
-    requireVision: imgs.length > 0,
-    contextTokens: ctxUsed,
-    pool: liveRoutingPool(),
-  });
-  const history = s.messages; // snapshot before the new turn, for the API call
-  append(s, { role: "user", text: fullText, images: imgs.length ? imgs : undefined });
-  void extractAndSave(fullText); // persist large code blocks as artifacts
+    history.reduce((n, m) => n + estimateTokens(m.text), estimateTokens(s.summary)) + estimateTokens(fullText);
+  const pool = liveRoutingPool();
+  const routeOpts = { requireVision: imgs.length > 0, contextTokens: ctxUsed, pool };
+
+  // Heuristic first: drives the none-check, the manual override, and the confident fast-path
+  // (no LLM call). The phase guard below blocks re-entry, so the async refine has no race.
+  const heur = classify(fullText);
+  let decision = route(fullText, policy, { ...routeOpts, classification: heur });
+  let backend = modelSel ? modelSel.backend : pickBackend(decision);
+  // Nothing connected — bail before touching the thread; the composer prompts to connect a model.
+  if (backend.kind === "none") return;
+
+  s.dirty = true; // user acted → now worth persisting
+  if (appendUser) {
+    append(s, { role: "user", text: fullText, images: imgs.length ? imgs : undefined });
+    void extractAndSave(fullText); // persist large code blocks as artifacts
+  }
   setPhase(s, "routing");
 
-  const backend = modelSel ? modelSel.backend : pickBackend(decision);
-  const manual = modelSel ? { label: modelSel.label, provider: modelSel.provider } : backendBadge(backend, decision);
-  if (backend.kind === "none") {
-    // No key — fall back to the scripted demo answer.
-    setTimeout(() => {
-      setPhase(s, "streaming");
-      const full = answerFor(fullText);
-      append(s, { role: "assistant", text: full, decision, shown: "", streaming: true });
-      streamOut(s, full, decision);
-    }, 950);
-    return;
+  // Hybrid: for an ambiguous auto-route, refine difficulty with the cheap LLM classifier,
+  // then re-route. Manual picks and confident heuristics skip this entirely.
+  if (!modelSel && !heur.confident) {
+    const cls = await classifyRequest(fullText, { pool });
+    decision = route(fullText, policy, { ...routeOpts, classification: cls });
+    const b = pickBackend(decision);
+    if (b.kind !== "none") backend = b;
   }
 
+  // Name the model that actually answered (pickBackend may diverge from the routed pick).
+  const manual = modelSel ? { label: modelSel.label, provider: modelSel.provider } : backendBadge(backend, decision);
   // "auto" effort tracks the routed difficulty; explicit levels pass through.
   const eff = effort === "auto" ? effortForDifficulty(decision.classification.difficulty ?? 0) : effort;
   void realSend(s, decision, history, backend, manual, thinking, eff, fullText, imgs, !!modelSel);
+}
+
+export function sendMessage(chatId: string, p: SendParams): void {
+  const s = sessions.get(chatId);
+  if (!s || s.phase !== "idle") return;
+  void dispatch(s, p, s.messages, true); // snapshot history before the new user turn is appended
+}
+
+// Re-run the last assistant turn: drop it, re-route the prompting user message, stream a fresh
+// answer. Params (policy/model/thinking/effort) come from the composer's current selection.
+export function regenerate(chatId: string, p: Omit<SendParams, "fullText" | "images">): void {
+  const s = sessions.get(chatId);
+  if (!s || s.phase !== "idle") return;
+  const lastIdx = s.messages.length - 1;
+  if (lastIdx < 0 || s.messages[lastIdx].role !== "assistant") return;
+  let userIdx = lastIdx - 1;
+  while (userIdx >= 0 && s.messages[userIdx].role !== "user") userIdx--;
+  if (userIdx < 0) return;
+  const userMsg = s.messages[userIdx];
+  const history = s.messages.slice(0, userIdx); // everything before that user turn
+  s.messages = s.messages.slice(0, lastIdx); // drop the trailing assistant; keep the user turn
+  commit(s);
+  void dispatch(s, { ...p, fullText: userMsg.text, images: userMsg.images ?? [] }, history, false);
+}
+
+// Edit a user message and resend: drop that turn and everything after it, then re-route the
+// new text (keeping the original attachments) and stream a fresh answer.
+export function editAndResend(chatId: string, msgIndex: number, newText: string, p: Omit<SendParams, "fullText" | "images">): void {
+  const s = sessions.get(chatId);
+  if (!s || s.phase !== "idle") return;
+  const msg = s.messages[msgIndex];
+  if (!msg || msg.role !== "user") return;
+  const text = newText.trim();
+  if (!text) return;
+  const history = s.messages.slice(0, msgIndex); // everything before the edited turn
+  const imgs = msg.images ?? []; // keep the original attachments
+  s.messages = history; // drop the edited turn + everything after; dispatch re-appends the user turn
+  s.covered = Math.min(s.covered, history.length); // summary can't cover dropped messages
+  commit(s);
+  void dispatch(s, { ...p, fullText: text, images: imgs }, history, true);
+}
+
+// Abort the active stream for this chat. Partial output already streamed is finalized in realSend.
+export function stopStream(chatId: string): void {
+  sessions.get(chatId)?.abort?.abort();
 }
 
 // Build the windowed request and stream a real completion. Stays in "routing" until
@@ -378,6 +430,9 @@ async function realSend(
   };
   const apiMessages: ChatMsg[] = [{ role: "system", content: sysContent }, ...recent, userMsg];
 
+  const controller = new AbortController();
+  s.abort = controller;
+
   let acc = "";
   let reason = "";
   let usage: Extract<Delta, { kind: "usage" }> | undefined;
@@ -399,12 +454,17 @@ async function realSend(
   const update = () => patchLastStreaming(s, { shown: acc, reasoning: reason || undefined });
 
   try {
-    for await (const delta of streamLLM(backend, apiMessages, reasoningOn, effortLevel)) {
+    for await (const delta of streamLLM(backend, apiMessages, reasoningOn, effortLevel, controller.signal)) {
       if (!started) begin();
       if (delta.kind === "usage") usage = delta;
       else if (delta.kind === "thinking") reason += delta.text;
       else acc += delta.text;
       update();
+    }
+    // User stopped: keep whatever streamed, skip usage/cost/memory for this partial turn.
+    if (controller.signal.aborted) {
+      if (started) patchLastStreaming(s, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false });
+      return;
     }
     if (!started) begin(); // empty completion — still show a turn
     const latencyMs = performance.now() - t0;
@@ -428,33 +488,17 @@ async function realSend(
         .catch(() => {});
     }
   } catch (err) {
-    const msg = `⚠️ ${humanizeError(err instanceof Error ? err.message : "Request failed")}`;
-    if (!started) begin();
-    patchAt(s, s.messages.length - 1, { text: msg, shown: msg, streaming: false });
+    // Abort surfaces as a fetch error on the browser paths — finalize the partial, not an error.
+    if (controller.signal.aborted) {
+      if (started) patchLastStreaming(s, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false });
+    } else {
+      const msg = `⚠️ ${humanizeError(err instanceof Error ? err.message : "Request failed")}`;
+      if (!started) begin();
+      patchAt(s, s.messages.length - 1, { text: msg, shown: msg, streaming: false });
+    }
   } finally {
+    if (s.abort === controller) s.abort = null;
     setPhase(s, "idle");
     maybeGenerateTitle(s);
   }
-}
-
-// Offline demo typewriter. Mutates the session like a real stream so a mid-typewriter
-// chat switch behaves identically.
-function streamOut(s: Session, full: string, decision: Decision): void {
-  const estIn = decision.tokens;
-  const estOut = estimateTokens(full);
-  let i = 0;
-  const step = Math.max(2, Math.round(full.length / 90)); // ~90 frames
-  const tick = () => {
-    i = Math.min(full.length, i + step);
-    patchLastStreaming(s, { shown: full.slice(0, i) });
-    if (i < full.length) {
-      setTimeout(tick, 18);
-    } else {
-      // Estimated usage (no cost) → header shows tokens, no $.
-      patchLastStreaming(s, { shown: full, streaming: false, usage: { inputTokens: estIn, outputTokens: estOut }, latencyMs: undefined });
-      setPhase(s, "idle");
-      maybeGenerateTitle(s);
-    }
-  };
-  setTimeout(tick, 30);
 }

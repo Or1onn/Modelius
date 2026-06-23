@@ -122,8 +122,10 @@ pub async fn openai_responses_stream(
     body: serde_json::Value,
     access_token: String,
     account_id: String,
+    stream_id: String,
     on_event: tauri::ipc::Channel<StreamEvent>,
 ) -> Result<(), String> {
+    let cancel = crate::stream::cancel_guard(&stream_id);
     let mut builder = reqwest::Client::new()
         .post("https://chatgpt.com/backend-api/codex/responses")
         .header("content-type", "application/json")
@@ -141,7 +143,7 @@ pub async fn openai_responses_stream(
         return Ok(());
     };
 
-    pump_sse(res, |data| {
+    pump_sse(res, &cancel.flag, |data| {
         if data == "[DONE]" {
             return ControlFlow::Continue(());
         }

@@ -47,8 +47,10 @@ pub async fn anthropic_messages_stream(
     body: serde_json::Value,
     token: String,
     oauth: bool,
+    stream_id: String,
     on_event: tauri::ipc::Channel<StreamEvent>,
 ) -> Result<(), String> {
+    let cancel = crate::stream::cancel_guard(&stream_id);
     let mut req = reqwest::Client::new()
         .post("https://api.anthropic.com/v1/messages")
         .header("content-type", "application/json")
@@ -70,7 +72,7 @@ pub async fn anthropic_messages_stream(
     // events: input/cache on message_start, output (cumulative) on message_delta.
     // Accumulate and flush a Usage event at stop.
     let (mut input, mut output, mut cache_read, mut cache_write) = (0u64, 0u64, 0u64, 0u64);
-    pump_sse(res, |data| {
+    pump_sse(res, &cancel.flag, |data| {
         let Ok(j) = serde_json::from_str::<serde_json::Value>(data) else { return ControlFlow::Continue(()) };
         let u64_at = |j: &serde_json::Value, ptr: &str| j.pointer(ptr).and_then(|v| v.as_u64()).unwrap_or(0);
         match j.get("type").and_then(|v| v.as_str()).unwrap_or("") {

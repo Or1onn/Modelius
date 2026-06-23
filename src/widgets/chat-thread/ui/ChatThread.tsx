@@ -86,6 +86,101 @@ function UserContent({
   );
 }
 
+// A user turn with an inline edit affordance. Editing truncates the thread from here and resends.
+function UserRow({
+  msg,
+  index,
+  canEdit,
+  onOpenBlock,
+  onEditResend,
+}: {
+  msg: Message;
+  index: number;
+  canEdit: boolean;
+  onOpenBlock: (msgIndex: number, blockIndex: number) => void;
+  onEditResend?: (msgIndex: number, text: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(msg.text);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  const autosize = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 320) + "px";
+  };
+  // On entering edit mode: focus, size to content, caret at end.
+  useEffect(() => {
+    if (!editing) return;
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.focus();
+    autosize();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  }, [editing]);
+
+  const save = () => {
+    setEditing(false);
+    const t = draft.trim();
+    if (t && t !== msg.text) onEditResend?.(index, t);
+  };
+
+  if (editing)
+    return (
+      <div className="row-user">
+        <div className="user-edit">
+          <textarea
+            ref={taRef}
+            className="user-edit-ta"
+            value={draft}
+            rows={1}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              autosize();
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                save();
+              } else if (e.key === "Escape") setEditing(false);
+            }}
+          />
+          <div className="user-edit-bar">
+            <button className="ue-btn" onClick={() => setEditing(false)}>
+              Cancel
+            </button>
+            <button className="ue-btn primary" onClick={save}>
+              Send
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+
+  return (
+    <div className="row-user">
+      <div className="user-col">
+        <UserContent text={msg.text} images={msg.images} onOpen={(bi) => onOpenBlock(index, bi)} />
+        {canEdit && (
+          <div className="user-foot">
+            <button
+              className="asst-act"
+              title="Edit & resend"
+              onClick={() => {
+                setDraft(msg.text);
+                setEditing(true);
+              }}
+            >
+              <Icon name="edit" size={15} />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // An assistant answer: prose as markdown; a code block as a card when large (≥15 lines / 4 KB),
 // else inline. Same size test while streaming, so a small block stays inline from its first token.
 function AssistantBody({ text, streaming, onOpen }: { text: string; streaming: boolean; onOpen: (blockIndex: number) => void }) {
@@ -149,6 +244,31 @@ function MemoryNote({ facts }: { facts: string[] }) {
   );
 }
 
+// Per-answer actions: copy (with brief "copied" feedback) and regenerate (last turn only).
+function AsstActions({ text, canRegenerate, onRegenerate }: { text: string; canRegenerate: boolean; onRegenerate?: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () =>
+    navigator.clipboard?.writeText(text).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1400);
+      },
+      () => {}
+    );
+  return (
+    <>
+      <button className="asst-act" title={copied ? "Copied" : "Copy"} onClick={copy}>
+        <Icon name={copied ? "check" : "copy"} size={15} />
+      </button>
+      {canRegenerate && (
+        <button className="asst-act" title="Regenerate" onClick={onRegenerate}>
+          <Icon name="refresh" size={15} />
+        </button>
+      )}
+    </>
+  );
+}
+
 export function ChatThread({
   messages,
   phase,
@@ -156,6 +276,8 @@ export function ChatThread({
   policy,
   manual = false,
   onOpenBlock,
+  onRegenerate,
+  onEditResend,
 }: {
   messages: Message[];
   phase: "idle" | "routing" | "streaming";
@@ -163,6 +285,8 @@ export function ChatThread({
   policy: PolicyId;
   manual?: boolean; // a specific model is picked → "Thinking…" instead of the routing line
   onOpenBlock: (msgIndex: number, blockIndex: number) => void;
+  onRegenerate?: () => void; // re-run the last assistant turn
+  onEditResend?: (msgIndex: number, text: string) => void; // edit a user turn and resend
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true); // at bottom → follow the stream; scrolling up unpins
@@ -184,9 +308,14 @@ export function ChatThread({
       <div className="thread-inner">
         {messages.map((msg, i) =>
           msg.role === "user" ? (
-            <div key={i} className="row-user">
-              <UserContent text={msg.text} images={msg.images} onOpen={(bi) => onOpenBlock(i, bi)} />
-            </div>
+            <UserRow
+              key={i}
+              msg={msg}
+              index={i}
+              canEdit={phase === "idle"}
+              onOpenBlock={onOpenBlock}
+              onEditResend={onEditResend}
+            />
           ) : (
             <div key={i} className="row-asst">
               <div className="asst-head">
@@ -224,13 +353,6 @@ export function ChatThread({
                     {msg.decision!.chosenCost === 0 ? "free" : "$" + msg.decision!.chosenCost.toFixed(4)}
                   </span>
                 ) : null}
-                <span className="asst-spacer" />
-                <button className="asst-act" title="Copy">
-                  <Icon name="copy" size={13} />
-                </button>
-                <button className="asst-act" title="Regenerate">
-                  <Icon name="refresh" size={13} />
-                </button>
               </div>
               {msg.reasoning && <ReasoningBlock text={msg.reasoning} streaming={!!msg.streaming} />}
               <div className="asst-body md">
@@ -242,6 +364,15 @@ export function ChatThread({
                 {msg.streaming && <span className="cursor" />}
               </div>
               {msg.memory && msg.memory.length > 0 && <MemoryNote facts={msg.memory} />}
+              {!msg.streaming && (
+                <div className="asst-foot">
+                  <AsstActions
+                    text={msg.text}
+                    canRegenerate={phase === "idle" && i === messages.length - 1}
+                    onRegenerate={onRegenerate}
+                  />
+                </div>
+              )}
             </div>
           )
         )}

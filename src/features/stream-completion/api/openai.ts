@@ -18,7 +18,8 @@ export async function* streamChatGPT(
   model: string,
   messages: ChatMsg[],
   modelName?: string,
-  thinking = false
+  thinking = false,
+  signal?: AbortSignal
 ): AsyncGenerator<Delta> {
   const auth = await getOpenAIAuth();
   if (!auth) throw new Error("No Codex account connected.");
@@ -41,11 +42,14 @@ export async function* streamChatGPT(
   // `summary: "auto"` streams a reasoning summary we can show.
   if (thinking) body.reasoning = { effort: "medium", summary: "auto" };
 
+  const streamId = crypto.randomUUID(); // lets Stop cancel the upstream request mid-flight
   yield* channelToDeltas(
-    (onEvent) => invoke("openai_responses_stream", { body, accessToken: auth.token, accountId: auth.accountId, onEvent }),
+    (onEvent) => invoke("openai_responses_stream", { body, accessToken: auth.token, accountId: auth.accountId, streamId, onEvent }),
     (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, metered: false }),
     // 401 = subscription session revoked/dead; drop the token so Providers shows disconnected.
-    (msg) => { if (/^ChatGPT 401\b/.test(msg)) disconnectOpenAIOAuth(); }
+    (msg) => { if (/^ChatGPT 401\b/.test(msg)) disconnectOpenAIOAuth(); },
+    signal,
+    streamId
   );
 }
 
@@ -54,7 +58,8 @@ export async function* streamChat(
   model: string,
   messages: ChatMsg[],
   modelName?: string,
-  thinking = false
+  thinking = false,
+  signal?: AbortSignal
 ): AsyncGenerator<Delta> {
   const key = await getKey("openai");
   if (!key) throw new Error("No OpenAI API key configured.");
@@ -78,6 +83,7 @@ export async function* streamChat(
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
+    signal,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${key}`,

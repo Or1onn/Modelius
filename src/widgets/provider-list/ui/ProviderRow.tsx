@@ -12,6 +12,9 @@ import { CODEX_MODELS } from "@/entities/model/model/apiIds";
 import { useAnthropicAuth } from "@/features/connect-anthropic/model/anthropicAuth";
 import { useOpenAIAuth } from "@/features/connect-openai/model/openaiAuth";
 
+// Reachability of the local daemon (Ollama): unknown until probed, then up/down.
+export type LocalStatus = "checking" | "up" | "down";
+
 const OAUTH = new Set(["anthropic", "openai"]); // have account sign-in
 const LIVE = new Set(["openai", "anthropic"]); // key can fetch a live model list
 const KEY_LIVE = new Set(["google", "groq"]); // key fetches a live list over the OpenAI-compat endpoint
@@ -278,9 +281,17 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
 }
 
 // ---------- inline manage ----------
-function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: () => void }) {
+function ManageInline({
+  pid,
+  onDisconnected,
+  onStatus,
+}: {
+  pid: string;
+  onDisconnected: () => void;
+  onStatus?: (s: LocalStatus) => void;
+}) {
   const p = PROVIDERS[pid];
-  const local = !!p.local;
+  const local = p.local;
   const { getKey, hasKey, clearKey } = useKeyStore();
   const { connected: anthConnected, disconnectAnthropicOAuth } = useAnthropicAuth();
   const { connected: oaiConnected, disconnectOpenAIOAuth } = useOpenAIAuth();
@@ -290,6 +301,11 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
 
   const [show, setShow] = useState(false);
   const [confirm, setConfirm] = useState(false);
+  const [reachable, setReachable] = useState<boolean | null>(null); // local daemon: null until probed
+  const report = (s: LocalStatus) => {
+    if (local) setReachable(s === "up");
+    onStatus?.(s);
+  };
 
   // Key value is in the keychain (async); load it for the masked/revealed display.
   const [keyVal, setKeyVal] = useState("");
@@ -320,13 +336,21 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
     let alive = true;
     (async () => {
       try {
-        if (local) setLive(alive ? await listOllamaModels() : []);
-        else if (viaOAuth && pid === "anthropic") setLive(alive ? await listClaudeAccountModels() : []);
+        if (local) {
+          const ms = alive ? await listOllamaModels() : [];
+          if (alive) {
+            setLive(ms);
+            report("up"); // daemon answered → reachable (even with zero models)
+          }
+        } else if (viaOAuth && pid === "anthropic") setLive(alive ? await listClaudeAccountModels() : []);
         else if (viaOAuth && pid === "openai") setLive(CODEX_MODELS.map((m) => ({ id: m.id, name: m.name })));
         else if (KEY_LIVE.has(pid) && viaKey) setLive(alive ? await listKeyProviderModels(pid) : []);
         else setLive(await listModels(pid));
       } catch {
-        if (alive) setLive([]);
+        if (alive) {
+          setLive([]);
+          if (local) report("down"); // daemon unreachable → not running / not installed
+        }
       }
     })();
     return () => {
@@ -339,8 +363,10 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
     setLive(null);
     try {
       setLive(await refreshOllama());
+      report("up");
     } catch {
       setLive([]);
+      report("down");
     }
   }
 
@@ -398,7 +424,16 @@ function ManageInline({ pid, onDisconnected }: { pid: string; onDisconnected: ()
       ) : local && live.length === 0 ? (
         <div className="key-hint" style={{ marginTop: 4 }}>
           <Icon name="alert" size={13} />
-          Ollama isn't reachable. Start it (<code>ollama serve</code>) and pull a model (<code>ollama pull llama3.2</code>), then recheck.
+          {reachable === false ? (
+            <>
+              Ollama isn't running. Start it (<code>ollama serve</code>) — or install it from <code>ollama.com</code> — then
+              recheck.
+            </>
+          ) : (
+            <>
+              No models installed. Pull one (<code>ollama pull llama3.2</code>), then recheck.
+            </>
+          )}
         </div>
       ) : (
         <div className="manage-models">
@@ -460,13 +495,18 @@ export function ProviderRow({
   configured,
   expanded,
   onToggle,
+  localStatus = "checking",
+  onLocalStatus,
 }: {
   pid: string;
   configured: boolean;
   expanded: boolean;
   onToggle: () => void;
+  localStatus?: LocalStatus; // local (Ollama) daemon reachability, for the status badge
+  onLocalStatus?: (s: LocalStatus) => void;
 }) {
   const p = PROVIDERS[pid];
+  const local = p.local;
   const count = modelsOf(pid).length;
 
   return (
@@ -486,20 +526,40 @@ export function ProviderRow({
           </div>
         </div>
         <div className="pv-rowright">
-          {configured && <span className="pv-dot green" />}
-          {configured ? (
-            <button
-              className="pv-config"
-              onClick={(e) => {
-                e.stopPropagation();
-                onToggle();
-              }}
-            >
-              Connected
-              <span className={"pv-chev" + (expanded ? " open" : "")}>
-                <Icon name="chevron" size={13} />
-              </span>
-            </button>
+          {local ? (
+            <>
+              <span
+                className={"pv-dot " + (localStatus === "up" ? "green" : localStatus === "down" ? "warn" : "muted")}
+              />
+              <button
+                className="pv-config"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggle();
+                }}
+              >
+                {localStatus === "up" ? "Connected" : localStatus === "down" ? "Not running" : "Checking…"}
+                <span className={"pv-chev" + (expanded ? " open" : "")}>
+                  <Icon name="chevron" size={13} />
+                </span>
+              </button>
+            </>
+          ) : configured ? (
+            <>
+              <span className="pv-dot green" />
+              <button
+                className="pv-config"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggle();
+                }}
+              >
+                Connected
+                <span className={"pv-chev" + (expanded ? " open" : "")}>
+                  <Icon name="chevron" size={13} />
+                </span>
+              </button>
+            </>
           ) : (
             <button
               className="pv-connect"
@@ -520,7 +580,7 @@ export function ProviderRow({
           <div className="pv-expand-pad">
             {expanded &&
               (configured ? (
-                <ManageInline pid={pid} onDisconnected={onToggle} />
+                <ManageInline pid={pid} onDisconnected={onToggle} onStatus={onLocalStatus} />
               ) : (
                 <ConnectInline pid={pid} onConnected={onToggle} />
               ))}

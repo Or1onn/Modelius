@@ -22,6 +22,8 @@ export function Sidebar({
   activeChatId,
   onOpenChat,
   onDeleteChat,
+  onPinChat,
+  onRenameChat,
 }: {
   screen: ScreenId;
   setScreen: (s: ScreenId) => void;
@@ -31,6 +33,8 @@ export function Sidebar({
   activeChatId: string;
   onOpenChat: (id: string) => void;
   onDeleteChat: (id: string) => void;
+  onPinChat: (id: string, pinned: boolean) => void;
+  onRenameChat: (id: string, title: string) => void;
 }) {
   const { getChats } = useChatStore();
   const chats = getChats();
@@ -88,6 +92,8 @@ export function Sidebar({
               screen={screen}
               onOpenChat={onOpenChat}
               onDeleteChat={onDeleteChat}
+              onPinChat={onPinChat}
+              onRenameChat={onRenameChat}
             />
           ))}
         </div>

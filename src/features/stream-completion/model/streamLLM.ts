@@ -9,10 +9,11 @@ export async function* streamLLM(
   backend: Backend,
   messages: ChatMsg[],
   thinking = false,
-  effort: EffortLevel | "auto" = "auto"
+  effort: EffortLevel | "auto" = "auto",
+  signal?: AbortSignal
 ): AsyncGenerator<Delta> {
-  if (backend.kind === "openai") yield* streamChat(backend.model, messages, backend.label, thinking);
-  else if (backend.kind === "chatgpt") yield* streamChatGPT(backend.model, messages, backend.label, thinking);
-  else if (backend.kind === "anthropic") yield* streamClaude(backend.model, messages, backend.label, thinking, effort);
-  else if (backend.kind === "compat") yield* streamCompat(backend, messages, backend.label);
+  if (backend.kind === "openai") yield* streamChat(backend.model, messages, backend.label, thinking, signal);
+  else if (backend.kind === "chatgpt") yield* streamChatGPT(backend.model, messages, backend.label, thinking, signal);
+  else if (backend.kind === "anthropic") yield* streamClaude(backend.model, messages, backend.label, thinking, effort, signal);
+  else if (backend.kind === "compat") yield* streamCompat(backend, messages, backend.label, signal);
 }

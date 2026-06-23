@@ -26,56 +26,68 @@ const REASON_WORDS_RU = /почему|объясн|анализ|докаж|ср�
 const MATH = /\bO\([^)]*\)|[∑∫√≈≤≥]/;
 const CONSTRAINTS = /\b(without using|in-?place|at most|no more than)\b|не использу|за o\(/;
 
-export function scoreDifficulty(text: string): { score: number; isCode: boolean } {
+export const KIND_LABELS: Record<Kind, string> = {
+  trivial: "Simple factual query",
+  general: "General request",
+  code: "Code-related request",
+  complex: "Complex reasoning task",
+};
+
+// Build the classification shape for a kind+difficulty (shared with the LLM classifier).
+export function classificationFor(kind: Kind, difficulty: number, confident: boolean): Classification {
+  return { kind, label: `${KIND_LABELS[kind]} (difficulty ${difficulty}/100)`, difficulty, confident };
+}
+
+export function scoreDifficulty(text: string): { score: number; isCode: boolean; confident: boolean } {
   const raw = text || "";
-  const t = raw.toLowerCase();
+  const hasFence = /```/.test(raw);
+  // Difficulty is the SKILL axis, not the size axis: score the instruction, not pasted
+  // code/logs. Strip fenced blocks so a big paste with a simple ask stays low. Length is
+  // handled separately by route()'s context-window filter, never here.
+  const body = raw.replace(/```[\s\S]*?```/g, " ");
+  const t = body.toLowerCase();
   let score = 0;
 
-  const isCode = CODE_WORDS.test(t) || CODE_STRUCT.test(raw) || /```/.test(raw) || STACK_TRACE.test(raw);
+  const isCode = CODE_WORDS.test(t) || CODE_STRUCT.test(body) || hasFence || STACK_TRACE.test(body);
   if (isCode) score += 25;
-  if (/```/.test(raw)) score += 10;
-  if (STACK_TRACE.test(raw)) score += 15;
+  if (hasFence) score += 10;
+  if (STACK_TRACE.test(body)) score += 15;
 
   // More distinct reasoning verbs = harder: 25 for one, +5 each up to 40.
   const reasonHits = (t.match(REASON_WORDS) || []).length + (t.match(REASON_WORDS_RU) || []).length;
   if (reasonHits) score += Math.min(40, 20 + reasonHits * 5);
-  if (MATH.test(raw)) score += 10;
+  if (MATH.test(body)) score += 10;
   if (CONSTRAINTS.test(t)) score += 10;
 
   // Multi-step structure: list items + multiple questions.
-  const steps = (raw.match(/^\s*(?:[-*]|\d+[.)])\s/gm) || []).length;
+  const steps = (body.match(/^\s*(?:[-*]|\d+[.)])\s/gm) || []).length;
   if (steps >= 2) score += Math.min(15, steps * 5);
-  if ((raw.match(/\?/g) || []).length >= 2) score += 5;
+  if ((body.match(/\?/g) || []).length >= 2) score += 5;
 
-  // Graded length: 0 below ~16 tokens, +25 at ~300.
-  score += Math.min(25, Math.max(0, ((estimateTokens(raw) - 16) / 284) * 25));
-
-  return { score: Math.min(100, Math.round(score)), isCode };
+  score = Math.min(100, Math.round(score));
+  // Confident only at the extremes — the murky middle escalates to the LLM classifier.
+  const confident = score >= 75 || (score < 18 && !isCode && estimateTokens(body) < 30);
+  return { score, isCode, confident };
 }
 
 export function classify(text: string): Classification {
-  const { score, isCode } = scoreDifficulty(text);
+  const { score, isCode, confident } = scoreDifficulty(text);
   let kind: Kind;
   if (score >= 70) kind = "complex";
   else if (isCode) kind = "code";
   else if (score < 25) kind = "trivial";
   else kind = "general";
-  const labels: Record<Kind, string> = {
-    trivial: "Simple factual query",
-    general: "General request",
-    code: "Code-related request",
-    complex: "Complex reasoning task",
-  };
-  return { kind, label: `${labels[kind]} (difficulty ${score}/100)`, difficulty: score };
+  return classificationFor(kind, score, confident);
 }
 
 // ----- Routing engine -----
 export function route(
   text: string,
   policy: PolicyId,
-  opts?: { requireVision?: boolean; contextTokens?: number; pool?: Model[] }
+  opts?: { requireVision?: boolean; contextTokens?: number; pool?: Model[]; classification?: Classification }
 ): Decision {
-  const cls = classify(text);
+  // A pre-computed classification (e.g. from the LLM classifier) overrides the heuristic.
+  const cls = opts?.classification ?? classify(text);
   const score = cls.difficulty ?? 0;
   const tokens = Math.round(200 + score * 10);
   // 65→92 over the score range (endpoints = old trivial(68)/complex(90) buckets).
@@ -109,9 +121,9 @@ export function route(
   const scored: Candidate[] = pool.map((m) => {
     let score: number;
     if (policy === "cost") score = 100 - reqCost(m) * 4000 + (m.cap - minCap) * 0.15;
-    else if (policy === "quality") score = m.cap * 1.0 + m.spd * 0.05;
-    else if (policy === "speed") score = m.spd * 1.0 + m.cap * 0.08 - m.latency * 6;
-    else score = m.cap * 1.0 - reqCost(m) * 1000; // privacy
+    else if (policy === "quality") score = m.cap + m.spd * 0.05;
+    else if (policy === "speed") score = m.spd + m.cap * 0.08 - m.latency * 6;
+    else score = m.cap - reqCost(m) * 1000; // privacy
     return { model: m, score, reqCost: reqCost(m) };
   });
   scored.sort((a, b) => b.score - a.score);

@@ -1,11 +1,12 @@
 // ProvidersScreen.tsx — provider connections in two settings-list sections; rows live in the provider-list widget.
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { PROVIDERS } from "@/entities/model/model/registry";
 import { useAnthropicAuth } from "@/features/connect-anthropic/model/anthropicAuth";
 import { useOpenAIAuth } from "@/features/connect-openai/model/openaiAuth";
-import { ProviderRow } from "@/widgets/provider-list/ui/ProviderRow";
+import { ProviderRow, type LocalStatus } from "@/widgets/provider-list/ui/ProviderRow";
 import { ApiKeys } from "@/widgets/provider-list/ui/ApiKeys";
+import { peekOllamaModels, refreshOllama } from "@/entities/session/model/ollamaSession";
 
 // Connected via a linked account (OAuth) or on-device. Keys live in the API Keys section.
 const ACCOUNT_PROVIDERS = ["anthropic", "openai", "ollama"];
@@ -56,10 +57,22 @@ export function ProvidersScreen() {
   const { connected: oaiConnected } = useOpenAIAuth();
   const [expanded, setExpanded] = useState<string | null>(null);
   const [apiOpen, setApiOpen] = useState(false);
+  // Probe the local Ollama daemon so the row shows whether it's actually running.
+  const [ollama, setOllama] = useState<LocalStatus>(() => (peekOllamaModels() ? "up" : "checking"));
+
+  useEffect(() => {
+    let alive = true;
+    refreshOllama()
+      .then(() => alive && setOllama("up"))
+      .catch(() => alive && setOllama("down"));
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // Account section reflects a linked account / on-device only — keys are handled in the API Keys section.
   function isConfigured(pid: string) {
-    if (PROVIDERS[pid].local) return true; // Ollama always available on-device
+    if (PROVIDERS[pid].local) return true; // local row always expands to its manage panel (reachability shown separately)
     if (pid === "anthropic") return anthConnected;
     if (pid === "openai") return oaiConnected;
     return false;
@@ -89,6 +102,8 @@ export function ProvidersScreen() {
                 configured={isConfigured(pid)}
                 expanded={expanded === pid}
                 onToggle={() => toggle(pid)}
+                localStatus={PROVIDERS[pid].local ? ollama : undefined}
+                onLocalStatus={PROVIDERS[pid].local ? setOllama : undefined}
               />
             ))}
           </div>

@@ -34,6 +34,17 @@ export const MEMORY_EXTRACT_PROMPT =
   "transliterate them. Reply with a JSON array only; use [] when nothing changes. " +
   "No prose, no code fences.\n\n";
 
+// Classify a request for smart routing when the heuristic is unsure. Output is JSON-parsed:
+// must be a single JSON object only. Judge SKILL needed, not text length.
+export const ROUTE_CLASSIFY_PROMPT =
+  "You are a routing classifier. Decide how much model capability the user's request " +
+  "truly needs — by the REASONING and SKILL required, NOT by how long the text is. A long " +
+  "pasted log, transcript or code dump with a simple ask (find a line, fix a typo, extract " +
+  "a value) is LOW difficulty. Categories: trivial = lookup or trivial edit; general = an " +
+  "ordinary request; code = a real programming task; complex = multi-step reasoning, " +
+  "architecture, math or proof. Reply with a single JSON object only, no prose, no code " +
+  'fences: {"difficulty": <integer 0-100>, "kind": "trivial|general|code|complex"}.\n\n';
+
 // Name a new chat from its first exchange. Output used verbatim as the title:
 // title text only (no quotes, fences, or trailing punctuation).
 export const TITLE_PROMPT =

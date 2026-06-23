@@ -1,6 +1,43 @@
 // stream.rs — streaming events sent to the webview + shared streaming/error helpers.
 use reqwest::Response;
+use std::collections::HashMap;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+// Cancellation registry: maps a per-request stream id to a flag the pump loop polls.
+// The webview flips it via `cancel_stream` when the user hits Stop, so the proxy drops
+// the upstream connection instead of streaming a response nobody is reading.
+fn cancels() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    static R: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// RAII handle: registers a cancel flag for `id` and removes it on drop (every command exit path).
+pub(crate) struct CancelGuard {
+    id: String,
+    pub flag: Arc<AtomicBool>,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        cancels().lock().unwrap().remove(&self.id);
+    }
+}
+
+pub(crate) fn cancel_guard(id: &str) -> CancelGuard {
+    let flag = Arc::new(AtomicBool::new(false));
+    cancels().lock().unwrap().insert(id.to_string(), flag.clone());
+    CancelGuard { id: id.to_string(), flag }
+}
+
+// Flip the flag for a live stream so its pump loop stops at the next chunk boundary.
+#[tauri::command]
+pub fn cancel_stream(stream_id: String) {
+    if let Some(flag) = cancels().lock().unwrap().get(&stream_id) {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
 
 // Streaming events sent back to the webview over a Tauri channel.
 #[derive(Clone, serde::Serialize)]
@@ -49,12 +86,16 @@ pub(crate) async fn check_stream_status(
 
 // Read an SSE body line-by-line, handing each non-empty `data:` payload to `on_data`.
 // `on_data` returns ControlFlow::Break to stop early (e.g. on [DONE] / completion events).
-pub(crate) async fn pump_sse<F>(mut res: Response, mut on_data: F) -> Result<(), String>
+// Returns at the next chunk boundary once `cancel` is set — dropping `res` closes the connection.
+pub(crate) async fn pump_sse<F>(mut res: Response, cancel: &AtomicBool, mut on_data: F) -> Result<(), String>
 where
     F: FnMut(&str) -> ControlFlow<()>,
 {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(bytes) = res.chunk().await.map_err(|e| e.to_string())? {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         buf.extend_from_slice(&bytes);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = buf.drain(..=pos).collect();

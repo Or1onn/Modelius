@@ -1,5 +1,5 @@
 // channel.ts — bridge a Rust streaming command (events over a Tauri Channel) into an async generator of Deltas.
-import { Channel } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import type { Delta } from "@/entities/model/model/backend";
 
 // Raw usage payload from Rust; cache fields are optional (the compat proxy omits them).
@@ -18,7 +18,9 @@ export type StreamEvent =
 export async function* channelToDeltas(
   start: (channel: Channel<StreamEvent>) => Promise<unknown>,
   mapUsage: (u: RawUsage) => Delta,
-  onError?: (msg: string) => void
+  onError?: (msg: string) => void,
+  signal?: AbortSignal,
+  streamId?: string
 ): AsyncGenerator<Delta> {
   const channel = new Channel<StreamEvent>();
   const queue: Delta[] = [];
@@ -29,6 +31,17 @@ export async function* channelToDeltas(
     wake?.();
     wake = null;
   };
+  // Abort: stop consuming the channel promptly and tell the Rust proxy to drop the upstream
+  // connection (cancel_stream by id). The partial output already streamed stays put.
+  if (signal) {
+    const onAbort = () => {
+      finished = true;
+      if (streamId) void invoke("cancel_stream", { streamId }).catch(() => {});
+      ping();
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
   channel.onmessage = (msg) => {
     if (msg.type === "chunk") queue.push({ kind: "text", text: msg.data });
     else if (msg.type === "thinking") queue.push({ kind: "thinking", text: msg.data });

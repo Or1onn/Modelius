@@ -18,7 +18,8 @@ export async function* streamClaude(
   messages: ChatMsg[],
   modelName?: string,
   thinking = false,
-  effort: EffortLevel | "auto" = "auto"
+  effort: EffortLevel | "auto" = "auto",
+  signal?: AbortSignal
 ): AsyncGenerator<Delta> {
   // Messages API takes only user/assistant turns; system is top-level.
   type TextBlock = { type: "text"; text: string; cache_control?: { type: "ephemeral" } };
@@ -85,8 +86,9 @@ export async function* streamClaude(
   }
 
   // Bridge the Rust channel into this generator. `oauth` (subscription) = not metered; the key path bills.
+  const streamId = crypto.randomUUID(); // lets Stop cancel the upstream request mid-flight
   yield* channelToDeltas(
-    (onEvent) => invoke("anthropic_messages_stream", { body, token, oauth, onEvent }),
+    (onEvent) => invoke("anthropic_messages_stream", { body, token, oauth, streamId, onEvent }),
     (u) => ({
       kind: "usage",
       inputTokens: u.input_tokens,
@@ -97,6 +99,8 @@ export async function* streamClaude(
     }),
     // OAuth-path 401 = session revoked/dead; drop the token so Providers shows disconnected.
     // (Key-path 401s aren't our token to clear.)
-    (msg) => { if (oauth && /^Anthropic 401\b/.test(msg)) disconnectAnthropicOAuth(); }
+    (msg) => { if (oauth && /^Anthropic 401\b/.test(msg)) disconnectAnthropicOAuth(); },
+    signal,
+    streamId
   );
 }

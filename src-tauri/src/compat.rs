@@ -25,8 +25,10 @@ pub async fn compat_chat_stream(
     api_key: String,
     provider: String,
     body: serde_json::Value,
+    stream_id: String,
     on_event: tauri::ipc::Channel<StreamEvent>,
 ) -> Result<(), String> {
+    let cancel = crate::stream::cancel_guard(&stream_id);
     let mut builder = reqwest::Client::new()
         .post(join_url(&base_url, "/chat/completions"))
         .header("content-type", "application/json")
@@ -41,7 +43,7 @@ pub async fn compat_chat_stream(
         return Ok(());
     };
 
-    pump_sse(res, |data| {
+    pump_sse(res, &cancel.flag, |data| {
         if data == "[DONE]" {
             let _ = on_event.send(StreamEvent::Done);
             return ControlFlow::Break(());

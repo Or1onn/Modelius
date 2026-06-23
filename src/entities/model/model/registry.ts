@@ -83,6 +83,7 @@ export interface Classification {
   kind: "trivial" | "general" | "code" | "complex";
   label: string;
   difficulty?: number; // 0–100; absent on Decisions persisted before it existed
+  confident?: boolean; // heuristic is sure → skip the LLM classifier (transient, routing-time)
 }
 
 export interface Candidate {

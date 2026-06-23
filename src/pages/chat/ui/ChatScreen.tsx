@@ -12,8 +12,9 @@ import { listAvailableModels, peekAvailableModels } from "@/features/pick-backen
 import { makeArtifact, rememberArtifactTitle, isLargePaste, wrapFence, type Artifact } from "@/entities/artifact/model/artifacts";
 import { readDataUrl, readText } from "@/pages/chat/lib/files";
 import { getChats } from "@/entities/chat/model/chats";
-import { useSession, sendMessage } from "@/pages/chat/model/sessionStore";
+import { useSession, sendMessage, stopStream, regenerate, editAndResend } from "@/pages/chat/model/sessionStore";
 import { getDraft, setDraft, clearDraft } from "@/pages/chat/model/drafts";
+import { getModelSel, setModelSel as persistModelSel } from "@/pages/chat/model/modelSel";
 
 // What the right panel shows: a static artifact (composer chip preview) or a live
 // locator into a thread message's Nth code block.
@@ -40,17 +41,24 @@ export function ChatScreen({
   policy,
   chatId,
   showDemo = false,
+  onConnectModel,
 }: {
   policy: PolicyId;
   chatId: string;
   showDemo?: boolean;
+  onConnectModel?: () => void;
 }) {
   // Demo thread only on the startup chat of a first-ever launch (no saved chats yet).
   const demo = showDemo && getChats().length === 0;
   // State + streaming live in the global session store, surviving a chat/screen switch.
   const { messages, phase, compacting, title, titleSettled, loading } = useSession(chatId, demo);
   const [input, setInput] = useState(() => getDraft(chatId)); // restore unsent draft on chat/screen switch
-  const [modelSel, setModelSel] = useState<ModelOption | null>(null); // null = Auto (routed)
+  // Persist the manual pick per-chat so it survives a chat/screen switch (like drafts).
+  const [modelSel, setModelSelState] = useState<ModelOption | null>(() => getModelSel(chatId));
+  const setModelSel = (sel: ModelOption | null) => {
+    persistModelSel(chatId, sel);
+    setModelSelState(sel);
+  };
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelQuery, setModelQuery] = useState(""); // 1code-style search filter in the picker
   const [thinking, setThinking] = useState(false); // request the reasoning trace
@@ -65,6 +73,7 @@ export function ChatScreen({
   const [attachments, setAttachments] = useState<Artifact[]>([]); // pending pasted/dropped text → artifact chips
   const [images, setImages] = useState<ImageRef[]>([]); // pending image attachments (vision)
   const [dragging, setDragging] = useState(false); // drag-over highlight
+  const [noModel, setNoModel] = useState(false); // tried to send with nothing connected
   const fileRef = useRef<HTMLInputElement>(null); // hidden file picker
 
   const busy = phase !== "idle";
@@ -143,6 +152,12 @@ export function ChatScreen({
   function send() {
     const text = input.trim();
     if ((!text && attachments.length === 0 && images.length === 0) || busy) return;
+    // No provider connected → don't fake an answer; prompt the user to connect a model.
+    if (peekAvailableModels().length === 0) {
+      setNoModel(true);
+      return;
+    }
+    setNoModel(false);
     // Fold attachments into the message as fenced blocks — no Message-shape change needed.
     const fullText = [text, ...attachments.map((a) => wrapFence(a.lang, a.code))].filter(Boolean).join("\n\n");
     const imgs = images;
@@ -182,6 +197,15 @@ export function ChatScreen({
   // Input block: centered (new chat) or pinned to the bottom.
   const composer = (
     <>
+    {noModel && (
+      <div className="no-model-notice">
+        <Icon name="providers" size={15} />
+        <span>No model connected — connect a provider to start chatting.</span>
+        <button className="no-model-btn" onClick={() => onConnectModel?.()}>
+          Connect a model
+        </button>
+      </div>
+    )}
     <div
       className={"composer" + (busy ? " busy" : "") + (dragging ? " dragover" : "")}
       onDragOver={(e) => {
@@ -231,9 +255,8 @@ export function ChatScreen({
       <textarea
         ref={taRef}
         value={input}
-        readOnly={busy}
         className={busy ? "working" : ""}
-        placeholder={busy ? "Working on your request…" : "Ask anything — the router picks the model."}
+        placeholder={busy ? "Working… type your next message" : "Ask anything — the router picks the model."}
         rows={1}
         onChange={(e) => {
           setInput(e.target.value);
@@ -418,9 +441,9 @@ export function ChatScreen({
         <span style={{ flex: 1 }} />
         <button
           className={"send-btn" + (busy ? " stop" : canSend ? " on" : "")}
-          onClick={busy ? undefined : send}
+          onClick={busy ? () => stopStream(chatId) : send}
           disabled={!busy && !canSend}
-          title={busy ? "Working…" : "Send"}
+          title={busy ? "Stop generating" : "Send"}
         >
           {busy ? <span className="send-stop" /> : <Icon name="send" size={16} />}
         </button>
@@ -437,7 +460,7 @@ export function ChatScreen({
   const openMsg = openRef?.kind === "msg" ? messages[openRef.msgIndex] : undefined;
   const openArt = !openRef ? null : openRef.kind === "static" ? openRef.art : resolveBlock(openMsg, openRef.blockIndex);
   const openGenerating =
-    openRef?.kind === "msg" && !!openMsg?.streaming && openMsg.text === "" && !!codeSegs(openMsg.shown || "")[openRef.blockIndex]?.open;
+    openRef?.kind === "msg" && !!openMsg?.streaming && openMsg.text === "" && codeSegs(openMsg.shown || "")[openRef.blockIndex]?.open;
 
   return (
     <div className="chat-wrap">
@@ -480,6 +503,8 @@ export function ChatScreen({
               policy={policy}
               manual={!!modelSel}
               onOpenBlock={(mi, bi) => setOpenRef({ kind: "msg", msgIndex: mi, blockIndex: bi })}
+              onRegenerate={() => regenerate(chatId, { policy, modelSel, thinking, effort })}
+              onEditResend={(mi, text) => editAndResend(chatId, mi, text, { policy, modelSel, thinking, effort })}
             />
             <div className="composer-wrap">{composer}</div>
           </>

@@ -9,7 +9,7 @@ import { isTauri } from "@/shared/api/tauri";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
 import type { Backend, ChatMsg, Delta } from "@/entities/model/model/backend";
 
-export async function* streamCompat(backend: Backend, messages: ChatMsg[], modelName?: string): AsyncGenerator<Delta> {
+export async function* streamCompat(backend: Backend, messages: ChatMsg[], modelName?: string, signal?: AbortSignal): AsyncGenerator<Delta> {
   // A fixed baseUrl endpoint: Gemini/Groq (keyed) or Ollama (local, no key).
   const baseUrl = backend.baseUrl;
   if (!baseUrl) throw new Error("Endpoint is no longer configured.");
@@ -29,20 +29,25 @@ export async function* streamCompat(backend: Backend, messages: ChatMsg[], model
   const body = { model: backend.model, messages: reqMsgs, stream: true, stream_options: { include_usage: true } };
 
   if (!isTauri()) {
-    yield* browserStream(baseUrl, name, key, body, metered);
+    yield* browserStream(baseUrl, name, key, body, metered, signal);
     return;
   }
 
+  const streamId = crypto.randomUUID(); // lets Stop cancel the upstream request mid-flight
   yield* channelToDeltas(
-    (onEvent) => invoke("compat_chat_stream", { baseUrl, apiKey: key, provider: name, body, onEvent }),
-    (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, metered })
+    (onEvent) => invoke("compat_chat_stream", { baseUrl, apiKey: key, provider: name, body, streamId, onEvent }),
+    (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, metered }),
+    undefined,
+    signal,
+    streamId
   );
 }
 
 // Browser-dev fallback: works only when the endpoint sends CORS headers (e.g. Ollama with OLLAMA_ORIGINS).
-async function* browserStream(baseUrl: string, name: string, key: string, body: unknown, metered: boolean): AsyncGenerator<Delta> {
+async function* browserStream(baseUrl: string, name: string, key: string, body: unknown, metered: boolean, signal?: AbortSignal): AsyncGenerator<Delta> {
   const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/chat/completions`, {
     method: "POST",
+    signal,
     headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
     body: JSON.stringify(body),
   });

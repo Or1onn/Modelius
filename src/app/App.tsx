@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import "@/app/styles/styles.css";
 import { type PolicyId } from "@/entities/model/model/registry";
-import { deleteChat, hydrateChatIndex } from "@/entities/chat/model/chats";
+import { deleteChat, pinChat, renameChat, hydrateChatIndex } from "@/entities/chat/model/chats";
 import { dropSession, isEmptySession } from "@/pages/chat/model/sessionStore";
 import { listOllamaModels } from "@/entities/session/model/ollamaSession";
 import { hasKey } from "@/entities/session/model/keys";
@@ -106,6 +106,8 @@ export default function App() {
         activeChatId={activeChatId}
         onOpenChat={openChat}
         onDeleteChat={removeChat}
+        onPinChat={pinChat}
+        onRenameChat={renameChat}
       />
       {navCollapsed && (
         <button className="sb-reopen" title="Show sidebar" onClick={() => setNavCollapsed(false)}>
@@ -120,6 +122,7 @@ export default function App() {
             chatId={activeChatId}
             showDemo={activeChatId === startupChatId.current}
             policy={policy}
+            onConnectModel={() => setScreen("providers")}
           />
         )}
         {screen === "providers" && <ProvidersScreen />}
