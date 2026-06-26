@@ -165,6 +165,7 @@ pub async fn openai_responses_stream(
                     output_tokens: j.pointer("/response/usage/output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                     cache_read: 0,
                     cache_write: 0,
+                    cost: None, // OpenAI bills via token usage; no per-request cost in the response.
                 });
                 let _ = on_event.send(StreamEvent::Done);
                 return ControlFlow::Break(());

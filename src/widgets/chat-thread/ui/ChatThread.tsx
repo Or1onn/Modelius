@@ -337,17 +337,7 @@ export function ChatThread({
                     No estimate while streaming (would vanish at completion on a subscription).
                     The estimate branch is only for static seed turns. */}
                 {msg.cost != null ? (
-                  <span className="asst-meta mono">
-                    ${msg.cost.toFixed(4)}
-                    {msg.priceSource && (
-                      <span
-                        className={"price-src " + msg.priceSource}
-                        title={msg.priceSource === "live" ? "Live price — OpenRouter catalog" : "Estimated from the built-in price table"}
-                      >
-                        {msg.priceSource === "live" ? "live" : "≈ table"}
-                      </span>
-                    )}
-                  </span>
+                  <span className="asst-meta mono">${msg.cost > 0 && msg.cost < 0.001 ? msg.cost.toFixed(6) : msg.cost.toFixed(4)}</span>
                 ) : !msg.usage && !msg.streaming ? (
                   <span className="asst-meta mono">
                     {msg.decision!.chosenCost === 0 ? "free" : "$" + msg.decision!.chosenCost.toFixed(4)}

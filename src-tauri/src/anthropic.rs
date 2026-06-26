@@ -97,6 +97,7 @@ pub async fn anthropic_messages_stream(
                     output_tokens: output,
                     cache_read,
                     cache_write,
+                    cost: None, // Anthropic bills via token usage; no per-request cost in the response.
                 });
                 let _ = on_event.send(StreamEvent::Done);
                 return ControlFlow::Break(());

@@ -15,5 +15,5 @@ export async function* streamLLM(
   if (backend.kind === "openai") yield* streamChat(backend.model, messages, backend.label, thinking, signal);
   else if (backend.kind === "chatgpt") yield* streamChatGPT(backend.model, messages, backend.label, thinking, signal);
   else if (backend.kind === "anthropic") yield* streamClaude(backend.model, messages, backend.label, thinking, effort, signal);
-  else if (backend.kind === "compat") yield* streamCompat(backend, messages, backend.label, signal);
+  else if (backend.kind === "compat") yield* streamCompat(backend, messages, backend.label, thinking, effort, signal);
 }

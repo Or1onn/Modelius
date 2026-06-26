@@ -50,6 +50,8 @@ pub(crate) enum StreamEvent {
         output_tokens: u64,
         cache_read: u64,
         cache_write: u64,
+        // Exact billed cost (USD) when the upstream API reports it (OpenRouter); else None.
+        cost: Option<f64>,
     },
     Done,
     Error(String),

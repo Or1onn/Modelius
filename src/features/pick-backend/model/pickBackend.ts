@@ -269,7 +269,6 @@ export function pickBackend(decision: Decision): Backend {
       : toAnthropicModel(decision.chosen),
     label: decision.chosen.name,
   });
-
   // A local (privacy/free) pick runs on the Ollama daemon, mapped to a real installed model.
   if (prov === "ollama") {
     const b = ollamaBackend(decision.chosen);

@@ -30,6 +30,11 @@ export function ModelBadge({
     short: name.slice(0, 2).toUpperCase(),
     local: false,
   };
+  // Aggregator (OpenRouter) ids are "vendor/model" — resolve the logo to the vendor brand.
+  // The id is in modelId/model.id (auto-routed) or the label (manual pick, where label == id).
+  const vid = modelId ?? m?.id ?? label;
+  const logoShort =
+    vid && vid.includes("/") ? vid.replace(/^~/, "").split("/")[0].slice(0, 2).toUpperCase() : p.short;
   const pad = size === "sm" ? "2px 7px 2px 6px" : size === "lg" ? "5px 12px 5px 9px" : "3px 9px 3px 7px";
   const fs = size === "sm" ? 11 : size === "lg" ? 14 : 12.5;
   const logoSz = size === "sm" ? 14 : size === "lg" ? 18 : 15;
@@ -53,7 +58,7 @@ export function ModelBadge({
       }}
     >
       <span className="badge-logo" style={{ width: logoSz, height: logoSz, fontSize: logoSz - 5, color: p.color }}>
-        <ProviderLogo pid={p.id} short={p.short} />
+        <ProviderLogo pid={p.id} short={logoShort} modelId={vid} />
       </span>
       {name}
       {showProvider && <span style={{ color: "var(--text-3)", fontSize: fs - 1.5 }}>· {p.name}</span>}

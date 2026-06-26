@@ -570,6 +570,9 @@ input, textarea { font-family: inherit; }
 /* Always-present check slot so the model name doesn't shift when the checkmark appears. */
 .model-menu-check { width: 14px; display: grid; place-items: center; flex-shrink: 0; }
 .model-menu-sub { color: var(--text-4); font-size: 11px; }
+/* Provider section header in the picker. */
+.model-menu-group { padding: 9px 9px 4px; font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--text-4); }
+.model-menu-group:first-child { padding-top: 4px; }
 .model-menu-empty { padding: 9px; font-size: 12px; color: var(--text-4); }
 .model-menu-sep { height: 1px; margin: 5px 4px; background: var(--border); }
 .toggle {
@@ -724,11 +727,13 @@ input, textarea { font-family: inherit; }
 .manage-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 13px; background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius); }
 .manage-row-k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-4); }
 .manage-row-v { font-family: var(--font-mono); font-size: 12.5px; color: var(--text-2); display: flex; align-items: center; gap: 8px; }
-.manage-models { display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.manage-models { display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden auto; max-height: 360px; }
 .manage-model { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; background: var(--surface-1); }
 .manage-model + .manage-model { border-top: 1px solid var(--border); }
 .manage-model-l { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .manage-model-meta { display: flex; gap: 12px; font-size: 11px; color: var(--text-4); font-family: var(--font-mono); }
+.manage-model-ico { width: 16px; height: 16px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 8.5px; font-weight: 700; color: var(--text-3); }
+.manage-model-ico img, .manage-model-ico svg { width: 16px; height: 16px; border-radius: 4px; object-fit: contain; }
 .manage-confirm { display: flex; align-items: center; gap: 10px; padding: 12px 13px; border-radius: var(--radius); background: color-mix(in oklab, #E5707A 9%, transparent); border: 1px solid color-mix(in oklab, #E5707A 28%, transparent); }
 .manage-confirm-t { flex: 1; font-size: 12px; color: var(--text-2); }
 .mc-btn { padding: 6px 12px; border-radius: var(--r-sm); font-size: 12px; font-weight: 540; transition: all .15s; }
@@ -761,6 +766,8 @@ input, textarea { font-family: inherit; }
 .pv-row:hover { background: color-mix(in oklab, var(--surface-2) 55%, transparent); }
 .pv-logo.pv-logo40 { width: 40px; height: 40px; border-radius: var(--radius); font-size: 13.5px; }
 .pv-logo40 svg, .pv-logo40 img { width: 22px; height: 22px; object-fit: contain; }
+/* Claude's orange mark reads as white inside the Providers panel (rows + model list). */
+.pv-logo40 img[src*="/claude/"], .manage-model-ico img[src*="/claude/"] { filter: brightness(0) invert(1); }
 
 .pv-rowmain { flex: 1; min-width: 0; }
 .pv-rowname { font-size: 14px; font-weight: 580; letter-spacing: -0.01em; }

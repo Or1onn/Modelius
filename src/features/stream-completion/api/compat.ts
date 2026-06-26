@@ -8,8 +8,16 @@ import { isKeyProvider } from "@/entities/session/model/keyProviders";
 import { isTauri } from "@/shared/api/tauri";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
 import type { Backend, ChatMsg, Delta } from "@/entities/model/model/backend";
+import type { EffortLevel } from "@/entities/model/model/apiIds";
 
-export async function* streamCompat(backend: Backend, messages: ChatMsg[], modelName?: string, signal?: AbortSignal): AsyncGenerator<Delta> {
+export async function* streamCompat(
+  backend: Backend,
+  messages: ChatMsg[],
+  modelName?: string,
+  thinking = false,
+  effort: EffortLevel | "auto" = "auto",
+  signal?: AbortSignal
+): AsyncGenerator<Delta> {
   // A fixed baseUrl endpoint: Gemini/Groq (keyed) or Ollama (local, no key).
   const baseUrl = backend.baseUrl;
   if (!baseUrl) throw new Error("Endpoint is no longer configured.");
@@ -26,7 +34,19 @@ export async function* streamCompat(backend: Backend, messages: ChatMsg[], model
     { role: "system", content: sysContent },
     ...messages.filter((m) => m.role !== "system").map((m) => ({ role: m.role, content: m.content })),
   ];
-  const body = { model: backend.model, messages: reqMsgs, stream: true, stream_options: { include_usage: true } };
+  // OpenRouter-only extras: exact cost accounting, and reasoning when Thinking is on. Effort maps to
+  // reasoning depth (Claude/etc. translate it to a token budget); xhigh/max clamp to OpenRouter's "high".
+  const isOpenRouter = backend.providerId === "openrouter";
+  const orEffort: "low" | "medium" | "high" | null =
+    effort === "auto" ? null : effort === "low" || effort === "medium" || effort === "high" ? effort : "high";
+  const body = {
+    model: backend.model,
+    messages: reqMsgs,
+    stream: true,
+    stream_options: { include_usage: true },
+    ...(isOpenRouter ? { usage: { include: true } } : {}),
+    ...(isOpenRouter && thinking ? { reasoning: orEffort ? { effort: orEffort } : { enabled: true } } : {}),
+  };
 
   if (!isTauri()) {
     yield* browserStream(baseUrl, name, key, body, metered, signal);
@@ -36,7 +56,7 @@ export async function* streamCompat(backend: Backend, messages: ChatMsg[], model
   const streamId = crypto.randomUUID(); // lets Stop cancel the upstream request mid-flight
   yield* channelToDeltas(
     (onEvent) => invoke("compat_chat_stream", { baseUrl, apiKey: key, provider: name, body, streamId, onEvent }),
-    (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, metered }),
+    (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, metered, cost: u.cost ?? undefined }),
     undefined,
     signal,
     streamId
@@ -73,10 +93,17 @@ async function* browserStream(baseUrl: string, name: string, key: string, body: 
         const json = JSON.parse(data);
         const delta: string | undefined = json.choices?.[0]?.delta?.content;
         if (delta) yield { kind: "text", text: delta };
-        const think: string | undefined = json.choices?.[0]?.delta?.reasoning_content;
+        // DeepSeek streams the trace as `reasoning_content`; OpenRouter normalizes it to `reasoning`.
+        const think: string | undefined = json.choices?.[0]?.delta?.reasoning_content ?? json.choices?.[0]?.delta?.reasoning;
         if (think) yield { kind: "thinking", text: think };
         if (json.usage)
-          yield { kind: "usage", inputTokens: json.usage.prompt_tokens, outputTokens: json.usage.completion_tokens, metered };
+          yield {
+            kind: "usage",
+            inputTokens: json.usage.prompt_tokens,
+            outputTokens: json.usage.completion_tokens,
+            metered,
+            cost: typeof json.usage.cost === "number" ? json.usage.cost : undefined,
+          };
       } catch {
         /* ignore keep-alive / partial lines */
       }

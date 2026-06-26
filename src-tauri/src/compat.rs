@@ -54,8 +54,12 @@ pub async fn compat_chat_stream(
                 let _ = on_event.send(StreamEvent::Chunk(t.to_string()));
             }
         }
-        // DeepSeek-style reasoning models stream the trace as `reasoning_content`.
-        if let Some(t) = j.pointer("/choices/0/delta/reasoning_content").and_then(|v| v.as_str()) {
+        // DeepSeek streams the trace as `reasoning_content`; OpenRouter normalizes it to `reasoning`.
+        let think = j
+            .pointer("/choices/0/delta/reasoning_content")
+            .or_else(|| j.pointer("/choices/0/delta/reasoning"))
+            .and_then(|v| v.as_str());
+        if let Some(t) = think {
             if !t.is_empty() {
                 let _ = on_event.send(StreamEvent::Thinking(t.to_string()));
             }
@@ -66,6 +70,8 @@ pub async fn compat_chat_stream(
                 output_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                 cache_read: 0,
                 cache_write: 0,
+                // OpenRouter returns the exact billed cost here when the request asks for usage accounting.
+                cost: u.get("cost").and_then(|v| v.as_f64()),
             });
         }
         ControlFlow::Continue(())

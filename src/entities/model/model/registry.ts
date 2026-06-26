@@ -37,6 +37,7 @@ export const PROVIDERS: Record<string, Provider> = {
   anthropic: { id: "anthropic", name: "Anthropic", color: "#D97757", short: "AN", local: false },
   google: { id: "google", name: "Google Gemini", color: "#4E8FF7", short: "GG", local: false },
   groq: { id: "groq", name: "Groq", color: "#F5A623", short: "GQ", local: false },
+  openrouter: { id: "openrouter", name: "OpenRouter", color: "#6E56CF", short: "OR", local: false },
   ollama: { id: "ollama", name: "Ollama", color: "#8B7FF5", short: "OL", local: true },
 };
 
@@ -48,8 +49,10 @@ export const MODELS: Model[] = [
   { id: "claude-opus-4", name: "Claude Opus 4", abbr: "Op", provider: "anthropic", cost: 0.018, cap: 98, spd: 55, latency: 2.4, ctx: "200K", vision: true },
   { id: "claude-sonnet-4", name: "Claude Sonnet 4", abbr: "Sn", provider: "anthropic", cost: 0.006, cap: 93, spd: 76, latency: 1.1, ctx: "200K", vision: true },
   { id: "claude-haiku-3-5", name: "Claude Haiku 3.5", abbr: "Hk", provider: "anthropic", cost: 0.001, cap: 80, spd: 90, latency: 0.5, ctx: "200K" },
-  { id: "gemini-2-5-pro", name: "Gemini 2.5 Pro", abbr: "Gp", provider: "google", cost: 0.0042, cap: 92, spd: 72, latency: 1.3, ctx: "1M", vision: true },
-  { id: "gemini-2-5-flash", name: "Gemini 2.5 Flash", abbr: "Gf", provider: "google", cost: 0.0003, cap: 81, spd: 93, latency: 0.4, ctx: "1M", vision: true },
+  { id: "gemini-3.1-pro-preview", name: "Gemini 3 Pro", abbr: "Gp", provider: "google", cost: 0.0042, cap: 94, spd: 72, latency: 1.3, ctx: "1M", vision: true },
+  { id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", abbr: "Gf", provider: "google", cost: 0.0003, cap: 84, spd: 93, latency: 0.4, ctx: "1M", vision: true },
+  { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", abbr: "Gp", provider: "google", cost: 0.0042, cap: 92, spd: 70, latency: 1.4, ctx: "1M", vision: true },
+  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", abbr: "Gf", provider: "google", cost: 0.0003, cap: 82, spd: 92, latency: 0.4, ctx: "1M", vision: true },
   { id: "llama-3-3-70b", name: "Llama 3.3 70B", abbr: "L3", provider: "groq", cost: 0.0009, cap: 84, spd: 99, latency: 0.25, ctx: "128K" },
   { id: "mixtral-8x7b", name: "Mixtral 8x7B", abbr: "Mx", provider: "groq", cost: 0.0006, cap: 74, spd: 97, latency: 0.3, ctx: "32K" },
   { id: "llama-3-2-local", name: "Llama 3.2", abbr: "Lo", provider: "ollama", cost: 0, cap: 70, spd: 62, latency: 0.9, ctx: "128K", local: true },
@@ -67,7 +70,6 @@ export const LIVE_CODEX: Model[] = [
   { id: "gpt-5.5", name: "GPT-5.5", abbr: "55", provider: "openai", cost: 0.007, cap: 97, spd: 68, latency: 1.4, ctx: "200K", vision: true },
   { id: "gpt-5.4-mini", name: "GPT-5.4 mini", abbr: "5m", provider: "openai", cost: 0.001, cap: 84, spd: 90, latency: 0.6, ctx: "200K", vision: true },
 ];
-
 export const MODEL_BY_ID: Record<string, Model> = Object.fromEntries(
   [...MODELS, ...LIVE_ANTHROPIC, ...LIVE_CODEX].map((m) => [m.id, m])
 );

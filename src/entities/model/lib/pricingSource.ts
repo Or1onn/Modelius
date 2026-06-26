@@ -12,6 +12,12 @@ type Rate = { in: number; out: number };
 interface ORModel {
   id: string;
   pricing?: { prompt?: string; completion?: string };
+  supported_parameters?: string[];
+}
+// Cached catalog data: per-token rates + a reasoning-capability flag per normalized id.
+interface Catalog {
+  rates: Record<string, Rate>;
+  caps: Record<string, boolean>;
 }
 
 // Normalize to the bare model slug so a provider-prefixed OpenRouter id (e.g. "google/gemini-2.5-flash")
@@ -20,12 +26,13 @@ function norm(id: string): string {
   return id.toLowerCase().split("/").pop()!.replace(/[^a-z0-9]/g, "");
 }
 
-function read(): Record<string, Rate> | null {
+function read(): Catalog | null {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (!raw) return null;
-    const e = JSON.parse(raw) as { at: number; data: Record<string, Rate> };
-    if (Date.now() - e.at < TTL) return e.data;
+    const e = JSON.parse(raw) as { at: number; rates?: Record<string, Rate>; caps?: Record<string, boolean> };
+    // `rates`/`caps` absent → an older cache shape; treat as stale so it's refetched.
+    if (e.rates && e.caps && Date.now() - e.at < TTL) return { rates: e.rates, caps: e.caps };
   } catch {
     /* ignore */
   }
@@ -40,14 +47,16 @@ export async function loadDynamicPricing(): Promise<void> {
     const json = isTauri()
       ? await invoke<{ data?: ORModel[] }>("compat_list_models", { baseUrl: OR_BASE, apiKey: "" })
       : await fetch(`${OR_BASE}/models`).then((r) => r.json());
-    const map: Record<string, Rate> = {};
+    const rates: Record<string, Rate> = {};
+    const caps: Record<string, boolean> = {};
     for (const m of (json.data ?? []) as ORModel[]) {
+      caps[norm(m.id)] = (m.supported_parameters ?? []).includes("reasoning");
       const pin = parseFloat(m.pricing?.prompt ?? "");
       const pout = parseFloat(m.pricing?.completion ?? "");
       if (!Number.isFinite(pin) || !Number.isFinite(pout) || (pin === 0 && pout === 0)) continue;
-      map[norm(m.id)] = { in: pin * 1e6, out: pout * 1e6 };
+      rates[norm(m.id)] = { in: pin * 1e6, out: pout * 1e6 };
     }
-    if (Object.keys(map).length) localStorage.setItem(STORE_KEY, JSON.stringify({ at: Date.now(), data: map }));
+    if (Object.keys(caps).length) localStorage.setItem(STORE_KEY, JSON.stringify({ at: Date.now(), rates, caps }));
   } catch {
     /* offline / blocked — keep static pricing */
   }
@@ -55,5 +64,11 @@ export async function loadDynamicPricing(): Promise<void> {
 
 // Live rate for a resolved API id, or undefined if not in the catalog. Sync (cache peek).
 export function dynamicRate(modelId: string): Rate | undefined {
-  return read()?.[norm(modelId)];
+  return read()?.rates[norm(modelId)];
+}
+
+// Whether the model supports reasoning, per OpenRouter's catalog. true/false when the model is
+// known; undefined when it isn't in the catalog (caller decides the fallback). Sync (cache peek).
+export function supportsReasoning(modelId: string): boolean | undefined {
+  return read()?.caps[norm(modelId)];
 }

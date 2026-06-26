@@ -8,7 +8,7 @@ import { isKeyProvider, listKeyProviderModels } from "@/entities/session/model/k
 import { ProviderRow } from "@/widgets/provider-list/ui/ProviderRow";
 
 // Providers connectable via an API key (OAuth-only/local providers live in other sections).
-const KEY_PROVIDERS = ["openai", "anthropic", "google", "groq"];
+const KEY_PROVIDERS = ["openai", "anthropic", "google", "groq", "openrouter"];
 
 function AddKeyForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => void }) {
   const { setKey } = useKeyStore();
@@ -21,7 +21,7 @@ function AddKeyForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => 
   async function add() {
     const pid = detectProvider(k);
     if (!pid || !validateKey(pid, k)) {
-      setErr("Unrecognized key — supported: OpenAI, Anthropic, Google, Groq.");
+      setErr("Unrecognized key — supported: OpenAI, Anthropic, Google, Groq, OpenRouter.");
       return;
     }
     await setKey(pid, k);

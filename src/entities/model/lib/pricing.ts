@@ -72,13 +72,13 @@ export function blendedCostPer1K(modelId: string): number | undefined {
 }
 
 // Real USD for a metered turn. Cache-aware: reads bill ~0.1x, writes ~1.25x the input rate.
-// Returns 0 for an unknown model id.
+// undefined when the model's rate is unknown — so the UI can omit the price instead of showing $0.
 export function costOf(
   modelId: string,
   usage: { inputTokens: number; outputTokens: number; cacheRead?: number; cacheWrite?: number }
-): number {
+): number | undefined {
   const p = priceFor(modelId);
-  if (!p) return 0;
+  if (!p) return undefined;
   const inUnits = usage.inputTokens + (usage.cacheWrite ?? 0) * 1.25 + (usage.cacheRead ?? 0) * 0.1;
   return (inUnits * p.in + usage.outputTokens * p.out) / 1e6;
 }

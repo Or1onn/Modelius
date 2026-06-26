@@ -76,6 +76,7 @@ export async function clearKey(provider: string): Promise<void> {
 export function detectProvider(key: string): string | null {
   const k = key.trim();
   if (/^sk-ant-/.test(k)) return "anthropic";
+  if (/^sk-or-/.test(k)) return "openrouter";
   if (/^sk-/.test(k)) return "openai";
   if (/^AIza/.test(k)) return "google";
   if (/^gsk_/.test(k)) return "groq";
@@ -87,12 +88,14 @@ export function validateKey(provider: string, key: string): boolean {
   const k = key.trim();
   if (provider === "openai") return /^sk-/.test(k) && k.length >= 20;
   if (provider === "anthropic") return /^sk-ant-/.test(k) && k.length >= 20;
+  if (provider === "openrouter") return /^sk-or-/.test(k) && k.length >= 20;
   return k.length >= 8;
 }
 
 export function keyHint(provider: string): string {
   if (provider === "openai") return "Starts with sk- · platform.openai.com/api-keys";
   if (provider === "anthropic") return "Starts with sk-ant- · console.anthropic.com";
+  if (provider === "openrouter") return "Starts with sk-or- · openrouter.ai/keys";
   return "Paste your provider API key";
 }
 

@@ -1,5 +1,5 @@
 // ChatScreen.tsx — chat page view: composer, model picker, artifact-panel host. Thread via widget.
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState, type UIEvent } from "react";
 import { ChatThread } from "@/widgets/chat-thread/ui/ChatThread";
 import { ArtifactPanel } from "@/widgets/artifact-panel/ui/ArtifactPanel";
 import { Icon } from "@/shared/ui/Icon";
@@ -9,6 +9,7 @@ import { PROVIDERS, type Message, type PolicyId, type ImageRef } from "@/entitie
 import type { ModelOption } from "@/entities/model/model/backend";
 import { anthropicEffortTier, EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
 import { listAvailableModels, peekAvailableModels } from "@/features/pick-backend/model/pickBackend";
+import { supportsReasoning } from "@/entities/model/lib/pricingSource";
 import { makeArtifact, rememberArtifactTitle, isLargePaste, wrapFence, type Artifact } from "@/entities/artifact/model/artifacts";
 import { readDataUrl, readText } from "@/pages/chat/lib/files";
 import { getChats } from "@/entities/chat/model/chats";
@@ -27,6 +28,16 @@ function resolveBlock(msg: Message | undefined, blockIndex: number): Artifact | 
   const body = msg.streaming ? msg.shown || "" : msg.text;
   const c = codeSegs(body)[blockIndex];
   return c ? makeArtifact(c.lang, c.code) : null;
+}
+
+// ProviderLogo props for a model option: OpenRouter rows resolve the icon to the id's vendor
+// brand (e.g. "anthropic/claude-…" → Claude); everything else uses the provider's own logo.
+function vendorOf(o: ModelOption): { pid: string; short: string; modelId?: string } {
+  if (o.provider === "openrouter" && o.backend.model.includes("/")) {
+    const vendor = o.backend.model.replace(/^~/, "").split("/")[0];
+    return { pid: o.provider, short: vendor.slice(0, 2).toUpperCase(), modelId: o.backend.model };
+  }
+  return { pid: o.provider, short: PROVIDERS[o.provider]?.short ?? "?" };
 }
 
 // Greeting for the new-chat hero.
@@ -69,6 +80,8 @@ export function ChatScreen({
   const modelPickRef = useRef<HTMLDivElement>(null);
   const [options, setOptions] = useState<ModelOption[]>(peekAvailableModels);
   const [modelsLoading, setModelsLoading] = useState(false);
+  const PICKER_PAGE = 40; // reveal the list in pages (large providers like OpenRouter have 300+)
+  const [pickerShown, setPickerShown] = useState(PICKER_PAGE);
   const [openRef, setOpenRef] = useState<OpenRef | null>(null); // artifact the right panel shows
   const [attachments, setAttachments] = useState<Artifact[]>([]); // pending pasted/dropped text → artifact chips
   const [images, setImages] = useState<ImageRef[]>([]); // pending image attachments (vision)
@@ -112,12 +125,27 @@ export function ChatScreen({
     }
   }, [modelMenuOpen]);
 
-  // Filter the live model list by the search query (matches label + provider).
+  // Group the list by connection: a Codex (ChatGPT) account, else the provider's display name.
+  // Options arrive already blocked per provider, so a header is shown wherever the group changes.
+  const groupKey = (o: ModelOption) => (o.backend.kind === "chatgpt" ? "codex" : o.provider);
+  const groupName = (o: ModelOption) =>
+    o.backend.kind === "chatgpt" ? "Codex" : PROVIDERS[o.provider]?.name ?? o.provider;
+
+  // Filter the live model list by the search query (matches model name, provider id, and group name).
   const q = modelQuery.trim().toLowerCase();
   const filteredOptions = q
-    ? options.filter((o) => (o.label + " " + o.provider).toLowerCase().includes(q))
+    ? options.filter((o) => (o.label + " " + o.provider + " " + groupName(o)).toLowerCase().includes(q))
     : options;
   const autoMatches = !q || "auto routed by policy".includes(q);
+
+  // Restart paging from the top whenever the menu opens or the search query changes.
+  useEffect(() => setPickerShown(PICKER_PAGE), [modelMenuOpen, q]);
+  const onPickerScroll = (e: UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 32) {
+      setPickerShown((n) => (n < filteredOptions.length ? n + PICKER_PAGE : n));
+    }
+  };
 
   function autosize() {
     const ta = taRef.current;
@@ -178,7 +206,20 @@ export function ChatScreen({
   // Effort selector visibility/levels. Explicit Anthropic pick → its model's tier; Auto →
   // safe low/med/high set when any connected model is Anthropic. resolveEffort is the final gate.
   const effTier = modelSel?.provider === "anthropic" ? anthropicEffortTier(modelSel.backend.model) : null;
-  const showEffort = modelSel ? !!effTier : options.some((o) => o.provider === "anthropic");
+  // OpenRouter reasoning models (e.g. Claude) accept low/medium/high effort too — only meaningful with
+  // Thinking on. effortLevels/activeEffort fall back to the sonnet set (low/medium/high) when effTier is null.
+  const orEffort = modelSel?.provider === "openrouter" && (supportsReasoning(modelSel.backend.model) ?? false) && thinking;
+  const showEffort = modelSel ? !!effTier || orEffort : options.some((o) => o.provider === "anthropic");
+  // Thinking toggle only for reasoning-capable models (per OpenRouter's catalog). A model unknown to
+  // the catalog defaults to shown; the provider backends still gate the actual param. Auto → shown if
+  // any connected model can reason.
+  const reasoningOk = modelSel
+    ? supportsReasoning(modelSel.backend.model) ?? true
+    : options.some((o) => (supportsReasoning(o.backend.model) ?? true));
+  // Drop a stale "on" state when switching to a model that can't reason.
+  useEffect(() => {
+    if (!reasoningOk) setThinking(false);
+  }, [reasoningOk]);
   const effortLevels = effTier ? EFFORT_LEVELS[effTier] : EFFORT_LEVELS.sonnet;
   const activeEffort = resolveEffort(effTier ?? "sonnet", effort);
   // Flyout is CSS-anchored to its row (no JS coords — app zoom breaks fixed positioning).
@@ -256,7 +297,7 @@ export function ChatScreen({
         ref={taRef}
         value={input}
         className={busy ? "working" : ""}
-        placeholder={busy ? "Working… type your next message" : "Ask anything — the router picks the model."}
+        placeholder={"Choose model and ask anything"}
         rows={1}
         onChange={(e) => {
           setInput(e.target.value);
@@ -313,10 +354,7 @@ export function ChatScreen({
                 className="model-pick-logo"
                 style={{ color: PROVIDERS[modelSel.provider]?.color }}
               >
-                <ProviderLogo
-                  pid={modelSel.provider}
-                  short={PROVIDERS[modelSel.provider]?.short ?? "?"}
-                />
+                <ProviderLogo {...vendorOf(modelSel)} />
               </span>
             ) : (
               <Icon name="providers" size={13} />
@@ -336,7 +374,7 @@ export function ChatScreen({
                   spellCheck={false}
                 />
               </div>
-              <div className="model-menu-scroll">
+              <div className="model-menu-scroll" onScroll={onPickerScroll}>
                 {autoMatches && (
                   <button
                     className={"model-menu-item" + (!modelSel ? " on" : "")}
@@ -361,41 +399,47 @@ export function ChatScreen({
                 {!modelsLoading && options.length > 0 && filteredOptions.length === 0 && !autoMatches && (
                   <div className="model-menu-empty">No models found.</div>
                 )}
-                {filteredOptions.map((o) => (
-                  <button
-                    key={o.key}
-                    className={"model-menu-item" + (modelSel?.key === o.key ? " on" : "")}
-                    onClick={() => {
-                      setModelSel(o);
-                      setModelMenuOpen(false);
-                    }}
-                  >
-                    <span
-                      className="model-menu-logo"
-                      style={{ color: PROVIDERS[o.provider]?.color }}
+                {filteredOptions.slice(0, pickerShown).map((o, i, arr) => (
+                  <Fragment key={o.key}>
+                    {(i === 0 || groupKey(arr[i - 1]) !== groupKey(o)) && (
+                      <div className="model-menu-group">{groupName(o)}</div>
+                    )}
+                    <button
+                      className={"model-menu-item" + (modelSel?.key === o.key ? " on" : "")}
+                      onClick={() => {
+                        setModelSel(o);
+                        setModelMenuOpen(false);
+                      }}
                     >
-                      <ProviderLogo
-                        pid={o.provider}
-                        short={PROVIDERS[o.provider]?.short ?? "?"}
-                      />
-                    </span>
-                    <span style={{ flex: 1 }}>{o.label}</span>
-                    <span className="model-menu-check">{modelSel?.key === o.key && <Icon name="check" size={12} />}</span>
-                  </button>
+                      <span
+                        className="model-menu-logo"
+                        style={{ color: PROVIDERS[o.provider]?.color }}
+                      >
+                        <ProviderLogo {...vendorOf(o)} />
+                      </span>
+                      <span style={{ flex: 1 }}>{o.label}</span>
+                      <span className="model-menu-check">{modelSel?.key === o.key && <Icon name="check" size={12} />}</span>
+                    </button>
+                  </Fragment>
                 ))}
+                {pickerShown < filteredOptions.length && (
+                  <div className="model-menu-empty">Showing {pickerShown} of {filteredOptions.length} · scroll for more</div>
+                )}
               </div>
-              <div className="model-menu-sep" />
-              <button
-                className="model-menu-item split-row"
-                role="switch"
-                aria-checked={thinking}
-                onClick={() => setThinking((v) => !v)}
-              >
-                <span>Thinking</span>
-                <span className={"toggle" + (thinking ? " on" : "")}>
-                  <span className="toggle-knob" />
-                </span>
-              </button>
+              {(reasoningOk || showEffort) && <div className="model-menu-sep" />}
+              {reasoningOk && (
+                <button
+                  className="model-menu-item split-row"
+                  role="switch"
+                  aria-checked={thinking}
+                  onClick={() => setThinking((v) => !v)}
+                >
+                  <span>Thinking</span>
+                  <span className={"toggle" + (thinking ? " on" : "")}>
+                    <span className="toggle-knob" />
+                  </span>
+                </button>
+              )}
               {showEffort && (
                 <div
                   className="effort-item"

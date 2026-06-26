@@ -471,8 +471,15 @@ async function realSend(
     const u = usage
       ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite }
       : { inputTokens: estimateTokens(apiMessages.map((mm) => mm.content).join("\n")), outputTokens: estimateTokens(acc) };
-    const cost = usage?.metered ? costOf(backend.model, u) : undefined; // $ only for metered turns
-    const priceSource = cost != null ? priceSource_(backend.model) ?? undefined : undefined;
+    // $ only for metered turns. Prefer the exact cost the API billed (OpenRouter); otherwise
+    // compute it from token usage × current per-token rates.
+    const exact = usage?.cost;
+    const cost = usage?.metered
+      ? exact != null && Number.isFinite(exact)
+        ? exact
+        : costOf(backend.model, u)
+      : undefined;
+    const priceSource = cost != null ? (exact != null ? "live" : priceSource_(backend.model) ?? undefined) : undefined;
     const asstIndex = s.messages.length - 1; // this turn's assistant message; stable (append-only)
     patchAt(s, asstIndex, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false, usage: u, latencyMs, cost, priceSource });
     if (acc.trim()) void extractAndSave(acc); // persist large code the model returned

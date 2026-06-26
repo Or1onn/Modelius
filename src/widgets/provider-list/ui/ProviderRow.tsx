@@ -1,5 +1,5 @@
 // ProviderRow.tsx — provider settings row + inline connect/manage panels (real keys/OAuth/live models).
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type UIEvent } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { MODELS, PROVIDERS } from "@/entities/model/model/registry";
 import { ProviderLogo } from "@/entities/model/ui/ProviderLogo";
@@ -17,27 +17,25 @@ export type LocalStatus = "checking" | "up" | "down";
 
 const OAUTH = new Set(["anthropic", "openai"]); // have account sign-in
 const LIVE = new Set(["openai", "anthropic"]); // key can fetch a live model list
-const KEY_LIVE = new Set(["google", "groq"]); // key fetches a live list over the OpenAI-compat endpoint
+const KEY_LIVE = new Set(["google", "groq", "openrouter"]); // key fetches a live list over the OpenAI-compat endpoint
 
 const TAGLINES: Record<string, string> = {
   anthropic: "Claude · claude.ai",
   openai: "GPT-4o & o3 · openai.com",
-  google: "Gemini 2.5 · ai.google.dev",
+  google: "Gemini · ai.google.dev",
   groq: "LPU inference · groq.com",
+  openrouter: "300+ models · openrouter.ai",
   ollama: "On-device · localhost:11434",
 };
-const KEY_PREFIX: Record<string, string> = { openai: "sk-", anthropic: "sk-ant-", google: "AIza", groq: "gsk_" };
+const KEY_PREFIX: Record<string, string> = { openai: "sk-", anthropic: "sk-ant-", google: "AIza", groq: "gsk_", openrouter: "sk-or-" };
 
 // Providers-page connection labels (registry name stays for badges elsewhere).
 const PROVIDER_LABEL: Record<string, string> = { openai: "Codex" };
 const labelOf = (pid: string) => PROVIDER_LABEL[pid] ?? PROVIDERS[pid].name;
 
 function logoStyle(brand: string) {
-  return {
-    color: brand,
-    background: `color-mix(in oklab, ${brand} 14%, var(--surface-2))`,
-    borderColor: `color-mix(in oklab, ${brand} 28%, transparent)`,
-  };
+  // Brand-coloured tint only feeds the initials fallback; the CDN logos sit on a clean, borderless square.
+  return { color: brand, background: "transparent", border: "none" };
 }
 
 const modelsOf = (pid: string) => MODELS.filter((m) => m.provider === pid);
@@ -136,7 +134,6 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
       setConnecting(false);
     }
   }
-
   const success = state === "success";
 
   return (
@@ -381,6 +378,19 @@ function ManageInline({
   const reg = modelsOf(pid);
   const useLive = !!live && live.length > 0;
 
+  // Reveal the live list in pages (the full catalog is cached; large providers like OpenRouter
+  // have 300+). Render the first PAGE, then grow by PAGE as the list is scrolled to its end.
+  const PAGE = 40;
+  const [shown, setShown] = useState(PAGE);
+  useEffect(() => setShown(PAGE), [live]);
+  const total = live?.length ?? 0;
+  const onModelsScroll = (e: UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 32) {
+      setShown((n) => (n < total ? n + PAGE : n));
+    }
+  };
+
   return (
     <div className="pv-manage">
       {local ? (
@@ -436,12 +446,18 @@ function ManageInline({
           )}
         </div>
       ) : (
-        <div className="manage-models">
+        <div className="manage-models" onScroll={useLive ? onModelsScroll : undefined}>
           {useLive
-            ? live!.map((m) => (
+            ? live!.slice(0, shown).map((m) => (
                 <div key={m.id} className="manage-model">
                   <span className="manage-model-l">
-                    <span style={{ width: 7, height: 7, borderRadius: 99, background: p.color, flexShrink: 0 }} />
+                    {pid === "openrouter" ? (
+                      <span className="manage-model-ico">
+                        <ProviderLogo pid="openrouter" short={(m.id.replace(/^~/, "").split("/")[0] || "or").slice(0, 2).toUpperCase()} modelId={m.id} />
+                      </span>
+                    ) : (
+                      <span style={{ width: 7, height: 7, borderRadius: 99, background: p.color, flexShrink: 0 }} />
+                    )}
                     <span style={{ fontSize: 12.5, fontFamily: "var(--font-mono)" }}>{m.name}</span>
                   </span>
                   {m.name !== m.id && (
@@ -465,6 +481,11 @@ function ManageInline({
                   </span>
                 </div>
               ))}
+          {useLive && shown < total && (
+            <div className="manage-model" style={{ justifyContent: "center", color: "var(--text-3)", fontSize: 11.5 }}>
+              Showing {shown} of {total} · scroll for more
+            </div>
+          )}
         </div>
       )}
 
