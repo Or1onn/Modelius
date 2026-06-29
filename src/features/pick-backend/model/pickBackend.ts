@@ -12,10 +12,11 @@ import {
 } from "@/entities/model/model/apiIds";
 import { TIER_WEIGHTS, type ModelTier } from "@/entities/model/lib/tiers";
 import { blendedCostPer1K } from "@/entities/model/lib/pricing";
+import { supportsVision } from "@/entities/model/lib/pricingSource";
 import { hasKey } from "@/entities/session/model/keys";
 import { hasAnthropicOAuth, getAnthropicAccessToken } from "@/entities/session/model/anthropicSession";
 import { hasOpenAIOAuth } from "@/entities/session/model/openaiSession";
-import { hasOllama, peekOllamaModels, listOllamaModels, OLLAMA_BASE } from "@/entities/session/model/ollamaSession";
+import { hasOllama, peekOllamaModels, listOllamaModels, peekOllamaVision, OLLAMA_BASE } from "@/entities/session/model/ollamaSession";
 import {
   KEY_PROVIDER_BASE,
   KEY_PROVIDER_IDS,
@@ -171,6 +172,19 @@ function ollamaBackend(chosen: Model): Backend | null {
   if (!real) return null;
   return { kind: "compat", model: real.id, label: real.name, baseUrl: OLLAMA_BASE, providerId: "ollama" };
 }
+
+// Vision support read from the model's own metadata — no name guessing. Ollama → its native
+// /api/show capabilities; everything else → the OpenRouter catalog's input_modalities.
+// true/false when the model reports it; undefined when no metadata is available.
+export function optionVision(opt: ModelOption): boolean | undefined {
+  if (opt.provider === "ollama") return peekOllamaVision(opt.backend.model);
+  return supportsVision(opt.backend.model);
+}
+
+// Permissive: Auto (null) and models with no modality metadata allow images; only a model
+// that explicitly reports no image support blocks them.
+export const optionAllowsImages = (opt: ModelOption | null): boolean =>
+  opt ? optionVision(opt) !== false : true;
 
 // User-pickable models by connection. ChatGPT account → curated Codex models (no
 // list endpoint); else a live list (sub via /v1/models, key via listModels).

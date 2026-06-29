@@ -36,4 +36,4 @@ export interface ChatMsg {
 // "usage" delta carries real token counts; `metered` = billed per-token (key) vs flat-fee (sub).
 export type Delta =
   | { kind: "text" | "thinking"; text: string }
-  | { kind: "usage"; inputTokens: number; outputTokens: number; cacheRead?: number; cacheWrite?: number; metered: boolean; cost?: number };
+  | { kind: "usage"; inputTokens: number; outputTokens: number; cacheRead?: number; cacheWrite?: number; reasoningTokens?: number; metered: boolean; cost?: number };

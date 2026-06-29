@@ -24,7 +24,7 @@ const TAGLINES: Record<string, string> = {
   openai: "GPT-4o & o3 · openai.com",
   google: "Gemini · ai.google.dev",
   groq: "LPU inference · groq.com",
-  openrouter: "300+ models · openrouter.ai",
+  openrouter: "openrouter.ai",
   ollama: "On-device · localhost:11434",
 };
 const KEY_PREFIX: Record<string, string> = { openai: "sk-", anthropic: "sk-ant-", google: "AIza", groq: "gsk_", openrouter: "sk-or-" };
@@ -528,7 +528,48 @@ export function ProviderRow({
 }) {
   const p = PROVIDERS[pid];
   const local = p.local;
-  const count = modelsOf(pid).length;
+
+  // Real model count: live list for providers that fetch one (Ollama, OAuth accounts, key-live
+  // catalogs like OpenRouter), the static registry otherwise. Seed from cache, then revalidate.
+  const { hasKey } = useKeyStore();
+  const { connected: anthConnected } = useAnthropicAuth();
+  const { connected: oaiConnected } = useOpenAIAuth();
+  const viaKey = !local && hasKey(pid);
+  const viaOAuth = (pid === "anthropic" && anthConnected) || (pid === "openai" && oaiConnected);
+  const willFetch = local || viaOAuth || ((LIVE.has(pid) || KEY_LIVE.has(pid)) && viaKey);
+
+  function seedCount(): number | null {
+    if (local) return peekOllamaModels()?.length ?? null;
+    if (viaOAuth && pid === "openai") return CODEX_MODELS.length;
+    if (viaOAuth && pid === "anthropic") return peekClaudeAccountModels()?.length ?? null;
+    if (LIVE.has(pid) && viaKey) return peekModels(pid)?.length ?? null;
+    if (KEY_LIVE.has(pid) && viaKey) return peekKeyProviderModels(pid)?.length ?? null;
+    return null;
+  }
+  const [liveCount, setLiveCount] = useState<number | null>(seedCount);
+  useEffect(() => {
+    if (!willFetch) return;
+    let alive = true;
+    (async () => {
+      try {
+        let ms: RemoteModel[];
+        if (local) ms = await listOllamaModels();
+        else if (viaOAuth && pid === "anthropic") ms = await listClaudeAccountModels();
+        else if (viaOAuth && pid === "openai") ms = CODEX_MODELS.map((m) => ({ id: m.id, name: m.name }));
+        else if (KEY_LIVE.has(pid) && viaKey) ms = await listKeyProviderModels(pid);
+        else ms = await listModels(pid);
+        if (alive) setLiveCount(ms.length);
+      } catch {
+        /* keep the registry fallback */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const count = liveCount ?? modelsOf(pid).length;
 
   return (
     <div className="pv-rowblock">

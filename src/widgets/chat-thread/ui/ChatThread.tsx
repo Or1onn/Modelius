@@ -329,8 +329,9 @@ export function ChatThread({
                   {msg.latencyMs != null ? (msg.latencyMs / 1000).toFixed(1) : msg.decision!.latency}s
                 </span>
                 {msg.usage && (
-                  <span className="asst-meta mono" title="tokens sent / received">
+                  <span className="asst-meta mono" title="tokens sent / received / reasoning">
                     ↑ {fmtCompact(msg.usage.inputTokens)} ↓ {fmtCompact(msg.usage.outputTokens)}
+                    {!!msg.usage.reasoningTokens && <> ⟳ {fmtCompact(msg.usage.reasoningTokens)}</>}
                   </span>
                 )}
                 {/* $ only for metered turns; subscription/offline (usage, no cost) shows nothing.

@@ -41,6 +41,15 @@ export function peek<T>(key: string): T | null {
   return null;
 }
 
+// Synchronous write — store a value computed outside the cached() flow (same TTL/peek shape).
+export function put<T>(key: string, data: T): void {
+  try {
+    localStorage.setItem(PREFIX + key, JSON.stringify({ at: Date.now(), data }));
+  } catch {
+    /* ignore */
+  }
+}
+
 // Drop a single cached list (e.g. recheck a local daemon that just started).
 export function evict(key: string): void {
   try {

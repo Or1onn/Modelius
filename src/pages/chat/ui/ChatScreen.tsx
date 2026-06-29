@@ -8,7 +8,7 @@ import { codeSegs } from "@/shared/lib/markdown";
 import { PROVIDERS, type Message, type PolicyId, type ImageRef } from "@/entities/model/model/registry";
 import type { ModelOption } from "@/entities/model/model/backend";
 import { anthropicEffortTier, EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
-import { listAvailableModels, peekAvailableModels } from "@/features/pick-backend/model/pickBackend";
+import { listAvailableModels, peekAvailableModels, optionAllowsImages } from "@/features/pick-backend/model/pickBackend";
 import { supportsReasoning } from "@/entities/model/lib/pricingSource";
 import { makeArtifact, rememberArtifactTitle, isLargePaste, wrapFence, type Artifact } from "@/entities/artifact/model/artifacts";
 import { readDataUrl, readText } from "@/pages/chat/lib/files";
@@ -125,6 +125,23 @@ export function ChatScreen({
     }
   }, [modelMenuOpen]);
 
+  // Default a reopened chat to its last manually-used model: the in-memory pick is lost on restart,
+  // but assistant turns record the model on the message. Restore once, only if nothing is picked.
+  const restoredFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (restoredFor.current === chatId) return;
+    if (modelSel || getModelSel(chatId)) {
+      restoredFor.current = chatId; // already has an explicit pick this session
+      return;
+    }
+    if (loading || options.length === 0) return; // wait for history + the live model list
+    const last = [...messages].reverse().find((m) => m.role === "assistant" && m.modelLabel);
+    const match = last && options.find((o) => o.label === last.modelLabel && o.provider === last.modelProvider);
+    if (match) setModelSel(match);
+    restoredFor.current = chatId;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatId, options, messages, loading]);
+
   // Group the list by connection: a Codex (ChatGPT) account, else the provider's display name.
   // Options arrive already blocked per provider, so a header is shown wherever the group changes.
   const groupKey = (o: ModelOption) => (o.backend.kind === "chatgpt" ? "codex" : o.provider);
@@ -138,8 +155,21 @@ export function ChatScreen({
     : options;
   const autoMatches = !q || "auto routed by policy".includes(q);
 
-  // Restart paging from the top whenever the menu opens or the search query changes.
-  useEffect(() => setPickerShown(PICKER_PAGE), [modelMenuOpen, q]);
+  // On open with no search, page far enough to include the selected model and flag it for scroll-into-view;
+  // while searching (or with no pick) restart paging from the top.
+  const pickerScrollPending = useRef(false);
+  useEffect(() => {
+    if (modelMenuOpen && !q && modelSel) {
+      const idx = options.findIndex((o) => o.key === modelSel.key);
+      if (idx >= 0) {
+        setPickerShown(Math.max(PICKER_PAGE, idx + PICKER_PAGE));
+        pickerScrollPending.current = true;
+        return;
+      }
+    }
+    setPickerShown(PICKER_PAGE);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelMenuOpen, q]);
   const onPickerScroll = (e: UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 32) {
@@ -161,6 +191,7 @@ export function ChatScreen({
   async function addFiles(files: ArrayLike<File>) {
     for (const file of Array.from(files)) {
       if (file.type.startsWith("image/")) {
+        if (!imagesAllowed) continue; // selected model can't read images — ignore it
         const url = await readDataUrl(file).catch(() => "");
         const data = url.split(",")[1];
         if (!data) continue;
@@ -222,6 +253,9 @@ export function ChatScreen({
   }, [reasoningOk]);
   const effortLevels = effTier ? EFFORT_LEVELS[effTier] : EFFORT_LEVELS.sonnet;
   const activeEffort = resolveEffort(effTier ?? "sonnet", effort);
+  // Thinking/Effort rows animate in/out (on model switch, and Effort when Thinking is toggled). The
+  // rows stay mounted and collapse via a CSS grid transition, so each appears/disappears smoothly.
+  const hasExtras = reasoningOk || showEffort;
   // Flyout is CSS-anchored to its row (no JS coords — app zoom breaks fixed positioning).
   // Short close delay lets the pointer cross the gap into the flyout.
   const openEffortFly = () => {
@@ -232,6 +266,13 @@ export function ChatScreen({
   const closeEffortFly = () => {
     effortTimer.current = window.setTimeout(() => setEffortOpen(false), 120);
   };
+
+  // Images need a vision-capable model. Auto/unknown allow them; a known text-only pick blocks them.
+  const imagesAllowed = optionAllowsImages(modelSel);
+  // Drop staged images when switching to a model that can't read them.
+  useEffect(() => {
+    if (!imagesAllowed) setImages([]);
+  }, [imagesAllowed]);
 
   const canSend = !!(input.trim() || attachments.length || images.length);
 
@@ -332,14 +373,18 @@ export function ChatScreen({
           ref={fileRef}
           type="file"
           multiple
-          accept="image/*,.txt,.md,.json,.csv,.ts,.tsx,.js,.jsx,.py,.rs,.go,.java,.c,.cpp,.cs,.css,.html,.yaml,.yml,.sql,.sh"
+          accept={(imagesAllowed ? "image/*," : "") + ".txt,.md,.json,.csv,.ts,.tsx,.js,.jsx,.py,.rs,.go,.java,.c,.cpp,.cs,.css,.html,.yaml,.yml,.sql,.sh"}
           style={{ display: "none" }}
           onChange={(e) => {
             if (e.target.files?.length) void addFiles(e.target.files);
             e.target.value = ""; // allow re-picking same file
           }}
         />
-        <button className="comp-tool" onClick={() => fileRef.current?.click()} title="Attach files or images">
+        <button
+          className="comp-tool"
+          onClick={() => fileRef.current?.click()}
+          title={imagesAllowed ? "Attach files or images" : "Attach text files (selected model can't read images)"}
+        >
           <Icon name="plus" size={17} />
         </button>
         <span className="comp-div" />
@@ -378,10 +423,7 @@ export function ChatScreen({
                 {autoMatches && (
                   <button
                     className={"model-menu-item" + (!modelSel ? " on" : "")}
-                    onClick={() => {
-                      setModelSel(null);
-                      setModelMenuOpen(false);
-                    }}
+                    onClick={() => setModelSel(null)}
                   >
                     <span className="model-menu-logo">
                       <span className="model-menu-dot" style={{ background: "var(--accent)" }} />
@@ -405,11 +447,18 @@ export function ChatScreen({
                       <div className="model-menu-group">{groupName(o)}</div>
                     )}
                     <button
+                      ref={
+                        modelSel?.key === o.key
+                          ? (el) => {
+                              if (el && pickerScrollPending.current) {
+                                pickerScrollPending.current = false;
+                                el.scrollIntoView({ block: "center" });
+                              }
+                            }
+                          : undefined
+                      }
                       className={"model-menu-item" + (modelSel?.key === o.key ? " on" : "")}
-                      onClick={() => {
-                        setModelSel(o);
-                        setModelMenuOpen(false);
-                      }}
+                      onClick={() => setModelSel(o)}
                     >
                       <span
                         className="model-menu-logo"
@@ -426,59 +475,64 @@ export function ChatScreen({
                   <div className="model-menu-empty">Showing {pickerShown} of {filteredOptions.length} · scroll for more</div>
                 )}
               </div>
-              {(reasoningOk || showEffort) && <div className="model-menu-sep" />}
-              {reasoningOk && (
-                <button
-                  className="model-menu-item split-row"
-                  role="switch"
-                  aria-checked={thinking}
-                  onClick={() => setThinking((v) => !v)}
-                >
-                  <span>Thinking</span>
-                  <span className={"toggle" + (thinking ? " on" : "")}>
-                    <span className="toggle-knob" />
-                  </span>
-                </button>
-              )}
-              {showEffort && (
-                <div
-                  className="effort-item"
-                  onMouseEnter={openEffortFly}
-                  onMouseLeave={closeEffortFly}
-                >
-                  <button
-                    className="model-menu-item split-row"
-                    onClick={() => (effortOpen ? setEffortOpen(false) : openEffortFly())}
-                  >
-                    <span>Effort</span>
-                    <span className="effort-val">
-                      <span className="effort-current">{activeEffort}</span>
-                      <Icon name="chevron" size={10} style={{ opacity: 0.6 }} />
-                    </span>
-                  </button>
-                  {effortOpen && (
-                    <div
-                      className="effort-flyout"
-                      onMouseEnter={openEffortFly}
-                      onMouseLeave={closeEffortFly}
-                    >
-                      {effortLevels.map((lvl) => (
-                        <button
-                          key={lvl}
-                          className={"model-menu-item" + (activeEffort === lvl ? " on" : "")}
-                          onClick={() => {
-                            setEffort(lvl);
-                            setEffortOpen(false);
-                          }}
-                        >
-                          <span style={{ textTransform: "capitalize" }}>{lvl}</span>
-                          <span className="effort-check">{activeEffort === lvl && <Icon name="check" size={12} />}</span>
-                        </button>
-                      ))}
+              <div className={"model-menu-extras" + (hasExtras ? " open" : "")}>
+                <div className="model-menu-extras-inner">
+                  <div className="model-menu-sep" />
+                  <div className={"menu-collapse" + (reasoningOk ? " open" : "")}>
+                    <div className="menu-collapse-inner">
+                      <button
+                        className="model-menu-item split-row"
+                        role="switch"
+                        aria-checked={thinking}
+                        onClick={() => setThinking((v) => !v)}
+                      >
+                        <span>Thinking</span>
+                        <span className={"toggle" + (thinking ? " on" : "")}>
+                          <span className="toggle-knob" />
+                        </span>
+                      </button>
                     </div>
-                  )}
+                  </div>
+                  <div className={"menu-collapse" + (showEffort ? " open" : "")}>
+                    <div className="menu-collapse-inner">
+                      <div
+                        className="effort-item"
+                        onMouseEnter={openEffortFly}
+                        onMouseLeave={closeEffortFly}
+                      >
+                        <button
+                          className="model-menu-item split-row"
+                          onClick={() => (effortOpen ? setEffortOpen(false) : openEffortFly())}
+                        >
+                          <span>Effort</span>
+                          <span className="effort-val">
+                            <span className="effort-current">{activeEffort}</span>
+                            <Icon name="chevron" size={10} style={{ opacity: 0.6 }} />
+                          </span>
+                        </button>
+                        {effortOpen && (
+                          <div
+                            className="effort-flyout"
+                            onMouseEnter={openEffortFly}
+                            onMouseLeave={closeEffortFly}
+                          >
+                            {effortLevels.map((lvl) => (
+                              <button
+                                key={lvl}
+                                className={"model-menu-item" + (activeEffort === lvl ? " on" : "")}
+                                onClick={() => setEffort(lvl)}
+                              >
+                                <span style={{ textTransform: "capitalize" }}>{lvl}</span>
+                                <span className="effort-check">{activeEffort === lvl && <Icon name="check" size={12} />}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              )}
+              </div>
             </div>
           )}
         </div>

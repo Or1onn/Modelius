@@ -469,7 +469,7 @@ async function realSend(
     if (!started) begin(); // empty completion — still show a turn
     const latencyMs = performance.now() - t0;
     const u = usage
-      ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite }
+      ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, reasoningTokens: usage.reasoningTokens }
       : { inputTokens: estimateTokens(apiMessages.map((mm) => mm.content).join("\n")), outputTokens: estimateTokens(acc) };
     // $ only for metered turns. Prefer the exact cost the API billed (OpenRouter); otherwise
     // compute it from token usage × current per-token rates.

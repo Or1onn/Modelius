@@ -3,7 +3,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type { Delta } from "@/entities/model/model/backend";
 
 // Raw usage payload from Rust; cache fields are optional (the compat proxy omits them).
-export type RawUsage = { input_tokens: number; output_tokens: number; cache_read?: number; cache_write?: number; cost?: number | null };
+export type RawUsage = { input_tokens: number; output_tokens: number; cache_read?: number; cache_write?: number; reasoning_tokens?: number; cost?: number | null };
 
 export type StreamEvent =
   | { type: "chunk"; data: string }

@@ -18,6 +18,19 @@ pub async fn compat_list_models(base_url: String, api_key: String) -> Result<ser
     json_or_err(res, "Endpoint").await
 }
 
+// POST {base}/api/show {"model": name} — Ollama's native model info, incl. the `capabilities`
+// array (e.g. ["completion","vision"]). Used to learn whether a local model accepts images.
+#[tauri::command]
+pub async fn ollama_show(base_url: String, model: String) -> Result<serde_json::Value, String> {
+    let res = reqwest::Client::new()
+        .post(join_url(&base_url, "/api/show"))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    json_or_err(res, "Ollama").await
+}
+
 // POST {base}/chat/completions with stream:true; SSE parsed here, deltas over the channel.
 #[tauri::command]
 pub async fn compat_chat_stream(
@@ -36,6 +49,12 @@ pub async fn compat_chat_stream(
         .json(&body);
     if !api_key.is_empty() {
         builder = builder.header("authorization", format!("Bearer {}", api_key));
+    }
+    // OpenRouter app-attribution headers (optional, only meaningful on its host).
+    if base_url.contains("openrouter.ai") {
+        builder = builder
+            .header("HTTP-Referer", "https://orchestro.app")
+            .header("X-Title", "Orchestro");
     }
 
     let res = builder.send().await.map_err(|e| e.to_string())?;
@@ -70,6 +89,10 @@ pub async fn compat_chat_stream(
                 output_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                 cache_read: 0,
                 cache_write: 0,
+                reasoning_tokens: u
+                    .pointer("/completion_tokens_details/reasoning_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
                 // OpenRouter returns the exact billed cost here when the request asks for usage accounting.
                 cost: u.get("cost").and_then(|v| v.as_f64()),
             });

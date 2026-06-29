@@ -129,7 +129,7 @@ export interface Message {
   modelProvider?: string;
   memory?: string[]; // facts this turn added to memory ("Memory updated" note)
   // Real measured stats (vs the estimates in `decision`).
-  usage?: { inputTokens: number; outputTokens: number; cacheRead?: number; cacheWrite?: number };
+  usage?: { inputTokens: number; outputTokens: number; cacheRead?: number; cacheWrite?: number; reasoningTokens?: number };
   latencyMs?: number; // wall-clock send → last token
   cost?: number; // real USD — metered turns only; absent on subscription/offline
   priceSource?: "live" | "table"; // where `cost`'s rate came from (OpenRouter live vs static table)

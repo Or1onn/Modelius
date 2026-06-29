@@ -45,7 +45,7 @@ export async function* streamChatGPT(
   const streamId = crypto.randomUUID(); // lets Stop cancel the upstream request mid-flight
   yield* channelToDeltas(
     (onEvent) => invoke("openai_responses_stream", { body, accessToken: auth.token, accountId: auth.accountId, streamId, onEvent }),
-    (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, metered: false }),
+    (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, reasoningTokens: u.reasoning_tokens, metered: false }),
     // 401 = subscription session revoked/dead; drop the token so Providers shows disconnected.
     (msg) => { if (/^ChatGPT 401\b/.test(msg)) disconnectOpenAIOAuth(); },
     signal,

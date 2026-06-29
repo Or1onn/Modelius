@@ -13,11 +13,13 @@ interface ORModel {
   id: string;
   pricing?: { prompt?: string; completion?: string };
   supported_parameters?: string[];
+  architecture?: { input_modalities?: string[] };
 }
-// Cached catalog data: per-token rates + a reasoning-capability flag per normalized id.
+// Cached catalog data: per-token rates + reasoning/vision capability flags per normalized id.
 interface Catalog {
   rates: Record<string, Rate>;
   caps: Record<string, boolean>;
+  vis: Record<string, boolean>;
 }
 
 // Normalize to the bare model slug so a provider-prefixed OpenRouter id (e.g. "google/gemini-2.5-flash")
@@ -30,9 +32,9 @@ function read(): Catalog | null {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (!raw) return null;
-    const e = JSON.parse(raw) as { at: number; rates?: Record<string, Rate>; caps?: Record<string, boolean> };
-    // `rates`/`caps` absent → an older cache shape; treat as stale so it's refetched.
-    if (e.rates && e.caps && Date.now() - e.at < TTL) return { rates: e.rates, caps: e.caps };
+    const e = JSON.parse(raw) as { at: number; rates?: Record<string, Rate>; caps?: Record<string, boolean>; vis?: Record<string, boolean> };
+    // `rates`/`caps`/`vis` absent → an older cache shape; treat as stale so it's refetched.
+    if (e.rates && e.caps && e.vis && Date.now() - e.at < TTL) return { rates: e.rates, caps: e.caps, vis: e.vis };
   } catch {
     /* ignore */
   }
@@ -49,14 +51,16 @@ export async function loadDynamicPricing(): Promise<void> {
       : await fetch(`${OR_BASE}/models`).then((r) => r.json());
     const rates: Record<string, Rate> = {};
     const caps: Record<string, boolean> = {};
+    const vis: Record<string, boolean> = {};
     for (const m of (json.data ?? []) as ORModel[]) {
       caps[norm(m.id)] = (m.supported_parameters ?? []).includes("reasoning");
+      vis[norm(m.id)] = (m.architecture?.input_modalities ?? []).includes("image");
       const pin = parseFloat(m.pricing?.prompt ?? "");
       const pout = parseFloat(m.pricing?.completion ?? "");
       if (!Number.isFinite(pin) || !Number.isFinite(pout) || (pin === 0 && pout === 0)) continue;
       rates[norm(m.id)] = { in: pin * 1e6, out: pout * 1e6 };
     }
-    if (Object.keys(caps).length) localStorage.setItem(STORE_KEY, JSON.stringify({ at: Date.now(), rates, caps }));
+    if (Object.keys(caps).length) localStorage.setItem(STORE_KEY, JSON.stringify({ at: Date.now(), rates, caps, vis }));
   } catch {
     /* offline / blocked — keep static pricing */
   }
@@ -71,4 +75,10 @@ export function dynamicRate(modelId: string): Rate | undefined {
 // known; undefined when it isn't in the catalog (caller decides the fallback). Sync (cache peek).
 export function supportsReasoning(modelId: string): boolean | undefined {
   return read()?.caps[norm(modelId)];
+}
+
+// Whether the model accepts image input, per OpenRouter's catalog. true/false when the model
+// is known; undefined when it isn't in the catalog (caller decides the fallback). Sync (cache peek).
+export function supportsVision(modelId: string): boolean | undefined {
+  return read()?.vis[norm(modelId)];
 }

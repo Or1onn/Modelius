@@ -56,7 +56,7 @@ export async function* streamCompat(
   const streamId = crypto.randomUUID(); // lets Stop cancel the upstream request mid-flight
   yield* channelToDeltas(
     (onEvent) => invoke("compat_chat_stream", { baseUrl, apiKey: key, provider: name, body, streamId, onEvent }),
-    (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, metered, cost: u.cost ?? undefined }),
+    (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, reasoningTokens: u.reasoning_tokens, metered, cost: u.cost ?? undefined }),
     undefined,
     signal,
     streamId
@@ -68,7 +68,11 @@ async function* browserStream(baseUrl: string, name: string, key: string, body: 
   const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/chat/completions`, {
     method: "POST",
     signal,
-    headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
+      ...(baseUrl.includes("openrouter.ai") ? { "HTTP-Referer": "https://orchestro.app", "X-Title": "Orchestro" } : {}),
+    },
     body: JSON.stringify(body),
   });
   if (!res.ok || !res.body) {
@@ -101,6 +105,7 @@ async function* browserStream(baseUrl: string, name: string, key: string, body: 
             kind: "usage",
             inputTokens: json.usage.prompt_tokens,
             outputTokens: json.usage.completion_tokens,
+            reasoningTokens: json.usage.completion_tokens_details?.reasoning_tokens,
             metered,
             cost: typeof json.usage.cost === "number" ? json.usage.cost : undefined,
           };

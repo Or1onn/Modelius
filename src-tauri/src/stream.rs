@@ -50,6 +50,9 @@ pub(crate) enum StreamEvent {
         output_tokens: u64,
         cache_read: u64,
         cache_write: u64,
+        // Reasoning/thinking tokens billed on top of the visible answer (OpenRouter reports them
+        // separately under completion_tokens_details); 0 when the upstream doesn't break them out.
+        reasoning_tokens: u64,
         // Exact billed cost (USD) when the upstream API reports it (OpenRouter); else None.
         cost: Option<f64>,
     },
