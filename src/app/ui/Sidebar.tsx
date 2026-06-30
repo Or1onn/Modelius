@@ -2,6 +2,7 @@
 import { Icon } from "@/shared/ui/Icon";
 import { useChatStore } from "@/entities/chat/model/chats";
 import { ChatGroup, groupHistory, type ScreenId } from "@/app/ui/ChatGroup";
+import { UpdateBanner } from "@/widgets/update-banner/ui/UpdateBanner";
 
 const NAV: { id: ScreenId; label: string; icon: string; beta?: boolean }[] = [
   { id: "providers", label: "Providers", icon: "providers" },
@@ -99,6 +100,8 @@ export function Sidebar({
           ))}
         </div>
       </div>
+
+      <UpdateBanner />
 
       <div className="sb-user">
         <span className="sb-user-av">TT</span>
