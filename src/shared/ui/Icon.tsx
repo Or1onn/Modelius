@@ -6,7 +6,7 @@ import {
   Sparkles, ArrowRight, Play, TrendingUp, Gauge, Copy, RefreshCw, Settings, Pencil,
   Eye, EyeOff, Key, CircleAlert, CircleCheck, CircleX, Link2, Cpu, SlidersHorizontal,
   Ellipsis, Upload, Brain, Code, PanelLeftClose, PanelLeftOpen, Pin, Trash2, Globe,
-  Moon, Sun, type LucideIcon,
+  Moon, Sun, Download, type LucideIcon,
 } from "lucide-react";
 
 // name → lucide component. Names kept from the old set so call sites don't change.
@@ -58,6 +58,7 @@ const ICONS: Record<string, LucideIcon> = {
   pin: Pin,
   trash: Trash2,
   globe: Globe,
+  download: Download,
 };
 
 interface IconProps {
