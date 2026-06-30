@@ -2,6 +2,7 @@
 import { useState, isValidElement, type MouseEvent, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Icon } from "@/shared/ui/Icon";
 
@@ -107,7 +108,7 @@ const MD_COMPONENTS: Components = {
 // GFM rendering for assistant messages; tolerant of partial markdown mid-stream.
 export function Markdown({ text }: { text: string }) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]} components={MD_COMPONENTS}>
       {text}
     </ReactMarkdown>
   );

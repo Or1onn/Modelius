@@ -16,6 +16,7 @@ export async function* streamCompat(
   modelName?: string,
   thinking = false,
   effort: EffortLevel | "auto" = "auto",
+  web = false,
   signal?: AbortSignal
 ): AsyncGenerator<Delta> {
   // A fixed baseUrl endpoint: Gemini/Groq (keyed) or Ollama (local, no key).
@@ -39,8 +40,10 @@ export async function* streamCompat(
   const isOpenRouter = backend.providerId === "openrouter";
   const orEffort: "low" | "medium" | "high" | null =
     effort === "auto" ? null : effort === "low" || effort === "medium" || effort === "high" ? effort : "high";
+  // OpenRouter runs a server-side web search when the model id carries the ":online" suffix.
+  const model = isOpenRouter && web ? `${backend.model}:online` : backend.model;
   const body = {
-    model: backend.model,
+    model,
     messages: reqMsgs,
     stream: true,
     stream_options: { include_usage: true },
@@ -97,6 +100,8 @@ async function* browserStream(baseUrl: string, name: string, key: string, body: 
         const json = JSON.parse(data);
         const delta: string | undefined = json.choices?.[0]?.delta?.content;
         if (delta) yield { kind: "text", text: delta };
+        const fr: string | undefined = json.choices?.[0]?.finish_reason;
+        if (fr) yield { kind: "stop", reason: fr };
         // DeepSeek streams the trace as `reasoning_content`; OpenRouter normalizes it to `reasoning`.
         const think: string | undefined = json.choices?.[0]?.delta?.reasoning_content ?? json.choices?.[0]?.delta?.reasoning;
         if (think) yield { kind: "thinking", text: think };

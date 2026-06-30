@@ -19,6 +19,7 @@ export async function* streamChatGPT(
   messages: ChatMsg[],
   modelName?: string,
   thinking = false,
+  web = false,
   signal?: AbortSignal
 ): AsyncGenerator<Delta> {
   const auth = await getOpenAIAuth();
@@ -41,6 +42,8 @@ export async function* streamChatGPT(
   const body: Record<string, unknown> = { model, instructions, input, stream: true, store: false };
   // `summary: "auto"` streams a reasoning summary we can show.
   if (thinking) body.reasoning = { effort: "medium", summary: "auto" };
+  // Server-side web search (Responses API built-in tool).
+  if (web) body.tools = [{ type: "web_search" }];
 
   const streamId = crypto.randomUUID(); // lets Stop cancel the upstream request mid-flight
   yield* channelToDeltas(
@@ -59,6 +62,7 @@ export async function* streamChat(
   messages: ChatMsg[],
   modelName?: string,
   thinking = false,
+  web = false,
   signal?: AbortSignal
 ): AsyncGenerator<Delta> {
   const key = await getKey("openai");
@@ -94,6 +98,8 @@ export async function* streamChat(
       stream: true,
       stream_options: { include_usage: true }, // final chunk carries real token usage
       ...(thinking && openaiSupportsReasoning(model) ? { reasoning_effort: "medium" } : {}),
+      // Chat Completions web search is only available on the *-search-preview models.
+      ...(web && /search/i.test(model) ? { web_search_options: {} } : {}),
     }),
   });
 
@@ -122,6 +128,8 @@ export async function* streamChat(
         const json = JSON.parse(data);
         const delta: string | undefined = json.choices?.[0]?.delta?.content;
         if (delta) yield { kind: "text", text: delta };
+        const fr: string | undefined = json.choices?.[0]?.finish_reason;
+        if (fr) yield { kind: "stop", reason: fr };
         // include_usage delivers usage on a trailing empty-choices chunk. prompt_tokens
         // already includes cached tokens — don't pass cacheRead or costOf double-counts.
         if (json.usage)

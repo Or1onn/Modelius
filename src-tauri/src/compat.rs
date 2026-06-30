@@ -73,6 +73,10 @@ pub async fn compat_chat_stream(
                 let _ = on_event.send(StreamEvent::Chunk(t.to_string()));
             }
         }
+        // finish_reason is null until the final chunk ("stop" / "length" / …).
+        if let Some(fr) = j.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) {
+            let _ = on_event.send(StreamEvent::StopReason(fr.to_string()));
+        }
         // DeepSeek streams the trace as `reasoning_content`; OpenRouter normalizes it to `reasoning`.
         let think = j
             .pointer("/choices/0/delta/reasoning_content")

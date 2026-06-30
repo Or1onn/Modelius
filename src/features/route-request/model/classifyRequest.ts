@@ -27,7 +27,7 @@ export async function classifyRequest(text: string, opts?: { pool?: Model[] }): 
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
     let out = "";
-    for await (const d of streamLLM(backend, [{ role: "user", content: ROUTE_CLASSIFY_PROMPT + sample(text) }], false, "low", ctrl.signal)) {
+    for await (const d of streamLLM(backend, [{ role: "user", content: ROUTE_CLASSIFY_PROMPT + sample(text) }], false, "low", false, ctrl.signal)) {
       if (d.kind === "text") out += d.text;
     }
     const parsed = parse(out);

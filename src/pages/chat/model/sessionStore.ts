@@ -3,14 +3,16 @@
 // switch. ChatScreen subscribes and renders. In the page: drives streamLLM.
 import { useCallback, useSyncExternalStore } from "react";
 import { route, classify } from "@/features/route-request/model/route";
+import { branchGroup } from "@/pages/chat/lib/branches";
 import { classifyRequest } from "@/features/route-request/model/classifyRequest";
 import { SYSTEM_PROMPT, SUMMARY_PROMPT, MEMORY_EXTRACT_PROMPT, TITLE_PROMPT } from "@/shared/config/prompts";
+import { getCustomInstructions } from "@/entities/settings/model/settings";
 import { estimateTokens, ctxTokens } from "@/shared/lib/tokens";
 import { costOf, priceSource as priceSource_ } from "@/entities/model/lib/pricing";
 import type { Message, Decision, PolicyId, ImageRef } from "@/entities/model/model/registry";
 import type { ChatMsg, Delta, Backend, ModelOption } from "@/entities/model/model/backend";
 import { CODEX_MODELS, ctxForBackend, effortForDifficulty, type EffortLevel } from "@/entities/model/model/apiIds";
-import { pickBackend, pickSummarizerBackend, liveRoutingPool } from "@/features/pick-backend/model/pickBackend";
+import { pickBackend, pickSummarizerBackend, liveRoutingPool, modelAllowsWeb } from "@/features/pick-backend/model/pickBackend";
 import { streamLLM } from "@/features/stream-completion/model/streamLLM";
 import { memoryBlock, getMemories, applyMemoryOps, hydrateMemory } from "@/entities/memory/model/memory";
 import { extractMemories } from "@/pages/chat/model/extractMemories";
@@ -31,6 +33,10 @@ type Phase = "idle" | "routing" | "streaming";
 
 const MEMORY_EVERY = 3; // extract memory on every Nth finished turn (1st, 4th, …)
 
+// Stop/finish reasons that mean the model hit the output-token budget (→ offer "Continue").
+const MAX_TOKEN_STOPS = new Set(["max_tokens", "length", "max_output_tokens", "model_length"]);
+const isMaxTokens = (r: string): boolean => MAX_TOKEN_STOPS.has(r);
+
 // Immutable view the component subscribes to (re-created per commit).
 export interface SessionView {
   messages: Message[];
@@ -39,6 +45,10 @@ export interface SessionView {
   title: string;
   titleSettled: boolean;
   loading: boolean; // saved body still being fetched — suppress the new-chat hero
+  customPrompt: string; // per-chat persona; "" = inherit the global custom instructions
+  summary: string; // compacted brief of old turns (for the context-fill indicator)
+  covered: number; // leading messages folded into `summary`
+  siblings: Message[][]; // inactive alternative threads (branching)
 }
 
 // Params the composer hands to the store, which does routing/streaming.
@@ -47,6 +57,7 @@ export interface SendParams {
   modelSel: ModelOption | null; // null = Auto (routed)
   thinking: boolean;
   effort: EffortLevel | "auto";
+  web: boolean; // request a server-side web search
   fullText: string;
   images: ImageRef[];
 }
@@ -54,6 +65,7 @@ export interface SendParams {
 interface Session {
   chatId: string;
   messages: Message[];
+  siblings: Message[][]; // inactive alternative threads (branch snapshots), active = `messages`
   summary: string; // compressed brief of old turns
   covered: number; // leading messages folded into `summary`
   phase: Phase;
@@ -61,6 +73,7 @@ interface Session {
   title: string;
   titleSettled: boolean;
   loading: boolean;
+  customPrompt: string;
   createdAt: number;
   dirty: boolean; // set on first user action; gates persistence (skip the demo)
   memoryTurns: number; // finished assistant turns, for throttling memory extraction
@@ -81,6 +94,10 @@ function rebuildView(s: Session): void {
     title: s.title,
     titleSettled: s.titleSettled,
     loading: s.loading,
+    customPrompt: s.customPrompt,
+    summary: s.summary,
+    covered: s.covered,
+    siblings: s.siblings,
   };
 }
 
@@ -98,7 +115,7 @@ function schedulePersist(s: Session): void {
     s.saveTimer = null;
     const entry = indexEntryFrom(s.chatId, s.messages, s.createdAt, s.title, s.titleSettled);
     if (!entry) return;
-    void saveChatBody(s.chatId, { messages: s.messages, summary: s.summary, covered: s.covered, title: s.title });
+    void saveChatBody(s.chatId, { messages: s.messages, summary: s.summary, covered: s.covered, title: s.title, customPrompt: s.customPrompt, siblings: s.siblings });
     upsertChat(entry);
   }, 400) as unknown as number;
 }
@@ -112,6 +129,7 @@ function ensure(chatId: string, demo: boolean): Session {
   s = {
     chatId,
     messages: [],
+    siblings: [],
     summary: "",
     covered: 0,
     phase: "idle",
@@ -119,6 +137,7 @@ function ensure(chatId: string, demo: boolean): Session {
     title: "",
     titleSettled: false,
     loading: known,
+    customPrompt: "",
     createdAt: Date.now(),
     dirty: false,
     memoryTurns: 0,
@@ -142,9 +161,11 @@ async function load(s: Session, demo: boolean): Promise<void> {
     const body = await loadChatBody(s.chatId);
     if (body && !s.dirty && s.phase === "idle" && s.messages.length === 0) {
       s.messages = body.messages;
+      s.siblings = body.siblings ?? [];
       s.summary = body.summary;
       s.covered = body.covered;
       s.title = body.title;
+      s.customPrompt = body.customPrompt ?? "";
     }
   }
   s.loading = false;
@@ -157,6 +178,17 @@ async function load(s: Session, demo: boolean): Promise<void> {
 export function isEmptySession(chatId: string): boolean {
   const s = sessions.get(chatId);
   return s ? s.messages.length === 0 : !getChats().some((c) => c.id === chatId);
+}
+
+// Set this chat's persona (per-chat system prompt). Empty → inherit the global custom instructions.
+export function setChatPrompt(chatId: string, text: string): void {
+  const s = sessions.get(chatId);
+  if (!s) return;
+  const next = text.trim();
+  if (next === s.customPrompt) return;
+  s.customPrompt = next;
+  s.dirty = true; // worth persisting
+  commit(s);
 }
 
 // Drop a session (on chat delete) so a stray commit can't resurrect it.
@@ -180,6 +212,7 @@ export function useSession(chatId: string, demo: boolean): SessionView {
 // ---- Mutators ----
 
 function append(s: Session, msg: Message): void {
+  if (msg.ts == null) msg.ts = Date.now();
   s.messages = [...s.messages, msg];
   commit(s);
 }
@@ -269,14 +302,15 @@ function maybeGenerateTitle(s: Session): void {
 // Route a turn and kick off streaming. `history` is the thread state the API sees (excludes the
 // current user turn). `appendUser` is false on regenerate, where the user turn already exists.
 async function dispatch(s: Session, p: SendParams, history: Message[], appendUser: boolean): Promise<void> {
-  const { policy, modelSel, thinking, effort, fullText, images: imgs } = p;
+  const { policy, modelSel, thinking, effort, web, fullText, images: imgs } = p;
 
   // An attached image forces a vision-capable model regardless of policy. Context pressure
   // (history + summary + this turn) floors the pool to models whose window can hold it.
   const ctxUsed =
     history.reduce((n, m) => n + estimateTokens(m.text), estimateTokens(s.summary)) + estimateTokens(fullText);
   const pool = liveRoutingPool();
-  const routeOpts = { requireVision: imgs.length > 0, contextTokens: ctxUsed, pool };
+  // requireWeb only constrains auto-routing; a manual pick is already gated by the composer's Web button.
+  const routeOpts = { requireVision: imgs.length > 0, requireWeb: web && !modelSel, webCapable: modelAllowsWeb, contextTokens: ctxUsed, pool };
 
   // Heuristic first: drives the none-check, the manual override, and the confident fast-path
   // (no LLM call). The phase guard below blocks re-entry, so the async refine has no race.
@@ -306,7 +340,7 @@ async function dispatch(s: Session, p: SendParams, history: Message[], appendUse
   const manual = modelSel ? { label: modelSel.label, provider: modelSel.provider } : backendBadge(backend, decision);
   // "auto" effort tracks the routed difficulty; explicit levels pass through.
   const eff = effort === "auto" ? effortForDifficulty(decision.classification.difficulty ?? 0) : effort;
-  void realSend(s, decision, history, backend, manual, thinking, eff, fullText, imgs, !!modelSel);
+  void realSend(s, decision, history, backend, manual, thinking, eff, fullText, imgs, !!modelSel, web);
 }
 
 export function sendMessage(chatId: string, p: SendParams): void {
@@ -327,9 +361,86 @@ export function regenerate(chatId: string, p: Omit<SendParams, "fullText" | "ima
   if (userIdx < 0) return;
   const userMsg = s.messages[userIdx];
   const history = s.messages.slice(0, userIdx); // everything before that user turn
+  s.siblings = [...s.siblings, s.messages]; // keep the old answer as a branch sibling
   s.messages = s.messages.slice(0, lastIdx); // drop the trailing assistant; keep the user turn
   commit(s);
   void dispatch(s, { ...p, fullText: userMsg.text, images: userMsg.images ?? [] }, history, false);
+}
+
+// Continue a turn cut off by the output-token budget: re-stream with the partial answer as an
+// assistant prefill and append into the SAME bubble. Reuses the producing model (or manual pick).
+export function continueMessage(chatId: string, p: Omit<SendParams, "fullText" | "images">): void {
+  const s = sessions.get(chatId);
+  if (!s || s.phase !== "idle") return;
+  const idx = s.messages.length - 1;
+  const last = s.messages[idx];
+  if (!last || last.role !== "assistant" || !last.truncated) return;
+  void continueSend(s, p, idx);
+}
+
+async function continueSend(s: Session, p: Omit<SendParams, "fullText" | "images">, idx: number): Promise<void> {
+  await hydrateMemory();
+  const last = s.messages[idx];
+  // Backend: current manual pick, else the model that produced this turn (routed fallback if absent).
+  let decision = last.decision;
+  if (!decision) {
+    let ui = idx - 1;
+    while (ui >= 0 && s.messages[ui].role !== "user") ui--;
+    decision = route(ui >= 0 ? s.messages[ui].text : "", p.policy);
+  }
+  const backend = p.modelSel ? p.modelSel.backend : pickBackend(decision);
+  if (backend.kind === "none") return;
+  const eff = p.effort === "auto" ? effortForDifficulty(decision.classification?.difficulty ?? 0) : p.effort;
+
+  // Context = everything up to and including the partial assistant (its text becomes the prefill).
+  const recent: ChatMsg[] = s.messages
+    .slice(s.covered, idx + 1)
+    .map((m) => ({ role: m.role, content: m.text, images: m.images?.map((im) => ({ mime: im.mime, data: im.data })) }));
+  const custom = s.customPrompt.trim() || getCustomInstructions().trim();
+  const mem = memoryBlock();
+  const sysContent =
+    SYSTEM_PROMPT +
+    (custom ? `\n\n${custom}` : "") +
+    (mem ? `\n\nWhat you remember about the user:\n${mem}` : "") +
+    (s.summary ? `\n\nSummary of earlier conversation:\n${s.summary}` : "");
+  const apiMessages: ChatMsg[] = [{ role: "system", content: sysContent }, ...recent];
+
+  const controller = new AbortController();
+  s.abort = controller;
+  setPhase(s, "streaming");
+  let acc = last.text;
+  let reason = last.reasoning ?? "";
+  let stopReason = "";
+  let usage: Extract<Delta, { kind: "usage" }> | undefined;
+  patchAt(s, idx, { streaming: true, shown: acc, truncated: undefined });
+  const update = () => patchAt(s, idx, { shown: acc, reasoning: reason || undefined });
+
+  try {
+    for await (const delta of streamLLM(backend, apiMessages, p.thinking, eff, p.web, controller.signal)) {
+      if (delta.kind === "usage") usage = delta;
+      else if (delta.kind === "thinking") reason += delta.text;
+      else if (delta.kind === "stop") stopReason = delta.reason;
+      else acc += delta.text;
+      update();
+    }
+    if (controller.signal.aborted) {
+      patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false, truncated: true });
+      return;
+    }
+    // Fold the continuation's output tokens into the existing usage (input was billed already).
+    const prev = last.usage;
+    const u = usage
+      ? { inputTokens: prev?.inputTokens ?? usage.inputTokens, outputTokens: (prev?.outputTokens ?? 0) + usage.outputTokens, cacheRead: prev?.cacheRead, cacheWrite: prev?.cacheWrite, reasoningTokens: prev?.reasoningTokens }
+      : prev;
+    patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false, usage: u, truncated: isMaxTokens(stopReason) || undefined });
+    if (acc.trim()) void extractAndSave(acc);
+  } catch {
+    // Keep the partial and leave "Continue" available; don't clobber with a ⚠️ error bubble.
+    patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false, truncated: true });
+  } finally {
+    if (s.abort === controller) s.abort = null;
+    setPhase(s, "idle");
+  }
 }
 
 // Edit a user message and resend: drop that turn and everything after it, then re-route the
@@ -343,10 +454,27 @@ export function editAndResend(chatId: string, msgIndex: number, newText: string,
   if (!text) return;
   const history = s.messages.slice(0, msgIndex); // everything before the edited turn
   const imgs = msg.images ?? []; // keep the original attachments
+  s.siblings = [...s.siblings, s.messages]; // keep the pre-edit thread as a branch sibling
   s.messages = history; // drop the edited turn + everything after; dispatch re-appends the user turn
   s.covered = Math.min(s.covered, history.length); // summary can't cover dropped messages
   commit(s);
   void dispatch(s, { ...p, fullText: text, images: imgs }, history, true);
+}
+
+// Switch to the previous/next sibling branch at divergence position `p`. The currently-active
+// thread becomes a sibling; the chosen one becomes active.
+export function switchBranch(chatId: string, p: number, dir: -1 | 1): void {
+  const s = sessions.get(chatId);
+  if (!s || s.phase !== "idle") return;
+  const all = [...s.siblings, s.messages];
+  const grp = branchGroup(all, s.messages, p);
+  if (!grp) return;
+  const target = grp.versions[(grp.k + dir + grp.versions.length) % grp.versions.length];
+  if (target === s.messages) return;
+  s.siblings = all.filter((t) => t !== target); // demote old active, drop chosen from siblings
+  s.messages = target;
+  s.covered = Math.min(s.covered, p); // summary can't cover messages past the divergence
+  commit(s);
 }
 
 // Abort the active stream for this chat. Partial output already streamed is finalized in realSend.
@@ -366,7 +494,8 @@ async function realSend(
   effortLevel: EffortLevel | "auto",
   fullText: string,
   imgs: ImageRef[],
-  isManual: boolean
+  isManual: boolean,
+  web: boolean
 ): Promise<void> {
   await hydrateMemory(); // ensure the decrypted memory cache is ready before building the prompt
   // Keep inside the window, budgeting by the routed pick's ctx (a stable proxy).
@@ -416,10 +545,13 @@ async function realSend(
     ? `\n\nReferenced code artifacts (verbatim, do not summarize):\n${blocks.join("\n\n")}`
     : "";
 
-  // Long-term memory first, then the per-chat summary.
+  // Custom instructions first (per-chat persona overrides the global setting), then long-term
+  // memory, then the per-chat summary.
+  const custom = s.customPrompt.trim() || getCustomInstructions().trim();
   const mem = memoryBlock();
   const sysContent =
     SYSTEM_PROMPT +
+    (custom ? `\n\n${custom}` : "") +
     (mem ? `\n\nWhat you remember about the user:\n${mem}` : "") +
     (sumText ? `\n\nSummary of earlier conversation:\n${sumText}` : "") +
     codeAppendix;
@@ -435,6 +567,7 @@ async function realSend(
 
   let acc = "";
   let reason = "";
+  let stopReason = "";
   let usage: Extract<Delta, { kind: "usage" }> | undefined;
   const t0 = performance.now();
   let started = false;
@@ -454,10 +587,11 @@ async function realSend(
   const update = () => patchLastStreaming(s, { shown: acc, reasoning: reason || undefined });
 
   try {
-    for await (const delta of streamLLM(backend, apiMessages, reasoningOn, effortLevel, controller.signal)) {
+    for await (const delta of streamLLM(backend, apiMessages, reasoningOn, effortLevel, web, controller.signal)) {
       if (!started) begin();
       if (delta.kind === "usage") usage = delta;
       else if (delta.kind === "thinking") reason += delta.text;
+      else if (delta.kind === "stop") stopReason = delta.reason;
       else acc += delta.text;
       update();
     }
@@ -481,7 +615,7 @@ async function realSend(
       : undefined;
     const priceSource = cost != null ? (exact != null ? "live" : priceSource_(backend.model) ?? undefined) : undefined;
     const asstIndex = s.messages.length - 1; // this turn's assistant message; stable (append-only)
-    patchAt(s, asstIndex, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false, usage: u, latencyMs, cost, priceSource });
+    patchAt(s, asstIndex, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false, usage: u, latencyMs, cost, priceSource, truncated: isMaxTokens(stopReason) || undefined });
     if (acc.trim()) void extractAndSave(acc); // persist large code the model returned
     // Reconcile durable user facts off the critical path, throttled to every MEMORY_EVERY-th
     // turn (1st, 4th, …) to cut cost/noise. Ops add/update/delete against known facts; tag the

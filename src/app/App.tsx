@@ -1,7 +1,8 @@
 // App.tsx — shell: sidebar nav, conversation history, screen routing.
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import "highlight.js/styles/github-dark.css";
 import "@/app/styles/styles.css";
-import { type PolicyId } from "@/entities/model/model/registry";
+import { hydrateSettings, useSettings } from "@/entities/settings/model/settings";
 import { deleteChat, pinChat, renameChat, hydrateChatIndex } from "@/entities/chat/model/chats";
 import { dropSession, isEmptySession } from "@/pages/chat/model/sessionStore";
 import { listOllamaModels } from "@/entities/session/model/ollamaSession";
@@ -15,7 +16,9 @@ import { clearDraft } from "@/pages/chat/model/drafts";
 import { ChatScreen } from "@/pages/chat/ui/ChatScreen";
 import { ProvidersScreen } from "@/pages/providers/ui/ProvidersScreen";
 import { MemoryScreen } from "@/pages/memory/ui/MemoryScreen";
+import { SettingsScreen } from "@/pages/settings/ui/SettingsScreen";
 import { SearchModal } from "@/widgets/search-modal/ui/SearchModal";
+import { ShortcutsModal } from "@/widgets/shortcuts-modal/ui/ShortcutsModal";
 import { Sidebar } from "@/app/ui/Sidebar";
 import { Icon } from "@/shared/ui/Icon";
 import type { ScreenId } from "@/app/ui/ChatGroup";
@@ -29,11 +32,53 @@ const ROOT_STYLE = {
   "--grain-op": (25 / 100) * 0.55,
 } as CSSProperties;
 
+// Resizable sidebar (grid first column). Width is layout px; the shell's `zoom` (see .app)
+// scales the rendered size, so drag deltas (screen px) are divided back out.
+const NAV_KEY = "orchestro.navWidth";
+const NAV_MIN = 200;
+const NAV_MAX = 460;
+const clampNav = (w: number) => Math.max(NAV_MIN, Math.min(w, NAV_MAX));
+
 export default function App() {
   const [screen, setScreen] = useState<ScreenId>("chat");
-  const [policy] = useState<PolicyId>("cost");
+  const { policy, zoom, theme } = useSettings(); // routing policy + UI zoom + theme (persisted)
+
+  // Drive the light/dark palette via a data-theme attribute on <html> so body + app both pick it up.
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [navCollapsed, setNavCollapsed] = useState(false);
+  const [navWidth, setNavWidth] = useState(() => {
+    const saved = Number(localStorage.getItem(NAV_KEY));
+    return saved >= NAV_MIN ? clampNav(saved) : 252;
+  });
+  const [navResizing, setNavResizing] = useState(false); // disables the grid transition mid-drag
+
+  // Drag the sidebar/stage boundary to resize. clientX is screen px → divide by zoom for layout px.
+  const startNavResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = navWidth;
+    setNavResizing(true); // follow the cursor 1:1, no .28s grid easing
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    const onMove = (ev: MouseEvent) => setNavWidth(clampNav(startW + (ev.clientX - startX) / zoom));
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      setNavResizing(false);
+      setNavWidth((w) => {
+        localStorage.setItem(NAV_KEY, String(w));
+        return w;
+      });
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
 
   // activeChatId keys ChatScreen, so switching/opening remounts it with that chat's state.
   const [activeChatId, setActiveChatId] = useState<string>(() => crypto.randomUUID());
@@ -56,6 +101,9 @@ export default function App() {
     gotoNewChat();
     setScreen("chat");
   };
+  // Latest newChat for the global keydown handler (which subscribes once).
+  const newChatRef = useRef(newChat);
+  newChatRef.current = newChat;
   const openChat = (id: string) => {
     setActiveChatId(id);
     setScreen("chat");
@@ -73,29 +121,43 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       await migrateToSecureStorage();
-      await Promise.all([hydrateMemory(), hydrateChatIndex(), hydrateTitles()]);
+      await Promise.all([hydrateSettings(), hydrateMemory(), hydrateChatIndex(), hydrateTitles()]);
       void loadDynamicPricing(); // live per-token prices (OpenRouter) → routing cost + real $ per turn
       void listOllamaModels().catch(() => {});
       for (const pid of KEY_PROVIDER_IDS) if (hasKey(pid)) void listKeyProviderModels(pid).catch(() => {});
     })();
   }, []);
 
-  // Cmd/Ctrl-K toggles search.
+  // Global shortcuts. Mod (Cmd/Ctrl): K search, N new chat, / shortcuts. Bare "?" also opens
+  // shortcuts, but only when not typing into a field.
   useEffect(() => {
+    const typingInField = () => {
+      const el = document.activeElement as HTMLElement | null;
+      return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+    };
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      const mod = e.metaKey || e.ctrlKey;
+      const k = e.key.toLowerCase();
+      if (mod && k === "k") {
         e.preventDefault();
         setSearchOpen((o) => !o);
+      } else if (mod && k === "n") {
+        e.preventDefault();
+        newChatRef.current();
+      } else if ((mod && k === "/") || (e.key === "?" && !typingInField())) {
+        e.preventDefault();
+        setShortcutsOpen((o) => !o);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const noise = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.6 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`;
 
   return (
-    <div className={"app" + (navCollapsed ? " nav-collapsed" : "")} style={ROOT_STYLE}>
+    <div className={"app" + (navCollapsed ? " nav-collapsed" : "") + (navResizing ? " nav-resizing" : "")} style={{ ...ROOT_STYLE, "--nav-w": navWidth + "px", "--app-zoom": zoom } as CSSProperties}>
       <div className="grain" style={{ backgroundImage: noise, opacity: "var(--grain-op)" }} />
       <Sidebar
         screen={screen}
@@ -109,6 +171,9 @@ export default function App() {
         onPinChat={pinChat}
         onRenameChat={renameChat}
       />
+      {!navCollapsed && (
+        <div className="nav-resize" style={{ left: navWidth }} onMouseDown={startNavResize} title="Drag to resize" />
+      )}
       {navCollapsed && (
         <button className="sb-reopen" title="Show sidebar" onClick={() => setNavCollapsed(false)}>
           <Icon name="panelLeftOpen" size={16} />
@@ -127,9 +192,11 @@ export default function App() {
         )}
         {screen === "providers" && <ProvidersScreen />}
         {screen === "memory" && <MemoryScreen />}
+        {screen === "settings" && <SettingsScreen />}
       </main>
 
       <SearchModal open={searchOpen} onClose={() => setSearchOpen(false)} onOpenChat={openChat} />
+      <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
     </div>
   );
 }

@@ -159,7 +159,7 @@ pub async fn openai_responses_stream(
                     let _ = on_event.send(StreamEvent::Thinking(t.to_string()));
                 }
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 let _ = on_event.send(StreamEvent::Usage {
                     input_tokens: j.pointer("/response/usage/input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                     output_tokens: j.pointer("/response/usage/output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -171,6 +171,10 @@ pub async fn openai_responses_stream(
                         .unwrap_or(0),
                     cost: None, // OpenAI bills via token usage; no per-request cost in the response.
                 });
+                // Truncated by the output-token budget → incomplete_details.reason = "max_output_tokens".
+                if let Some(r) = j.pointer("/response/incomplete_details/reason").and_then(|v| v.as_str()) {
+                    let _ = on_event.send(StreamEvent::StopReason(r.to_string()));
+                }
                 let _ = on_event.send(StreamEvent::Done);
                 return ControlFlow::Break(());
             }

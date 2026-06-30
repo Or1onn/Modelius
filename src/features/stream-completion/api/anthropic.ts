@@ -19,6 +19,7 @@ export async function* streamClaude(
   modelName?: string,
   thinking = false,
   effort: EffortLevel | "auto" = "auto",
+  web = false,
   signal?: AbortSignal
 ): AsyncGenerator<Delta> {
   // Messages API takes only user/assistant turns; system is top-level.
@@ -62,6 +63,10 @@ export async function* streamClaude(
   // Effort applies whenever supported, independent of the thinking toggle. resolveEffort
   // clamps levels the model can't use (e.g. Auto→Sonnet with max selected).
   if (tier) body.output_config = { effort: resolveEffort(tier, effort) };
+  // Server-side web search: Claude runs searches itself and folds results (with citations) into
+  // the streamed answer. The tool/result content blocks are ignored by the Rust SSE parser; only
+  // text/thinking deltas surface, so the answer streams as usual.
+  if (web) body.tools = [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }];
 
   // Prefer OAuth over a pasted API key.
   const oauthToken = await getAnthropicAccessToken();

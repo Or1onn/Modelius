@@ -4,7 +4,7 @@ import { createPortal } from "react-dom";
 import { Icon } from "@/shared/ui/Icon";
 import type { ChatIndexEntry } from "@/entities/chat/model/chats";
 
-export type ScreenId = "chat" | "providers" | "memory";
+export type ScreenId = "chat" | "providers" | "memory" | "settings";
 
 // Bucket chats by updatedAt into Today/Yesterday/Earlier (local day). Empty groups dropped by ChatGroup.
 export type HistGroup = { id: string; label: string; items: ChatIndexEntry[]; defaultOpen: boolean };
@@ -215,15 +215,15 @@ function ChatMenu({
     >
       <button className="sb-chat-menu-item" onClick={onPin}>
         <Icon name="pin" size={14} />
-        {pinned ? "Открепить" : "Закрепить"}
+        {pinned ? "Unpin" : "Pin"}
       </button>
       <button className="sb-chat-menu-item" onClick={onRename}>
         <Icon name="edit" size={14} />
-        Переименовать
+        Rename
       </button>
       <button className="sb-chat-menu-item danger" onClick={onDelete}>
         <Icon name="trash" size={14} />
-        Удалить
+        Delete
       </button>
     </div>,
     document.body

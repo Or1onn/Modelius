@@ -1,11 +1,16 @@
 // ChatThread.tsx — scrolling message list: user/assistant turns, reasoning + memory notes, routing rows.
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Icon } from "@/shared/ui/Icon";
+import { branchGroup } from "@/pages/chat/lib/branches";
 import { ModelBadge } from "@/entities/model/ui/ModelBadge";
 import { Markdown, segmentBody } from "@/shared/lib/markdown";
 import { fmtCompact } from "@/shared/lib/tokens";
 import { POLICIES, type PolicyId, type Message } from "@/entities/model/model/registry";
 import { isLargeBlock, isFileArtifact, makeArtifact, wrapFence, type Artifact } from "@/entities/artifact/model/artifacts";
+
+// Short wall-clock time for a message; full date in the tooltip.
+const fmtTime = (ts?: number) => (ts ? new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "");
+const fmtFull = (ts?: number) => (ts ? new Date(ts).toLocaleString() : "");
 
 // A code block as a clickable card; click opens it in the ArtifactPanel. `generating` = still streaming.
 function ArtifactCard({ art, onOpen, generating }: { art: Artifact; onOpen: () => void; generating?: boolean }) {
@@ -162,8 +167,8 @@ function UserRow({
     <div className="row-user">
       <div className="user-col">
         <UserContent text={msg.text} images={msg.images} onOpen={(bi) => onOpenBlock(index, bi)} />
-        {canEdit && (
-          <div className="user-foot">
+        <div className="user-foot">
+          {canEdit && (
             <button
               className="asst-act"
               title="Edit & resend"
@@ -174,8 +179,9 @@ function UserRow({
             >
               <Icon name="edit" size={15} />
             </button>
-          </div>
-        )}
+          )}
+          {msg.ts && <span className="msg-ts" title={fmtFull(msg.ts)}>{fmtTime(msg.ts)}</span>}
+        </div>
       </div>
     </div>
   );
@@ -269,6 +275,23 @@ function AsstActions({ text, canRegenerate, onRegenerate }: { text: string; canR
   );
 }
 
+// ◀ k/n ▶ switcher shown at a branch divergence point. `align` matches the diverging turn's side.
+function BranchNav({ n, k, align, onPrev, onNext }: { n: number; k: number; align: "user" | "asst"; onPrev: () => void; onNext: () => void }) {
+  return (
+    <div className={"branch-nav " + align}>
+      <button className="branch-arrow" onClick={onPrev} title="Previous version">
+        <Icon name="chevron" size={13} style={{ transform: "rotate(180deg)" }} />
+      </button>
+      <span className="branch-count">
+        {k + 1}/{n}
+      </span>
+      <button className="branch-arrow" onClick={onNext} title="Next version">
+        <Icon name="chevron" size={13} />
+      </button>
+    </div>
+  );
+}
+
 export function ChatThread({
   messages,
   phase,
@@ -278,6 +301,9 @@ export function ChatThread({
   onOpenBlock,
   onRegenerate,
   onEditResend,
+  onContinue,
+  siblings = [],
+  onSwitchBranch,
 }: {
   messages: Message[];
   phase: "idle" | "routing" | "streaming";
@@ -287,37 +313,65 @@ export function ChatThread({
   onOpenBlock: (msgIndex: number, blockIndex: number) => void;
   onRegenerate?: () => void; // re-run the last assistant turn
   onEditResend?: (msgIndex: number, text: string) => void; // edit a user turn and resend
+  onContinue?: () => void; // continue a turn cut off by max output tokens
+  siblings?: Message[][]; // inactive branch threads (for the ◀ k/n ▶ navigator)
+  onSwitchBranch?: (p: number, dir: -1 | 1) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true); // at bottom → follow the stream; scrolling up unpins
+  const [atBottom, setAtBottom] = useState(true); // mirrors pinnedRef for the floating button
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
   }, [messages, phase]);
 
+  const toBottom = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    pinnedRef.current = true;
+    setAtBottom(true);
+  };
+
+  // Active + sibling threads, for the per-position branch navigator.
+  const allThreads = useMemo(() => [...siblings, messages], [siblings, messages]);
+
   return (
+    <>
     <div
       className="thread"
       ref={scrollRef}
       onScroll={(e) => {
         const el = e.currentTarget;
-        pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+        const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+        pinnedRef.current = pinned;
+        setAtBottom(pinned);
       }}
     >
       <div className="thread-inner">
-        {messages.map((msg, i) =>
-          msg.role === "user" ? (
-            <UserRow
-              key={i}
-              msg={msg}
-              index={i}
+        {messages.map((msg, i) => {
+          const grp = onSwitchBranch && siblings.length ? branchGroup(allThreads, messages, i) : null;
+          const nav = grp ? (
+            <BranchNav
+              n={grp.versions.length}
+              k={grp.k}
+              align={msg.role === "user" ? "user" : "asst"}
+              onPrev={() => onSwitchBranch!(i, -1)}
+              onNext={() => onSwitchBranch!(i, 1)}
+            />
+          ) : null;
+          const row =
+            msg.role === "user" ? (
+              <UserRow
+                msg={msg}
+                index={i}
               canEdit={phase === "idle"}
               onOpenBlock={onOpenBlock}
               onEditResend={onEditResend}
             />
           ) : (
-            <div key={i} className="row-asst">
+            <div className={"row-asst" + (!msg.streaming && msg.text.startsWith("⚠️ ") ? " asst-error" : "")}>
               <div className="asst-head">
                 {msg.modelLabel ? (
                   <ModelBadge label={msg.modelLabel} provider={msg.modelProvider} size="sm" />
@@ -344,6 +398,11 @@ export function ChatThread({
                     {msg.decision!.chosenCost === 0 ? "free" : "$" + msg.decision!.chosenCost.toFixed(4)}
                   </span>
                 ) : null}
+                {msg.ts && !msg.streaming && (
+                  <span className="asst-meta msg-ts" title={fmtFull(msg.ts)}>
+                    {fmtTime(msg.ts)}
+                  </span>
+                )}
               </div>
               {msg.reasoning && <ReasoningBlock text={msg.reasoning} streaming={!!msg.streaming} />}
               <div className="asst-body md">
@@ -355,18 +414,38 @@ export function ChatThread({
                 {msg.streaming && <span className="cursor" />}
               </div>
               {msg.memory && msg.memory.length > 0 && <MemoryNote facts={msg.memory} />}
-              {!msg.streaming && (
-                <div className="asst-foot">
-                  <AsstActions
-                    text={msg.text}
-                    canRegenerate={phase === "idle" && i === messages.length - 1}
-                    onRegenerate={onRegenerate}
-                  />
-                </div>
-              )}
+              {!msg.streaming &&
+                (msg.text.startsWith("⚠️ ") && phase === "idle" && i === messages.length - 1 ? (
+                  <div className="asst-foot">
+                    <button className="retry-btn" onClick={onRegenerate}>
+                      <Icon name="refresh" size={14} />
+                      Retry
+                    </button>
+                  </div>
+                ) : (
+                  <div className="asst-foot">
+                    <AsstActions
+                      text={msg.text}
+                      canRegenerate={phase === "idle" && i === messages.length - 1}
+                      onRegenerate={onRegenerate}
+                    />
+                    {msg.truncated && phase === "idle" && i === messages.length - 1 && (
+                      <button className="continue-btn" onClick={onContinue} title="Response cut off by the token limit">
+                        <Icon name="arrowR" size={14} />
+                        Continue
+                      </button>
+                    )}
+                  </div>
+                ))}
             </div>
-          )
-        )}
+          );
+          return (
+            <Fragment key={i}>
+              {row}
+              {nav}
+            </Fragment>
+          );
+        })}
 
         {phase === "routing" && (
           <div className="row-asst">
@@ -387,5 +466,11 @@ export function ChatThread({
         )}
       </div>
     </div>
+    {!atBottom && (
+      <button className="scroll-bottom-btn" onClick={toBottom} title="Scroll to bottom">
+        <Icon name="chevronD" size={18} />
+      </button>
+    )}
+    </>
   );
 }

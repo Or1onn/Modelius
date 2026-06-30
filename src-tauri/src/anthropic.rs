@@ -72,6 +72,7 @@ pub async fn anthropic_messages_stream(
     // events: input/cache on message_start, output (cumulative) on message_delta.
     // Accumulate and flush a Usage event at stop.
     let (mut input, mut output, mut cache_read, mut cache_write) = (0u64, 0u64, 0u64, 0u64);
+    let mut stop_reason: Option<String> = None;
     pump_sse(res, &cancel.flag, |data| {
         let Ok(j) = serde_json::from_str::<serde_json::Value>(data) else { return ControlFlow::Continue(()) };
         let u64_at = |j: &serde_json::Value, ptr: &str| j.pointer(ptr).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -90,6 +91,9 @@ pub async fn anthropic_messages_stream(
             }
             "message_delta" => {
                 output = u64_at(&j, "/usage/output_tokens"); // cumulative
+                if let Some(r) = j.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
+                    stop_reason = Some(r.to_string());
+                }
             }
             "message_stop" => {
                 let _ = on_event.send(StreamEvent::Usage {
@@ -100,6 +104,9 @@ pub async fn anthropic_messages_stream(
                     reasoning_tokens: 0, // Anthropic folds thinking into output_tokens.
                     cost: None, // Anthropic bills via token usage; no per-request cost in the response.
                 });
+                if let Some(r) = stop_reason.take() {
+                    let _ = on_event.send(StreamEvent::StopReason(r));
+                }
                 let _ = on_event.send(StreamEvent::Done);
                 return ControlFlow::Break(());
             }

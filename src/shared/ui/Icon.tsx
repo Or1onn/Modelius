@@ -5,7 +5,8 @@ import {
   Leaf, Star, Zap, Lock, Paperclip, X, ChevronRight, ChevronDown, Search, Check,
   Sparkles, ArrowRight, Play, TrendingUp, Gauge, Copy, RefreshCw, Settings, Pencil,
   Eye, EyeOff, Key, CircleAlert, CircleCheck, CircleX, Link2, Cpu, SlidersHorizontal,
-  Ellipsis, Upload, Brain, Code, PanelLeftClose, PanelLeftOpen, Pin, Trash2, type LucideIcon,
+  Ellipsis, Upload, Brain, Code, PanelLeftClose, PanelLeftOpen, Pin, Trash2, Globe,
+  Moon, Sun, type LucideIcon,
 } from "lucide-react";
 
 // name → lucide component. Names kept from the old set so call sites don't change.
@@ -35,6 +36,8 @@ const ICONS: Record<string, LucideIcon> = {
   copy: Copy,
   refresh: RefreshCw,
   cog: Settings,
+  moon: Moon,
+  sun: Sun,
   edit: Pencil,
   eye: Eye,
   eyeOff: EyeOff,
@@ -54,6 +57,7 @@ const ICONS: Record<string, LucideIcon> = {
   panelLeftOpen: PanelLeftOpen,
   pin: Pin,
   trash: Trash2,
+  globe: Globe,
 };
 
 interface IconProps {

@@ -1,5 +1,5 @@
 // ChatScreen.tsx — chat page view: composer, model picker, artifact-panel host. Thread via widget.
-import { Fragment, useEffect, useRef, useState, type UIEvent } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type UIEvent } from "react";
 import { ChatThread } from "@/widgets/chat-thread/ui/ChatThread";
 import { ArtifactPanel } from "@/widgets/artifact-panel/ui/ArtifactPanel";
 import { Icon } from "@/shared/ui/Icon";
@@ -7,13 +7,16 @@ import { ProviderLogo } from "@/entities/model/ui/ProviderLogo";
 import { codeSegs } from "@/shared/lib/markdown";
 import { PROVIDERS, type Message, type PolicyId, type ImageRef } from "@/entities/model/model/registry";
 import type { ModelOption } from "@/entities/model/model/backend";
-import { anthropicEffortTier, EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
-import { listAvailableModels, peekAvailableModels, optionAllowsImages } from "@/features/pick-backend/model/pickBackend";
+import { anthropicEffortTier, ctxForBackend, EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
+import { estimateTokens, ctxTokens, fmtCompact } from "@/shared/lib/tokens";
+import { listAvailableModels, peekAvailableModels, optionAllowsImages, optionAllowsWeb } from "@/features/pick-backend/model/pickBackend";
 import { supportsReasoning } from "@/entities/model/lib/pricingSource";
 import { makeArtifact, rememberArtifactTitle, isLargePaste, wrapFence, type Artifact } from "@/entities/artifact/model/artifacts";
+import { collectVersions } from "@/entities/artifact/lib/versions";
+import { ExportButton } from "@/features/export-chat/ui/ExportButton";
 import { readDataUrl, readText } from "@/pages/chat/lib/files";
 import { getChats } from "@/entities/chat/model/chats";
-import { useSession, sendMessage, stopStream, regenerate, editAndResend } from "@/pages/chat/model/sessionStore";
+import { useSession, sendMessage, stopStream, regenerate, editAndResend, continueMessage, switchBranch, setChatPrompt } from "@/pages/chat/model/sessionStore";
 import { getDraft, setDraft, clearDraft } from "@/pages/chat/model/drafts";
 import { getModelSel, setModelSel as persistModelSel } from "@/pages/chat/model/modelSel";
 
@@ -48,6 +51,79 @@ function greeting(): string {
   return "Good evening";
 }
 
+// Per-chat persona: a system prompt scoped to this chat, overriding the global custom
+// instructions. The button highlights when one is set; the popover autosaves on outside-click.
+function PersonaButton({ value, onSave }: { value: string; onSave: (text: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(value);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  // Re-sync from the stored value on chat switch (while closed).
+  useEffect(() => {
+    if (!open) setDraft(value);
+  }, [value, open]);
+
+  // Outside-click autosaves and closes.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: globalThis.MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        onSave(draft.trim());
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open, draft, onSave]);
+
+  return (
+    <div className="persona-wrap" ref={wrapRef}>
+      <button
+        className={"persona-btn" + (value ? " on" : "")}
+        title={value ? "Chat persona — custom prompt set" : "Set a persona for this chat"}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <Icon name="sliders" size={15} />
+      </button>
+      {open && (
+        <div className="persona-pop">
+          <div className="persona-pop-head">Chat persona</div>
+          <p className="persona-pop-sub">
+            A system prompt just for this chat — overrides your global custom instructions. Empty inherits it.
+          </p>
+          <textarea
+            className="persona-pop-ta"
+            autoFocus
+            value={draft}
+            placeholder="e.g. You are a senior Rust reviewer. Be terse and blunt."
+            onChange={(e) => setDraft(e.target.value)}
+          />
+          <div className="persona-pop-bar">
+            <button
+              className="ue-btn"
+              onClick={() => {
+                setDraft(value);
+                setOpen(false);
+              }}
+            >
+              Cancel
+            </button>
+            <button
+              className="ue-btn primary"
+              onClick={() => {
+                onSave(draft.trim());
+                setOpen(false);
+              }}
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ChatScreen({
   policy,
   chatId,
@@ -62,7 +138,7 @@ export function ChatScreen({
   // Demo thread only on the startup chat of a first-ever launch (no saved chats yet).
   const demo = showDemo && getChats().length === 0;
   // State + streaming live in the global session store, surviving a chat/screen switch.
-  const { messages, phase, compacting, title, titleSettled, loading } = useSession(chatId, demo);
+  const { messages, phase, compacting, title, titleSettled, loading, customPrompt, summary, siblings } = useSession(chatId, demo);
   const [input, setInput] = useState(() => getDraft(chatId)); // restore unsent draft on chat/screen switch
   // Persist the manual pick per-chat so it survives a chat/screen switch (like drafts).
   const [modelSel, setModelSelState] = useState<ModelOption | null>(() => getModelSel(chatId));
@@ -73,6 +149,9 @@ export function ChatScreen({
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelQuery, setModelQuery] = useState(""); // 1code-style search filter in the picker
   const [thinking, setThinking] = useState(false); // request the reasoning trace
+  const [web, setWeb] = useState(true); // server-side web search — on by default
+  const [addMenuOpen, setAddMenuOpen] = useState(false); // composer "+" menu (files + web search)
+  const addMenuRef = useRef<HTMLDivElement>(null);
   const [effort, setEffort] = useState<EffortLevel | "auto">("auto"); // Anthropic effort, "auto" = per-model default
   const [effortOpen, setEffortOpen] = useState(false); // effort flyout
   const effortTimer = useRef<number | null>(null);
@@ -116,6 +195,16 @@ export function ChatScreen({
     document.addEventListener("mousedown", onDown);
     return () => document.removeEventListener("mousedown", onDown);
   }, [modelMenuOpen]);
+
+  // Close the composer "+" menu on an outside click.
+  useEffect(() => {
+    if (!addMenuOpen) return;
+    const onDown = (e: globalThis.MouseEvent) => {
+      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node)) setAddMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [addMenuOpen]);
 
   // Collapse the effort flyout and clear the search whenever the model menu closes.
   useEffect(() => {
@@ -227,7 +316,7 @@ export function ChatScreen({
     setTimeout(() => {
       if (taRef.current) taRef.current.style.height = "auto";
     }, 0);
-    sendMessage(chatId, { policy, modelSel, thinking, effort, fullText, images: imgs });
+    sendMessage(chatId, { policy, modelSel, thinking, effort, web, fullText, images: imgs });
   }
 
   // Empty chat → centered greeting + composer. While a saved body is still loading,
@@ -273,6 +362,13 @@ export function ChatScreen({
   useEffect(() => {
     if (!imagesAllowed) setImages([]);
   }, [imagesAllowed]);
+
+  // Web search needs a search-capable backend (Anthropic / Codex / OpenRouter / search-preview).
+  const webAllowed = optionAllowsWeb(modelSel);
+  // Drop a stale "on" when switching to a model that can't search.
+  useEffect(() => {
+    if (!webAllowed) setWeb(false);
+  }, [webAllowed]);
 
   const canSend = !!(input.trim() || attachments.length || images.length);
 
@@ -380,13 +476,39 @@ export function ChatScreen({
             e.target.value = ""; // allow re-picking same file
           }}
         />
-        <button
-          className="comp-tool"
-          onClick={() => fileRef.current?.click()}
-          title={imagesAllowed ? "Attach files or images" : "Attach text files (selected model can't read images)"}
-        >
-          <Icon name="plus" size={17} />
-        </button>
+        <div className="comp-add-wrap" ref={addMenuRef}>
+          <button
+            className={"comp-tool" + (addMenuOpen ? " on" : "")}
+            onClick={() => setAddMenuOpen((v) => !v)}
+            title="Add files, media, or web search"
+          >
+            <Icon name="plus" size={17} />
+          </button>
+          {addMenuOpen && (
+            <div className="comp-add-menu">
+              <button
+                className="model-menu-item"
+                onClick={() => {
+                  setAddMenuOpen(false);
+                  fileRef.current?.click();
+                }}
+              >
+                <span className="model-menu-logo"><Icon name="attach" size={15} /></span>
+                <span style={{ flex: 1 }}>{imagesAllowed ? "Files & media" : "Files"}</span>
+              </button>
+              <button
+                className="model-menu-item"
+                disabled={!webAllowed}
+                onClick={() => webAllowed && setWeb((v) => !v)}
+                title={webAllowed ? "Search the web for this turn" : "The selected model can't search the web"}
+              >
+                <span className="model-menu-logo"><Icon name="globe" size={15} /></span>
+                <span style={{ flex: 1 }}>Web search</span>
+                <span className="model-menu-check">{web && <Icon name="check" size={12} />}</span>
+              </button>
+            </div>
+          )}
+        </div>
         <span className="comp-div" />
         <div className="model-pick-wrap" ref={modelPickRef}>
           <button
@@ -554,11 +676,34 @@ export function ChatScreen({
   // Neutral placeholder until the title generates; fall back to first message only once settled.
   const headerTitle = title || (titleSettled && firstUser ? firstUser.text : "New chat");
 
+  // Context-fill indicator: mirror realSend's window budgeting so the bar's colour flips exactly
+  // when compaction kicks in. Window = active model's ctx (manual pick) or the last routed pick.
+  const ctxMeter = useMemo(() => {
+    let ctxStr = "200K";
+    if (modelSel) ctxStr = ctxForBackend(modelSel.backend);
+    else
+      for (let i = messages.length - 1; i >= 0; i--)
+        if (messages[i].decision) { ctxStr = messages[i].decision!.chosen.ctx; break; }
+    const win = ctxTokens(ctxStr);
+    const used = messages.reduce((n, m) => n + estimateTokens(m.text), estimateTokens(summary));
+    return { used, win, pct: win > 0 ? used / win : 0 };
+  }, [messages, summary, modelSel]);
+
   // Resolve the open artifact live from current state, plus whether that block is still generating.
   const openMsg = openRef?.kind === "msg" ? messages[openRef.msgIndex] : undefined;
   const openArt = !openRef ? null : openRef.kind === "static" ? openRef.art : resolveBlock(openMsg, openRef.blockIndex);
   const openGenerating =
     openRef?.kind === "msg" && !!openMsg?.streaming && openMsg.text === "" && codeSegs(openMsg.shown || "")[openRef.blockIndex]?.open;
+
+  // Version chain for the open artifact (by title, within this chat). Only for thread artifacts.
+  const versionMap = useMemo(() => collectVersions(messages), [messages]);
+  const openVersions =
+    openRef?.kind === "msg" && openArt ? versionMap.get(openArt.title) ?? [] : [];
+  const openVersionArts = openVersions.map((v) => v.art);
+  const openVersionIndex =
+    openRef?.kind === "msg"
+      ? openVersions.findIndex((v) => v.msgIndex === openRef.msgIndex && v.blockIndex === openRef.blockIndex)
+      : -1;
 
   return (
     <div className="chat-wrap">
@@ -579,6 +724,24 @@ export function ChatScreen({
               {headerTitle}
             </span>
             <span className="chat-top-meta">{messages.length} messages</span>
+            {messages.length > 0 && (
+              <span
+                className="ctx-meter"
+                data-level={ctxMeter.pct >= 0.85 ? "high" : ctxMeter.pct >= 0.5 ? "mid" : "low"}
+                title={`Context: ${Math.round(ctxMeter.used).toLocaleString()} / ${ctxMeter.win.toLocaleString()} tokens`}
+              >
+                <span className="ctx-meter-bar">
+                  <span className="ctx-meter-fill" style={{ width: Math.min(100, ctxMeter.pct * 100) + "%" }} />
+                </span>
+                <span className="ctx-meter-label">
+                  {fmtCompact(ctxMeter.used)} / {fmtCompact(ctxMeter.win)} · {Math.round(ctxMeter.pct * 100)}%
+                </span>
+              </span>
+            )}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <ExportButton title={headerTitle} messages={messages} createdAt={getChats().find((c) => c.id === chatId)?.createdAt} />
+            <PersonaButton value={customPrompt} onSave={(t) => setChatPrompt(chatId, t)} />
           </div>
         </header>
 
@@ -601,8 +764,11 @@ export function ChatScreen({
               policy={policy}
               manual={!!modelSel}
               onOpenBlock={(mi, bi) => setOpenRef({ kind: "msg", msgIndex: mi, blockIndex: bi })}
-              onRegenerate={() => regenerate(chatId, { policy, modelSel, thinking, effort })}
-              onEditResend={(mi, text) => editAndResend(chatId, mi, text, { policy, modelSel, thinking, effort })}
+              onRegenerate={() => regenerate(chatId, { policy, modelSel, thinking, effort, web })}
+              onEditResend={(mi, text) => editAndResend(chatId, mi, text, { policy, modelSel, thinking, effort, web })}
+              onContinue={() => continueMessage(chatId, { policy, modelSel, thinking, effort, web })}
+              siblings={siblings}
+              onSwitchBranch={(p, dir) => switchBranch(chatId, p, dir)}
             />
             <div className="composer-wrap">{composer}</div>
           </>
@@ -610,7 +776,13 @@ export function ChatScreen({
       </div>
 
       {openArt ? (
-        <ArtifactPanel artifact={openArt} onClose={() => setOpenRef(null)} generating={openGenerating} />
+        <ArtifactPanel
+          artifact={openArt}
+          onClose={() => setOpenRef(null)}
+          generating={openGenerating}
+          versions={openVersionArts}
+          versionIndex={openVersionIndex}
+        />
       ) : null}
     </div>
   );

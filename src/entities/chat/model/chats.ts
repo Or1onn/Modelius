@@ -121,6 +121,8 @@ export interface ChatBody {
   summary: string;
   covered: number;
   title: string; // LLM-generated; "" until generated (then falls back to first user msg)
+  customPrompt?: string; // per-chat persona; overrides the global custom instructions. "" = inherit
+  siblings?: Message[][]; // inactive alternative threads (branching)
 }
 
 const BODY_PREFIX = "orchestro.chat.";
@@ -142,7 +144,8 @@ function sanitize(messages: Message[]): Message[] {
 }
 
 export async function saveChatBody(id: string, body: ChatBody): Promise<void> {
-  const data = await vaultEncrypt(JSON.stringify({ ...body, messages: sanitize(body.messages) }));
+  const siblings = body.siblings?.length ? body.siblings.map(sanitize) : undefined;
+  const data = await vaultEncrypt(JSON.stringify({ ...body, messages: sanitize(body.messages), siblings }));
   if (isTauri()) {
     try {
       const d = await db();
@@ -179,7 +182,7 @@ export async function loadChatBody(id: string): Promise<ChatBody | null> {
   try {
     const b = JSON.parse(await vaultDecrypt(raw));
     if (!Array.isArray(b?.messages)) return null;
-    return { messages: b.messages, summary: b.summary ?? "", covered: b.covered ?? 0, title: b.title ?? "" };
+    return { messages: b.messages, summary: b.summary ?? "", covered: b.covered ?? 0, title: b.title ?? "", customPrompt: b.customPrompt ?? "", siblings: Array.isArray(b.siblings) ? b.siblings : undefined };
   } catch {
     return null;
   }

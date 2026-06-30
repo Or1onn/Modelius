@@ -84,7 +84,14 @@ export function classify(text: string): Classification {
 export function route(
   text: string,
   policy: PolicyId,
-  opts?: { requireVision?: boolean; contextTokens?: number; pool?: Model[]; classification?: Classification }
+  opts?: {
+    requireVision?: boolean;
+    requireWeb?: boolean;
+    webCapable?: (m: Model) => boolean;
+    contextTokens?: number;
+    pool?: Model[];
+    classification?: Classification;
+  }
 ): Decision {
   // A pre-computed classification (e.g. from the LLM classifier) overrides the heuristic.
   const cls = opts?.classification ?? classify(text);
@@ -108,6 +115,15 @@ export function route(
     const v = pool.filter((m) => m.vision);
     const any = base.filter((m) => m.vision);
     pool = v.length ? v : any.length ? any : pool;
+  }
+  // Web search on (auto-routing): keep only models that can actually run a search, mirroring the
+  // manual-pick gate. Falls back to the unfiltered pool when nothing connected can search (a
+  // non-searching answer beats an empty pool).
+  if (opts?.requireWeb && opts.webCapable) {
+    const cap = opts.webCapable;
+    const w = pool.filter(cap);
+    const any = base.filter(cap);
+    pool = w.length ? w : any.length ? any : pool;
   }
   // Context-pressure floor: drop models whose window can't hold the live conversation + this
   // turn's output. Skipped when it would empty the pool — compaction is the fallback, and this

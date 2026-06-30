@@ -9,6 +9,7 @@ export type StreamEvent =
   | { type: "chunk"; data: string }
   | { type: "thinking"; data: string }
   | { type: "usage"; data: RawUsage }
+  | { type: "stop_reason"; data: string }
   | { type: "done" }
   | { type: "error"; data: string };
 
@@ -46,6 +47,7 @@ export async function* channelToDeltas(
     if (msg.type === "chunk") queue.push({ kind: "text", text: msg.data });
     else if (msg.type === "thinking") queue.push({ kind: "thinking", text: msg.data });
     else if (msg.type === "usage") queue.push(mapUsage(msg.data));
+    else if (msg.type === "stop_reason") queue.push({ kind: "stop", reason: msg.data });
     else if (msg.type === "error") {
       error = msg.data;
       finished = true;

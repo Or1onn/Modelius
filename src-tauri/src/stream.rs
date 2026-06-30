@@ -56,6 +56,9 @@ pub(crate) enum StreamEvent {
         // Exact billed cost (USD) when the upstream API reports it (OpenRouter); else None.
         cost: Option<f64>,
     },
+    // Why the model stopped ("max_tokens" / "length" / "max_output_tokens" / "end_turn" / "stop").
+    // The webview offers "Continue" when this signals a max-output-tokens cutoff.
+    StopReason(String),
     Done,
     Error(String),
 }

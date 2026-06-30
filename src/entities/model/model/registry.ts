@@ -133,4 +133,6 @@ export interface Message {
   latencyMs?: number; // wall-clock send → last token
   cost?: number; // real USD — metered turns only; absent on subscription/offline
   priceSource?: "live" | "table"; // where `cost`'s rate came from (OpenRouter live vs static table)
+  ts?: number; // epoch ms when the turn was created (for the per-message timestamp)
+  truncated?: boolean; // stream ended on a max-output-tokens cutoff → offer "Continue"
 }

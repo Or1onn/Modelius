@@ -6,6 +6,7 @@ import { ChatGroup, groupHistory, type ScreenId } from "@/app/ui/ChatGroup";
 const NAV: { id: ScreenId; label: string; icon: string; beta?: boolean }[] = [
   { id: "providers", label: "Providers", icon: "providers" },
   { id: "memory", label: "Memory", icon: "memory" },
+  { id: "settings", label: "Settings", icon: "cog" },
 ];
 
 const TOP_ACTIONS: { id: string; label: string; icon: string; primary?: boolean }[] = [

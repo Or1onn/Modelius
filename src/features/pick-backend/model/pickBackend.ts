@@ -186,6 +186,26 @@ export function optionVision(opt: ModelOption): boolean | undefined {
 export const optionAllowsImages = (opt: ModelOption | null): boolean =>
   opt ? optionVision(opt) !== false : true;
 
+// Server-side web search support: Anthropic (web_search tool), Codex/Responses (web_search tool),
+// OpenRouter (:online suffix), and OpenAI *-search-preview models. Auto (null) is permissive — the
+// per-provider adapters silently skip the param for a backend that can't search.
+export const optionAllowsWeb = (opt: ModelOption | null): boolean => {
+  if (!opt) return true;
+  if (opt.provider === "anthropic" || opt.provider === "openrouter") return true;
+  if (opt.backend.kind === "chatgpt") return true;
+  if (opt.backend.kind === "openai") return /search/i.test(opt.backend.model);
+  return false;
+};
+
+// Same rule, for a registry Model in the routing pool (auto-routing): lets the router drop
+// search-incapable models when Web is on. An "openai" pool entry is Codex (web-capable) when the
+// ChatGPT account is connected, else a keyed model that only searches on *-search-preview ids.
+export const modelAllowsWeb = (m: Model): boolean => {
+  if (m.provider === "anthropic" || m.provider === "openrouter") return true;
+  if (m.provider === "openai") return hasOpenAIOAuth() || /search/i.test(m.id);
+  return false;
+};
+
 // User-pickable models by connection. ChatGPT account → curated Codex models (no
 // list endpoint); else a live list (sub via /v1/models, key via listModels).
 export async function listAvailableModels(): Promise<ModelOption[]> {
