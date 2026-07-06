@@ -23,7 +23,7 @@ export function SettingsScreen() {
           <div>
             <h1 className="screen-title">Settings</h1>
             <p className="screen-sub">
-              How Orchestro routes your turns and how the assistant behaves. Applies to every chat.
+              How Modelius routes your turns and how the assistant behaves. Applies to every chat.
               Stored only on this device.
             </p>
           </div>

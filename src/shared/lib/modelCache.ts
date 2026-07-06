@@ -1,5 +1,5 @@
 // modelCache.ts — TTL localStorage cache for fetched model lists (instant picker / Providers).
-const PREFIX = "orchestro.models.";
+const PREFIX = "modelius.models.";
 const TTL = 1000 * 60 * 60; // 1h — model catalogs change rarely.
 
 interface Entry<T> {

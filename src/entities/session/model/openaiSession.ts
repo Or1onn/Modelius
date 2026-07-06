@@ -12,10 +12,10 @@ export const AUTH_URL = "https://auth.openai.com/oauth/authorize";
 export const REDIRECT_URI = "http://localhost:1455/auth/callback";
 export const SCOPES = "openid profile email offline_access";
 
-const ACCESS_KEY = "orchestro.openai.access";
-const REFRESH_KEY = "orchestro.openai.refresh";
-const META_KEY = "orchestro.oauthmeta.openai"; // localStorage: non-secret presence + accountId
-export const OPENAI_OAUTH_EVT = "orchestro-openai-oauth-changed";
+const ACCESS_KEY = "modelius.openai.access";
+const REFRESH_KEY = "modelius.openai.refresh";
+const META_KEY = "modelius.oauthmeta.openai"; // localStorage: non-secret presence + accountId
+export const OPENAI_OAUTH_EVT = "modelius-openai-oauth-changed";
 
 export interface OpenAIToken {
   accessToken: string;

@@ -47,9 +47,9 @@ fn query_param(path: &str, key: &str) -> Option<String> {
     None
 }
 
-const CALLBACK_HTML: &str = "<!doctype html><meta charset=utf-8><title>Orchestro</title>\
+const CALLBACK_HTML: &str = "<!doctype html><meta charset=utf-8><title>Modelius</title>\
 <body style=\"font-family:system-ui;background:#0b0b0e;color:#e8e8ea;display:grid;place-items:center;height:100vh;margin:0\">\
-<div style=\"text-align:center\"><h2>Signed in to ChatGPT</h2><p style=\"color:#9a9aa2\">You can close this tab and return to Orchestro.</p></div>";
+<div style=\"text-align:center\"><h2>Signed in to ChatGPT</h2><p style=\"color:#9a9aa2\">You can close this tab and return to Modelius.</p></div>";
 
 // OpenAI's OAuth redirects to a localhost URL, so we briefly run a loopback
 // server to capture the authorization code (validated against `state`).

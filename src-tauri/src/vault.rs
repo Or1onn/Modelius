@@ -9,7 +9,7 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rand::{rngs::OsRng, RngCore};
 use std::sync::OnceLock;
 
-const DEK_KEY: &str = "orchestro.vault.dek";
+const DEK_KEY: &str = "modelius.vault.dek";
 const PREFIX: &str = "v1:"; // version tag; absence = legacy plaintext
 static DEK: OnceLock<[u8; 32]> = OnceLock::new();
 

@@ -45,6 +45,8 @@ pub fn cancel_stream(stream_id: String) {
 pub(crate) enum StreamEvent {
     Chunk(String),
     Thinking(String),
+    // A model-generated image as a complete data URL (image-output chat models).
+    Image(String),
     Usage {
         input_tokens: u64,
         output_tokens: u64,

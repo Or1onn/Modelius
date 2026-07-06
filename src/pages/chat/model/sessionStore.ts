@@ -411,20 +411,22 @@ async function continueSend(s: Session, p: Omit<SendParams, "fullText" | "images
   let acc = last.text;
   let reason = last.reasoning ?? "";
   let stopReason = "";
+  const genImgs = [...(last.genImages ?? [])];
   let usage: Extract<Delta, { kind: "usage" }> | undefined;
   patchAt(s, idx, { streaming: true, shown: acc, truncated: undefined });
-  const update = () => patchAt(s, idx, { shown: acc, reasoning: reason || undefined });
+  const update = () => patchAt(s, idx, { shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined });
 
   try {
     for await (const delta of streamLLM(backend, apiMessages, p.thinking, eff, p.web, controller.signal)) {
       if (delta.kind === "usage") usage = delta;
       else if (delta.kind === "thinking") reason += delta.text;
       else if (delta.kind === "stop") stopReason = delta.reason;
+      else if (delta.kind === "image") genImgs.push(delta.dataUrl);
       else acc += delta.text;
       update();
     }
     if (controller.signal.aborted) {
-      patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false, truncated: true });
+      patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false, truncated: true });
       return;
     }
     // Fold the continuation's output tokens into the existing usage (input was billed already).
@@ -432,11 +434,11 @@ async function continueSend(s: Session, p: Omit<SendParams, "fullText" | "images
     const u = usage
       ? { inputTokens: prev?.inputTokens ?? usage.inputTokens, outputTokens: (prev?.outputTokens ?? 0) + usage.outputTokens, cacheRead: prev?.cacheRead, cacheWrite: prev?.cacheWrite, reasoningTokens: prev?.reasoningTokens }
       : prev;
-    patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false, usage: u, truncated: isMaxTokens(stopReason) || undefined });
+    patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false, usage: u, truncated: isMaxTokens(stopReason) || undefined });
     if (acc.trim()) void extractAndSave(acc);
   } catch {
     // Keep the partial and leave "Continue" available; don't clobber with a ⚠️ error bubble.
-    patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false, truncated: true });
+    patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false, truncated: true });
   } finally {
     if (s.abort === controller) s.abort = null;
     setPhase(s, "idle");
@@ -568,6 +570,7 @@ async function realSend(
   let acc = "";
   let reason = "";
   let stopReason = "";
+  const genImgs: string[] = [];
   let usage: Extract<Delta, { kind: "usage" }> | undefined;
   const t0 = performance.now();
   let started = false;
@@ -584,7 +587,7 @@ async function realSend(
       modelProvider: manual?.provider,
     });
   };
-  const update = () => patchLastStreaming(s, { shown: acc, reasoning: reason || undefined });
+  const update = () => patchLastStreaming(s, { shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined });
 
   try {
     for await (const delta of streamLLM(backend, apiMessages, reasoningOn, effortLevel, web, controller.signal)) {
@@ -592,12 +595,13 @@ async function realSend(
       if (delta.kind === "usage") usage = delta;
       else if (delta.kind === "thinking") reason += delta.text;
       else if (delta.kind === "stop") stopReason = delta.reason;
+      else if (delta.kind === "image") genImgs.push(delta.dataUrl);
       else acc += delta.text;
       update();
     }
     // User stopped: keep whatever streamed, skip usage/cost/memory for this partial turn.
     if (controller.signal.aborted) {
-      if (started) patchLastStreaming(s, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false });
+      if (started) patchLastStreaming(s, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false });
       return;
     }
     if (!started) begin(); // empty completion — still show a turn
@@ -615,7 +619,7 @@ async function realSend(
       : undefined;
     const priceSource = cost != null ? (exact != null ? "live" : priceSource_(backend.model) ?? undefined) : undefined;
     const asstIndex = s.messages.length - 1; // this turn's assistant message; stable (append-only)
-    patchAt(s, asstIndex, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false, usage: u, latencyMs, cost, priceSource, truncated: isMaxTokens(stopReason) || undefined });
+    patchAt(s, asstIndex, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false, usage: u, latencyMs, cost, priceSource, truncated: isMaxTokens(stopReason) || undefined });
     if (acc.trim()) void extractAndSave(acc); // persist large code the model returned
     // Reconcile durable user facts off the critical path, throttled to every MEMORY_EVERY-th
     // turn (1st, 4th, …) to cut cost/noise. Ops add/update/delete against known facts; tag the
@@ -631,7 +635,7 @@ async function realSend(
   } catch (err) {
     // Abort surfaces as a fetch error on the browser paths — finalize the partial, not an error.
     if (controller.signal.aborted) {
-      if (started) patchLastStreaming(s, { text: acc, shown: acc, reasoning: reason || undefined, streaming: false });
+      if (started) patchLastStreaming(s, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false });
     } else {
       const msg = `⚠️ ${humanizeError(err instanceof Error ? err.message : "Request failed")}`;
       if (!started) begin();

@@ -36,5 +36,6 @@ export interface ChatMsg {
 // "usage" delta carries real token counts; `metered` = billed per-token (key) vs flat-fee (sub).
 export type Delta =
   | { kind: "text" | "thinking"; text: string }
+  | { kind: "image"; dataUrl: string } // a model-generated image (complete data URL) — image-output models
   | { kind: "stop"; reason: string } // why the model stopped (e.g. "max_tokens"/"length") — drives "Continue"
   | { kind: "usage"; inputTokens: number; outputTokens: number; cacheRead?: number; cacheWrite?: number; reasoningTokens?: number; metered: boolean; cost?: number };

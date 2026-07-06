@@ -1,6 +1,8 @@
 // Sidebar.tsx — left nav: logo, actions, screen nav, chat history, user footer.
+import type { CSSProperties } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { useChatStore } from "@/entities/chat/model/chats";
+import { useCodeChatStore } from "@/entities/agent/model/codeChats";
 import { ChatGroup, groupHistory, type ScreenId } from "@/app/ui/ChatGroup";
 import { UpdateBanner } from "@/widgets/update-banner/ui/UpdateBanner";
 
@@ -15,6 +17,38 @@ const TOP_ACTIONS: { id: string; label: string; icon: string; primary?: boolean 
   { id: "search", label: "Search", icon: "search" },
 ];
 
+// Workspace mode: Chat vs Code. Segmented control at the top of the sidebar (Cowork excluded).
+const MODES: { id: ScreenId; label: string; icon: string }[] = [
+  { id: "chat", label: "Chat", icon: "chat" },
+  { id: "code", label: "Code", icon: "code" },
+];
+
+function ModeToggle({ screen, setScreen }: { screen: ScreenId; setScreen: (s: ScreenId) => void }) {
+  // Active mode index drives the sliding highlight; -1 (a non-mode screen like Providers) hides it.
+  const active = MODES.findIndex((m) => m.id === screen);
+  return (
+    <div
+      className="mode-seg"
+      role="tablist"
+      style={{ gridTemplateColumns: `repeat(${MODES.length}, 1fr)`, "--seg-n": MODES.length, "--seg-i": active } as CSSProperties}
+    >
+      <span className="mode-seg-ind" style={{ opacity: active < 0 ? 0 : 1 }} />
+      {MODES.map((m) => (
+        <button
+          key={m.id}
+          role="tab"
+          aria-selected={screen === m.id}
+          className={"mode-seg-btn" + (screen === m.id ? " on" : "")}
+          onClick={() => setScreen(m.id)}
+        >
+          <Icon name={m.icon} size={15} />
+          <span>{m.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function Sidebar({
   screen,
   setScreen,
@@ -26,6 +60,11 @@ export function Sidebar({
   onDeleteChat,
   onPinChat,
   onRenameChat,
+  activeCodeChatId,
+  onOpenCode,
+  onDeleteCode,
+  onPinCode,
+  onRenameCode,
 }: {
   screen: ScreenId;
   setScreen: (s: ScreenId) => void;
@@ -37,20 +76,35 @@ export function Sidebar({
   onDeleteChat: (id: string) => void;
   onPinChat: (id: string, pinned: boolean) => void;
   onRenameChat: (id: string, title: string) => void;
+  activeCodeChatId: string;
+  onOpenCode: (id: string) => void;
+  onDeleteCode: (id: string) => void;
+  onPinCode: (id: string, pinned: boolean) => void;
+  onRenameCode: (id: string, title: string) => void;
 }) {
   const { getChats } = useChatStore();
-  const chats = getChats();
+  const { getCodeChats } = useCodeChatStore();
+  // Code mode shows its own history + handlers; every other screen shows chat history.
+  const isCode = screen === "code";
+  const chats = isCode ? getCodeChats() : getChats();
+  const recentsActiveId = isCode ? activeCodeChatId : activeChatId;
+  const onOpen = isCode ? onOpenCode : onOpenChat;
+  const onDelete = isCode ? onDeleteCode : onDeleteChat;
+  const onPin = isCode ? onPinCode : onPinChat;
+  const onRename = isCode ? onRenameCode : onRenameChat;
   return (
     <nav className="sidebar">
       <div className="sb-logo">
         <span className="sb-mark">
           <span className="sb-mark-core" />
         </span>
-        <span className="sb-word">Orchestro</span>
+        <span className="sb-word">Modelius</span>
         <button className="sb-collapse" title="Collapse sidebar" onClick={onCollapse}>
           <Icon name="panelLeftClose" size={16} />
         </button>
       </div>
+
+      <ModeToggle screen={screen} setScreen={setScreen} />
 
       <div className="sb-group">
         {TOP_ACTIONS.map((a) => (
@@ -90,12 +144,12 @@ export function Sidebar({
             <ChatGroup
               key={g.id}
               group={g}
-              activeChatId={activeChatId}
+              activeChatId={recentsActiveId}
               screen={screen}
-              onOpenChat={onOpenChat}
-              onDeleteChat={onDeleteChat}
-              onPinChat={onPinChat}
-              onRenameChat={onRenameChat}
+              onOpenChat={onOpen}
+              onDeleteChat={onDelete}
+              onPinChat={onPin}
+              onRenameChat={onRename}
             />
           ))}
         </div>

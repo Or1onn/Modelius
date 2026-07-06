@@ -15,7 +15,7 @@ import {
   type TokenResponse,
 } from "@/entities/session/model/anthropicSession";
 
-const PKCE_KEY = "orchestro.anthropic.pkce"; // keychain (transient, deleted after exchange)
+const PKCE_KEY = "modelius.anthropic.pkce"; // keychain (transient, deleted after exchange)
 
 // ----- PKCE -----
 function base64url(bytes: Uint8Array): string {

@@ -5,8 +5,8 @@ import { useEffect, useReducer } from "react";
 import { vaultEncrypt, vaultDecrypt } from "@/shared/api/secrets";
 import type { PolicyId } from "@/entities/model/model/registry";
 
-const STORAGE_KEY = "orchestro.settings";
-const EVT = "orchestro-settings-changed";
+const STORAGE_KEY = "modelius.settings";
+const EVT = "modelius-settings-changed";
 
 export type ThemeId = "dark" | "light";
 

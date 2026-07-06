@@ -1,5 +1,6 @@
 // lib.rs — Tauri app entrypoint: wires plugins, the SQLite migration, and the
 // command handlers. The commands themselves live in the domain modules below.
+mod agent;
 mod anthropic;
 mod artifacts;
 mod compat;
@@ -25,7 +26,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_sql::Builder::default()
-                .add_migrations("sqlite:orchestro.db", migrations)
+                .add_migrations("sqlite:modelius.db", migrations)
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
@@ -39,6 +40,7 @@ pub fn run() {
             compat::compat_chat_stream,
             compat::ollama_show,
             stream::cancel_stream,
+            agent::agent_run,
             artifacts::artifact_write,
             artifacts::artifact_read,
             secrets::secret_set,

@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { isTauri } from "@/shared/api/tauri";
 
 const OR_BASE = "https://openrouter.ai/api/v1"; // compat_list_models appends /models
-const STORE_KEY = "orchestro.pricing.openrouter";
+const STORE_KEY = "modelius.pricing.openrouter";
 const TTL = 1000 * 60 * 60 * 24; // prices change rarely — refresh daily
 
 type Rate = { in: number; out: number };
@@ -13,13 +13,14 @@ interface ORModel {
   id: string;
   pricing?: { prompt?: string; completion?: string };
   supported_parameters?: string[];
-  architecture?: { input_modalities?: string[] };
+  architecture?: { input_modalities?: string[]; output_modalities?: string[] };
 }
-// Cached catalog data: per-token rates + reasoning/vision capability flags per normalized id.
+// Cached catalog data: per-token rates + reasoning/vision/image-output capability flags per normalized id.
 interface Catalog {
   rates: Record<string, Rate>;
   caps: Record<string, boolean>;
   vis: Record<string, boolean>;
+  imgOut: Record<string, boolean>;
 }
 
 // Normalize to the bare model slug so a provider-prefixed OpenRouter id (e.g. "google/gemini-2.5-flash")
@@ -32,9 +33,9 @@ function read(): Catalog | null {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (!raw) return null;
-    const e = JSON.parse(raw) as { at: number; rates?: Record<string, Rate>; caps?: Record<string, boolean>; vis?: Record<string, boolean> };
-    // `rates`/`caps`/`vis` absent → an older cache shape; treat as stale so it's refetched.
-    if (e.rates && e.caps && e.vis && Date.now() - e.at < TTL) return { rates: e.rates, caps: e.caps, vis: e.vis };
+    const e = JSON.parse(raw) as { at: number; rates?: Record<string, Rate>; caps?: Record<string, boolean>; vis?: Record<string, boolean>; imgOut?: Record<string, boolean> };
+    // `rates`/`caps`/`vis`/`imgOut` absent → an older cache shape; treat as stale so it's refetched.
+    if (e.rates && e.caps && e.vis && e.imgOut && Date.now() - e.at < TTL) return { rates: e.rates, caps: e.caps, vis: e.vis, imgOut: e.imgOut };
   } catch {
     /* ignore */
   }
@@ -52,15 +53,17 @@ export async function loadDynamicPricing(): Promise<void> {
     const rates: Record<string, Rate> = {};
     const caps: Record<string, boolean> = {};
     const vis: Record<string, boolean> = {};
+    const imgOut: Record<string, boolean> = {};
     for (const m of (json.data ?? []) as ORModel[]) {
       caps[norm(m.id)] = (m.supported_parameters ?? []).includes("reasoning");
       vis[norm(m.id)] = (m.architecture?.input_modalities ?? []).includes("image");
+      imgOut[norm(m.id)] = (m.architecture?.output_modalities ?? []).includes("image");
       const pin = parseFloat(m.pricing?.prompt ?? "");
       const pout = parseFloat(m.pricing?.completion ?? "");
       if (!Number.isFinite(pin) || !Number.isFinite(pout) || (pin === 0 && pout === 0)) continue;
       rates[norm(m.id)] = { in: pin * 1e6, out: pout * 1e6 };
     }
-    if (Object.keys(caps).length) localStorage.setItem(STORE_KEY, JSON.stringify({ at: Date.now(), rates, caps, vis }));
+    if (Object.keys(caps).length) localStorage.setItem(STORE_KEY, JSON.stringify({ at: Date.now(), rates, caps, vis, imgOut }));
   } catch {
     /* offline / blocked — keep static pricing */
   }
@@ -81,4 +84,10 @@ export function supportsReasoning(modelId: string): boolean | undefined {
 // is known; undefined when it isn't in the catalog (caller decides the fallback). Sync (cache peek).
 export function supportsVision(modelId: string): boolean | undefined {
   return read()?.vis[norm(modelId)];
+}
+
+// Whether the model can generate images, per OpenRouter's catalog. true/false when the model
+// is known; undefined when it isn't in the catalog (caller decides the fallback). Sync (cache peek).
+export function supportsImageOutput(modelId: string): boolean | undefined {
+  return read()?.imgOut[norm(modelId)];
 }

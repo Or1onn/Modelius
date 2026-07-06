@@ -53,8 +53,8 @@ pub async fn compat_chat_stream(
     // OpenRouter app-attribution headers (optional, only meaningful on its host).
     if base_url.contains("openrouter.ai") {
         builder = builder
-            .header("HTTP-Referer", "https://orchestro.app")
-            .header("X-Title", "Orchestro");
+            .header("HTTP-Referer", "https://modelius.app")
+            .header("X-Title", "Modelius");
     }
 
     let res = builder.send().await.map_err(|e| e.to_string())?;
@@ -71,6 +71,17 @@ pub async fn compat_chat_stream(
         if let Some(t) = j.pointer("/choices/0/delta/content").and_then(|v| v.as_str()) {
             if !t.is_empty() {
                 let _ = on_event.send(StreamEvent::Chunk(t.to_string()));
+            }
+        }
+        // Image-output models (OpenRouter, Gemini compat): images arrive as data URLs in
+        // delta.images (streaming) or message.images (final-chunk shape). Forward as-is.
+        for p in ["/choices/0/delta/images", "/choices/0/message/images"] {
+            if let Some(arr) = j.pointer(p).and_then(|v| v.as_array()) {
+                for im in arr {
+                    if let Some(url) = im.pointer("/image_url/url").and_then(|v| v.as_str()) {
+                        let _ = on_event.send(StreamEvent::Image(url.to_string()));
+                    }
+                }
             }
         }
         // finish_reason is null until the final chunk ("stop" / "length" / …).

@@ -12,10 +12,10 @@ export const AUTH_URL = "https://claude.ai/oauth/authorize";
 export const REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback";
 export const SCOPES = "org:create_api_key user:profile user:inference";
 
-const ACCESS_KEY = "orchestro.anthropic.access";
-const REFRESH_KEY = "orchestro.anthropic.refresh";
-const META_KEY = "orchestro.oauthmeta.anthropic"; // localStorage: non-secret presence
-export const ANTHROPIC_OAUTH_EVT = "orchestro-anthropic-oauth-changed";
+const ACCESS_KEY = "modelius.anthropic.access";
+const REFRESH_KEY = "modelius.anthropic.refresh";
+const META_KEY = "modelius.oauthmeta.anthropic"; // localStorage: non-secret presence
+export const ANTHROPIC_OAUTH_EVT = "modelius-anthropic-oauth-changed";
 
 export interface OAuthToken {
   accessToken: string;

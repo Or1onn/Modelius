@@ -363,7 +363,7 @@ export function ChatScreen({
     if (!imagesAllowed) setImages([]);
   }, [imagesAllowed]);
 
-  // Web search needs a search-capable backend (Anthropic / Codex / OpenRouter / search-preview).
+  // Web search needs a search-capable backend (Anthropic / Codex / OpenRouter / OpenAI Responses).
   const webAllowed = optionAllowsWeb(modelSel);
   // Drop a stale "on" when switching to a model that can't search.
   useEffect(() => {
