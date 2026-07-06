@@ -5,9 +5,9 @@ import { useEffect, useReducer } from "react";
 import { clearModelCache } from "@/shared/lib/modelCache";
 import { secretGet, secretSet, secretDelete } from "@/shared/api/secrets";
 
-const KEY = "orchestro.key."; // keychain entry name
-const META = "orchestro.keymeta."; // localStorage: { last6 } — non-secret
-const EVT = "orchestro-keys-changed";
+const KEY = "modelius.key."; // keychain entry name
+const META = "modelius.keymeta."; // localStorage: { last6 } — non-secret
+const EVT = "modelius-keys-changed";
 
 function envKey(provider: string): string {
   if (provider === "openai") return import.meta.env.VITE_OPENAI_API_KEY || "";

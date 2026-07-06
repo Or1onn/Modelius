@@ -5,7 +5,7 @@ import { vaultEncrypt, vaultDecrypt } from "@/shared/api/secrets";
 
 // Dynamic-length fence (\1 closes the open run) so code containing ``` round-trips.
 const FENCE = /(`{3,})([^\n`]*)\n([\s\S]*?)\n\1/g;
-const PREFIX = "orchestro.artifact."; // localStorage fallback key prefix
+const PREFIX = "modelius.artifact."; // localStorage fallback key prefix
 const REF = /\[\[(code-[0-9a-f]{8})\]\]/g; // [[code-XXXX]] reference tokens
 
 // Per-session lang map (disk file holds pure code only); "" after reload until re-parsed.

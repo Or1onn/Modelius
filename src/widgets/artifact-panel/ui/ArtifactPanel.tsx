@@ -19,7 +19,7 @@ function highlightCode(code: string, lang: string): string | null {
 }
 
 // Persisted panel width (px). Clamped to [MIN_WIDTH, avail-MIN_REST] so the chat stays usable.
-const WIDTH_KEY = "orchestro.artifactPanelWidth";
+const WIDTH_KEY = "modelius.artifactPanelWidth";
 const MIN_WIDTH = 320;
 const MIN_REST = 420; // min space left for the chat column
 // `avail` = width of the panel's container (chat area, excludes the sidebar).

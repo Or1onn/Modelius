@@ -186,23 +186,26 @@ export function optionVision(opt: ModelOption): boolean | undefined {
 export const optionAllowsImages = (opt: ModelOption | null): boolean =>
   opt ? optionVision(opt) !== false : true;
 
+// Models the OpenAI key path (Responses API) can run the web_search tool on.
+const openaiWebCapable = (id: string): boolean => /^(gpt-4o|gpt-4\.1|gpt-4\.5|gpt-5|o[34])/i.test(id);
+
 // Server-side web search support: Anthropic (web_search tool), Codex/Responses (web_search tool),
-// OpenRouter (:online suffix), and OpenAI *-search-preview models. Auto (null) is permissive — the
-// per-provider adapters silently skip the param for a backend that can't search.
+// OpenRouter (:online suffix), and OpenAI key models via the Responses web_search tool. Auto (null)
+// is permissive — the per-provider adapters silently skip the param for a backend that can't search.
 export const optionAllowsWeb = (opt: ModelOption | null): boolean => {
   if (!opt) return true;
   if (opt.provider === "anthropic" || opt.provider === "openrouter") return true;
   if (opt.backend.kind === "chatgpt") return true;
-  if (opt.backend.kind === "openai") return /search/i.test(opt.backend.model);
+  if (opt.backend.kind === "openai") return openaiWebCapable(opt.backend.model);
   return false;
 };
 
 // Same rule, for a registry Model in the routing pool (auto-routing): lets the router drop
 // search-incapable models when Web is on. An "openai" pool entry is Codex (web-capable) when the
-// ChatGPT account is connected, else a keyed model that only searches on *-search-preview ids.
+// ChatGPT account is connected, else a keyed model searching via the Responses web_search tool.
 export const modelAllowsWeb = (m: Model): boolean => {
   if (m.provider === "anthropic" || m.provider === "openrouter") return true;
-  if (m.provider === "openai") return hasOpenAIOAuth() || /search/i.test(m.id);
+  if (m.provider === "openai") return hasOpenAIOAuth() || openaiWebCapable(m.id);
   return false;
 };
 

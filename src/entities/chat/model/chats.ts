@@ -8,8 +8,8 @@ import { vaultEncrypt, vaultDecrypt } from "@/shared/api/secrets";
 
 // ---- Index (encrypted localStorage blob + in-RAM cache, reactive) ----
 
-const INDEX_KEY = "orchestro.chats.index";
-const EVT = "orchestro-chats-changed";
+const INDEX_KEY = "modelius.chats.index";
+const EVT = "modelius-chats-changed";
 
 export interface ChatIndexEntry {
   id: string;
@@ -125,14 +125,15 @@ export interface ChatBody {
   siblings?: Message[][]; // inactive alternative threads (branching)
 }
 
-const BODY_PREFIX = "orchestro.chat.";
+const BODY_PREFIX = "modelius.chat.";
 
 // Lazy singleton DB handle; the `chats` migration is registered in Rust.
+// Exported so the code-chats store can share the same connection (its rows live in the same table).
 let dbPromise: Promise<import("@tauri-apps/plugin-sql").default> | null = null;
-async function db() {
+export async function db() {
   if (!dbPromise) {
     const { default: Database } = await import("@tauri-apps/plugin-sql");
-    dbPromise = Database.load("sqlite:orchestro.db");
+    dbPromise = Database.load("sqlite:modelius.db");
   }
   return dbPromise;
 }

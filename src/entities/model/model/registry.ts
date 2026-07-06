@@ -120,6 +120,7 @@ export interface Message {
   role: "user" | "assistant";
   text: string;
   images?: ImageRef[]; // vision input
+  genImages?: string[]; // model-generated images (data URLs) — image-output models
   decision?: Decision;
   shown?: string;
   streaming?: boolean;

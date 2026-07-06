@@ -8,6 +8,7 @@ export type RawUsage = { input_tokens: number; output_tokens: number; cache_read
 export type StreamEvent =
   | { type: "chunk"; data: string }
   | { type: "thinking"; data: string }
+  | { type: "image"; data: string }
   | { type: "usage"; data: RawUsage }
   | { type: "stop_reason"; data: string }
   | { type: "done" }
@@ -46,6 +47,7 @@ export async function* channelToDeltas(
   channel.onmessage = (msg) => {
     if (msg.type === "chunk") queue.push({ kind: "text", text: msg.data });
     else if (msg.type === "thinking") queue.push({ kind: "thinking", text: msg.data });
+    else if (msg.type === "image") queue.push({ kind: "image", dataUrl: msg.data });
     else if (msg.type === "usage") queue.push(mapUsage(msg.data));
     else if (msg.type === "stop_reason") queue.push({ kind: "stop", reason: msg.data });
     else if (msg.type === "error") {

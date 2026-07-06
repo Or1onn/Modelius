@@ -38,7 +38,7 @@ export function UpdateBanner() {
           <Icon name="download" size={15} />
         </span>
         <span className="sb-update-txt">
-          <span className="sb-update-title">{updating ? "Updating Orchestro…" : "Update available"}</span>
+          <span className="sb-update-title">{updating ? "Updating Modelius…" : "Update available"}</span>
           <span className="sb-update-sub">
             {updating ? "Restarting to apply" : `v${version} · ready to install`}
           </span>

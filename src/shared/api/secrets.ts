@@ -6,7 +6,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { isTauri } from "@/shared/api/tauri";
 
-const LS = "orchestro.secret."; // localStorage namespace for the keychain overflow
+const LS = "modelius.secret."; // localStorage namespace for the keychain overflow
 let warned = false;
 function degrade(e: unknown): void {
   if (warned) return;

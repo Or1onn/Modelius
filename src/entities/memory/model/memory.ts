@@ -5,8 +5,8 @@ import { useEffect, useReducer } from "react";
 import { estimateTokens } from "@/shared/lib/tokens";
 import { vaultEncrypt, vaultDecrypt } from "@/shared/api/secrets";
 
-const STORAGE_KEY = "orchestro.memory";
-const EVT = "orchestro-memory-changed";
+const STORAGE_KEY = "modelius.memory";
+const EVT = "modelius-memory-changed";
 
 export type MemoryKind = "user" | "preference" | "project" | "fact";
 

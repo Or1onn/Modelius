@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "orchestro",
+  "productName": "Modelius",
   "version": "0.1.0",
   "identifier": "com.gracious-determined-curie.orchestro",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Orchestro",
+        "title": "Modelius",
         "width": 1360,
         "height": 880,
         "minWidth": 1180,
@@ -39,7 +39,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/Or1onn/Orchestro/releases/latest/download/latest.json"
+        "https://github.com/Or1onn/Modelius/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZCNkY0QTY0ODUxNjJGRjUKUldUMUx4YUZaRXB2YXpTOWQxQVBmSGozZi9veWpLbXNhK2JjUG1CQzczQVl0VDFiS1N1aDQrOFcK"
     }

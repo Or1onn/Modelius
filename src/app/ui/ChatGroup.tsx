@@ -4,7 +4,7 @@ import { createPortal } from "react-dom";
 import { Icon } from "@/shared/ui/Icon";
 import type { ChatIndexEntry } from "@/entities/chat/model/chats";
 
-export type ScreenId = "chat" | "providers" | "memory" | "settings";
+export type ScreenId = "chat" | "code" | "providers" | "memory" | "settings";
 
 // Bucket chats by updatedAt into Today/Yesterday/Earlier (local day). Empty groups dropped by ChatGroup.
 export type HistGroup = { id: string; label: string; items: ChatIndexEntry[]; defaultOpen: boolean };
@@ -65,7 +65,7 @@ export function ChatGroup({
           <ChatRow
             key={h.id}
             chat={h}
-            active={h.id === activeChatId && screen === "chat"}
+            active={h.id === activeChatId && (screen === "chat" || screen === "code")}
             onOpenChat={onOpenChat}
             onDeleteChat={onDeleteChat}
             onPinChat={onPinChat}

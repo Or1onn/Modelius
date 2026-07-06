@@ -4,7 +4,9 @@ import "highlight.js/styles/github-dark.css";
 import "@/app/styles/styles.css";
 import { hydrateSettings, useSettings } from "@/entities/settings/model/settings";
 import { deleteChat, pinChat, renameChat, hydrateChatIndex } from "@/entities/chat/model/chats";
+import { deleteCodeChat, pinCodeChat, renameCodeChat, hydrateCodeIndex } from "@/entities/agent/model/codeChats";
 import { dropSession, isEmptySession } from "@/pages/chat/model/sessionStore";
+import { dropCodeSession, isEmptyCodeSession } from "@/pages/code/model/codeSessionStore";
 import { listOllamaModels } from "@/entities/session/model/ollamaSession";
 import { hasKey } from "@/entities/session/model/keys";
 import { KEY_PROVIDER_IDS, listKeyProviderModels } from "@/entities/session/model/keyProviders";
@@ -14,6 +16,7 @@ import { hydrateTitles } from "@/entities/artifact/model/artifacts";
 import { migrateToSecureStorage } from "@/shared/lib/migrateSecrets";
 import { clearDraft } from "@/pages/chat/model/drafts";
 import { ChatScreen } from "@/pages/chat/ui/ChatScreen";
+import { CodeScreen } from "@/pages/code/ui/CodeScreen";
 import { ProvidersScreen } from "@/pages/providers/ui/ProvidersScreen";
 import { MemoryScreen } from "@/pages/memory/ui/MemoryScreen";
 import { SettingsScreen } from "@/pages/settings/ui/SettingsScreen";
@@ -25,7 +28,7 @@ import type { ScreenId } from "@/app/ui/ChatGroup";
 
 // Fixed theme (baked-in defaults).
 const ROOT_STYLE = {
-  "--accent": "#00C9B1",
+  "--accent": "#3B82F6",
   "--font-ui": "'Geist', system-ui, sans-serif",
   "--font-mono": "'Geist Mono', monospace",
   "--su": 1,
@@ -34,7 +37,7 @@ const ROOT_STYLE = {
 
 // Resizable sidebar (grid first column). Width is layout px; the shell's `zoom` (see .app)
 // scales the rendered size, so drag deltas (screen px) are divided back out.
-const NAV_KEY = "orchestro.navWidth";
+const NAV_KEY = "modelius.navWidth";
 const NAV_MIN = 200;
 const NAV_MAX = 460;
 const clampNav = (w: number) => Math.max(NAV_MIN, Math.min(w, NAV_MAX));
@@ -101,9 +104,6 @@ export default function App() {
     gotoNewChat();
     setScreen("chat");
   };
-  // Latest newChat for the global keydown handler (which subscribes once).
-  const newChatRef = useRef(newChat);
-  newChatRef.current = newChat;
   const openChat = (id: string) => {
     setActiveChatId(id);
     setScreen("chat");
@@ -116,12 +116,44 @@ export default function App() {
     if (id === activeChatId) gotoNewChat(); // fall back to the new-chat slot
   };
 
+  // Code mode has its own chats — mirror the activeChatId / new-slot pattern above.
+  const [activeCodeChatId, setActiveCodeChatId] = useState<string>(() => crypto.randomUUID());
+  const [newCodeChatId, setNewCodeChatId] = useState(activeCodeChatId);
+  const gotoNewCode = (): string => {
+    let id = newCodeChatId;
+    if (!isEmptyCodeSession(id)) {
+      id = crypto.randomUUID();
+      setNewCodeChatId(id);
+    }
+    setActiveCodeChatId(id);
+    return id;
+  };
+  const newCode = () => {
+    gotoNewCode();
+    setScreen("code");
+  };
+  const openCode = (id: string) => {
+    setActiveCodeChatId(id);
+    setScreen("code");
+  };
+  const removeCode = (id: string) => {
+    deleteCodeChat(id);
+    dropCodeSession(id);
+    if (id === activeCodeChatId) gotoNewCode();
+  };
+
+  // "New" and Cmd+N are mode-aware: create a code session in Code mode, else a chat.
+  const newInMode = () => (screen === "code" ? newCode() : newChat());
+  // Latest newInMode for the global keydown handler (which subscribes once).
+  const newChatRef = useRef(newInMode);
+  newChatRef.current = newInMode;
+
   // Startup: migrate secrets into the keychain, decrypt the in-RAM stores, then warm live
   // model lists so connected providers join the routing pool before the picker opens.
   useEffect(() => {
     void (async () => {
       await migrateToSecureStorage();
-      await Promise.all([hydrateSettings(), hydrateMemory(), hydrateChatIndex(), hydrateTitles()]);
+      await Promise.all([hydrateSettings(), hydrateMemory(), hydrateChatIndex(), hydrateCodeIndex(), hydrateTitles()]);
       void loadDynamicPricing(); // live per-token prices (OpenRouter) → routing cost + real $ per turn
       void listOllamaModels().catch(() => {});
       for (const pid of KEY_PROVIDER_IDS) if (hasKey(pid)) void listKeyProviderModels(pid).catch(() => {});
@@ -162,7 +194,7 @@ export default function App() {
       <Sidebar
         screen={screen}
         setScreen={setScreen}
-        onNewChat={newChat}
+        onNewChat={newInMode}
         onOpenSearch={() => setSearchOpen(true)}
         onCollapse={() => setNavCollapsed(true)}
         activeChatId={activeChatId}
@@ -170,6 +202,11 @@ export default function App() {
         onDeleteChat={removeChat}
         onPinChat={pinChat}
         onRenameChat={renameChat}
+        activeCodeChatId={activeCodeChatId}
+        onOpenCode={openCode}
+        onDeleteCode={removeCode}
+        onPinCode={pinCodeChat}
+        onRenameCode={renameCodeChat}
       />
       {!navCollapsed && (
         <div className="nav-resize" style={{ left: navWidth }} onMouseDown={startNavResize} title="Drag to resize" />
@@ -180,19 +217,24 @@ export default function App() {
         </button>
       )}
       <main className="stage">
-        {/* Streaming lives in the session store, so a screen switch unmount doesn't abort it. */}
-        {screen === "chat" && (
-          <ChatScreen
-            key={activeChatId}
-            chatId={activeChatId}
-            showDemo={activeChatId === startupChatId.current}
-            policy={policy}
-            onConnectModel={() => setScreen("providers")}
-          />
-        )}
-        {screen === "providers" && <ProvidersScreen />}
-        {screen === "memory" && <MemoryScreen />}
-        {screen === "settings" && <SettingsScreen />}
+        {/* Streaming lives in the session store, so a screen switch unmount doesn't abort it.
+            Keyed by `screen` so a screen change plays the enter animation, but switching between
+            chats (same key "chat") does not — only the inner ChatScreen remounts by activeChatId. */}
+        <div className="stage-swap" key={screen}>
+          {screen === "chat" && (
+            <ChatScreen
+              key={activeChatId}
+              chatId={activeChatId}
+              showDemo={activeChatId === startupChatId.current}
+              policy={policy}
+              onConnectModel={() => setScreen("providers")}
+            />
+          )}
+          {screen === "code" && <CodeScreen key={activeCodeChatId} chatId={activeCodeChatId} />}
+          {screen === "providers" && <ProvidersScreen />}
+          {screen === "memory" && <MemoryScreen />}
+          {screen === "settings" && <SettingsScreen />}
+        </div>
       </main>
 
       <SearchModal open={searchOpen} onClose={() => setSearchOpen(false)} onOpenChat={openChat} />

@@ -14,14 +14,15 @@ export const KEY_PROVIDER_IDS = Object.keys(KEY_PROVIDER_BASE);
 
 // Cache namespace — bump when the cached list's contents change (e.g. the OpenRouter cap was
 // removed, so a previously-cached 40-item list must be dropped in favour of the full catalog).
-const CACHE_V = "v2";
+// v3: "image-generation" chat models (e.g. gemini-2.0-flash-preview-image-generation) no longer filtered.
+const CACHE_V = "v3";
 
 export function isKeyProvider(pid: string): boolean {
   return pid in KEY_PROVIDER_BASE;
 }
 
 // Drop non-chat entries the catalogs include (embeddings, audio, image, safety).
-const NON_CHAT = /embed|whisper|tts|audio|imagen|image-generation|aqa|guard|moderation|rerank/i;
+const NON_CHAT = /embed|whisper|tts|audio|imagen|aqa|guard|moderation|rerank/i;
 
 function normalize(models: RemoteModel[]): RemoteModel[] {
   return models

@@ -411,6 +411,13 @@ export function ChatThread({
                   streaming={!!msg.streaming && msg.text === ""}
                   onOpen={(bi) => onOpenBlock(i, bi)}
                 />
+                {msg.genImages && msg.genImages.length > 0 && (
+                  <div className="asst-images">
+                    {msg.genImages.map((u, k) => (
+                      <img className="asst-image" key={k} src={u} alt="Generated image" />
+                    ))}
+                  </div>
+                )}
                 {msg.streaming && <span className="cursor" />}
               </div>
               {msg.memory && msg.memory.length > 0 && <MemoryNote facts={msg.memory} />}
