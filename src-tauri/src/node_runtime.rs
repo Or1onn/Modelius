@@ -102,7 +102,7 @@ pub(crate) async fn ensure(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         return Ok(dir);
     }
 
-    let (ext, _) = if cfg!(windows) { ("zip", ()) } else { ("tar.gz", ()) };
+    let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
     let url = format!(
         "https://nodejs.org/dist/v{v}/node-v{v}-{p}.{ext}",
         v = NODE_VERSION,

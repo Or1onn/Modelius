@@ -191,21 +191,6 @@ fn write_codex_home(app: &tauri::AppHandle, auth: &CodexAuth) -> Result<std::pat
     Ok(dir)
 }
 
-// A tool_result's `content` is either a raw string or an array of {type:"text", text} blocks.
-fn result_text(content: Option<&serde_json::Value>) -> String {
-    match content {
-        Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
-        Some(v) if v.is_array() => v
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
-}
-
 // Cap diff text so a large Edit/Write can't flood the transcript (char-safe, no marker).
 fn cap(s: &str) -> String {
     const MAX: usize = 8000;
@@ -315,7 +300,7 @@ fn handle_claude_line(line: &str, on_event: &tauri::ipc::Channel<AgentEvent>) ->
                 for block in content {
                     if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
                         let id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let output = truncate(&result_text(block.get("content")));
+                        let output = truncate(&crate::gateway::tool_result_text(block.get("content")));
                         if !output.is_empty() {
                             let _ = on_event.send(AgentEvent::ToolResult { id, output });
                         }
