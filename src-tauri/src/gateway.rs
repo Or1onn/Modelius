@@ -11,13 +11,14 @@
 // Security: the listener binds loopback only; every request must carry the per-run random
 // token (Authorization: Bearer / x-api-key), so other local processes can't relay through
 // the stored provider key. The provider key itself never reaches the CLI process.
+use crate::stream::http_client;
 use futures_util::StreamExt;
 use rand::RngCore;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 pub(crate) enum Proto {
     Anthropic,
     OpenAi,
@@ -34,13 +35,6 @@ pub(crate) struct Gateway {
     pub port: u16,
     pub token: String,
     handle: tokio::task::JoinHandle<()>,
-}
-
-// One shared upstream client: reuses pooled TLS connections across the many sequential calls an
-// agent turn makes. A per-request Client::new() would pay DNS + TCP + TLS handshake every time.
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
 }
 
 impl Gateway {
@@ -228,6 +222,23 @@ async fn respond_json(sock: &mut TcpStream, status: u16, body: &str) -> std::io:
 // x-api-key carry the loopback token and are replaced with the real provider key. The response
 // body is streamed back EOF-delimited (no Content-Length + Connection: close), so SSE tunnels
 // through untouched.
+// Anthropic credential + version headers. Both credential forms are sent — anthropic-compatible
+// gateways vary in which they read; the version echoes the CLI's or defaults.
+fn anthropic_auth(
+    req: reqwest::RequestBuilder,
+    key: &str,
+    headers_in: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    let version = headers_in
+        .iter()
+        .find(|(k, _)| k == "anthropic-version")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("2023-06-01");
+    req.header("x-api-key", key)
+        .header("authorization", format!("Bearer {}", key))
+        .header("anthropic-version", version)
+}
+
 async fn passthrough(
     sock: &mut TcpStream,
     method: &str,
@@ -242,16 +253,7 @@ async fn passthrough(
     match cfg.outbound {
         Proto::OpenAi => req = req.bearer_auth(&cfg.api_key),
         Proto::Anthropic => {
-            // Send both credential headers — anthropic-compatible gateways vary in which they read.
-            req = req
-                .header("x-api-key", &cfg.api_key)
-                .header("authorization", format!("Bearer {}", cfg.api_key));
-            let version = headers_in
-                .iter()
-                .find(|(k, _)| k == "anthropic-version")
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("2023-06-01");
-            req = req.header("anthropic-version", version);
+            req = anthropic_auth(req, &cfg.api_key, headers_in);
             for (_, v) in headers_in.iter().filter(|(k, _)| k == "anthropic-beta") {
                 req = req.header("anthropic-beta", v);
             }
@@ -304,16 +306,7 @@ async fn count_tokens_forward(
     cfg: &GatewayConfig,
 ) -> std::io::Result<()> {
     let url = format!("{}/v1/messages/count_tokens", base);
-    let version = headers_in
-        .iter()
-        .find(|(k, _)| k == "anthropic-version")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("2023-06-01");
-    let upstream = http_client()
-        .post(&url)
-        .header("x-api-key", &cfg.api_key)
-        .header("authorization", format!("Bearer {}", cfg.api_key))
-        .header("anthropic-version", version)
+    let upstream = anthropic_auth(http_client().post(&url), &cfg.api_key, headers_in)
         .header("content-type", "application/json")
         .body(body.to_vec())
         .send()
@@ -330,6 +323,55 @@ async fn count_tokens_forward(
     respond_json(sock, 200, &json!({ "input_tokens": est }).to_string()).await
 }
 
+// POST a translated request to {base}/chat/completions. On transport failure or a non-2xx
+// status the error is written to `sock` (surfacing the provider's own message so auth/model
+// errors are readable in the transcript) and None is returned.
+async fn send_chat(
+    sock: &mut TcpStream,
+    base: &str,
+    key: &str,
+    chat_req: &Value,
+) -> std::io::Result<Option<reqwest::Response>> {
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    let upstream = http_client().post(&url).bearer_auth(key).json(chat_req).send().await;
+    let upstream = match upstream {
+        Ok(r) => r,
+        Err(e) => {
+            respond_json(sock, 502, &err_body("api_error", &format!("upstream unreachable: {}", e))).await?;
+            return Ok(None);
+        }
+    };
+    if !upstream.status().is_success() {
+        let status = upstream.status().as_u16();
+        let text = upstream.text().await.unwrap_or_default();
+        let msg = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|j| j.pointer("/error/message").and_then(|v| v.as_str()).map(String::from))
+            .unwrap_or(text);
+        respond_json(sock, status, &err_body("api_error", &msg)).await?;
+        return Ok(None);
+    }
+    Ok(Some(upstream))
+}
+
+// Read a non-streaming upstream body and answer with the translated response.
+async fn respond_translated(
+    sock: &mut TcpStream,
+    upstream: reqwest::Response,
+    model: &str,
+    translate: fn(&Value, &str) -> Value,
+) -> std::io::Result<()> {
+    let json: Value = match upstream.json().await {
+        Ok(j) => j,
+        Err(e) => return respond_json(sock, 502, &err_body("api_error", &format!("bad upstream body: {}", e))).await,
+    };
+    // Some providers (OpenRouter et al.) return 200 with an error object in the body.
+    if let Some(msg) = upstream_error(&json) {
+        return respond_json(sock, 502, &err_body("api_error", &msg)).await;
+    }
+    respond_json(sock, 200, &translate(&json, model).to_string()).await
+}
+
 // ---- /v1/messages: translate and forward (anthropic-in → openai-out) ----
 
 async fn proxy_messages(sock: &mut TcpStream, base: &str, key: &str, body: &[u8]) -> std::io::Result<()> {
@@ -340,43 +382,47 @@ async fn proxy_messages(sock: &mut TcpStream, base: &str, key: &str, body: &[u8]
     let model = req.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let openai_req = to_openai_request(&req, base, stream);
 
-    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-    let upstream = http_client()
-        .post(&url)
-        .bearer_auth(key)
-        .json(&openai_req)
-        .send()
-        .await;
-
-    let upstream = match upstream {
-        Ok(r) => r,
-        Err(e) => return respond_json(sock, 502, &err_body("api_error", &format!("upstream unreachable: {}", e))).await,
+    let Some(upstream) = send_chat(sock, base, key, &openai_req).await? else {
+        return Ok(());
     };
-
-    if !upstream.status().is_success() {
-        let status = upstream.status().as_u16();
-        let text = upstream.text().await.unwrap_or_default();
-        // Surface the provider's own message so auth/model errors are readable in the transcript.
-        let msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|j| j.pointer("/error/message").and_then(|v| v.as_str()).map(String::from))
-            .unwrap_or(text);
-        return respond_json(sock, status, &err_body("api_error", &msg)).await;
-    }
-
     if stream {
         stream_response(sock, upstream, &model).await
     } else {
-        let json: Value = match upstream.json().await {
-            Ok(j) => j,
-            Err(e) => return respond_json(sock, 502, &err_body("api_error", &format!("bad upstream body: {}", e))).await,
-        };
-        // Some providers (OpenRouter et al.) return 200 with an error object in the body.
-        if let Some(msg) = upstream_error(&json) {
-            return respond_json(sock, 502, &err_body("api_error", &msg)).await;
-        }
-        respond_json(sock, 200, &to_anthropic_response(&json, &model).to_string()).await
+        respond_translated(sock, upstream, &model, to_anthropic_response).await
     }
+}
+
+// Shared chat/completions request tail: token cap (api.openai.com rejects max_tokens on current
+// models; compat providers expect it) + streaming usage accounting.
+fn apply_chat_common(out: &mut Value, req: &Value, max_key: &str, base: &str, stream: bool) {
+    if let Some(mt) = req.get(max_key) {
+        let field = if base.contains("api.openai.com") { "max_completion_tokens" } else { "max_tokens" };
+        out[field] = mt.clone();
+    }
+    if stream {
+        out["stream"] = json!(true);
+        out["stream_options"] = json!({ "include_usage": true });
+    }
+}
+
+// Map tool entries to the chat/completions nested {type:"function", function:{…}} shape.
+// `params_key` names where the source schema lives; `filter` skips non-function entries.
+fn map_chat_tools(tools: &[Value], params_key: &str, filter: fn(&Value) -> bool) -> Option<Value> {
+    let mapped: Vec<Value> = tools
+        .iter()
+        .filter(|t| filter(t))
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.get("name").cloned().unwrap_or(Value::Null),
+                    "description": t.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": t.get(params_key).cloned().unwrap_or(json!({ "type": "object" })),
+                },
+            })
+        })
+        .collect();
+    (!mapped.is_empty()).then_some(Value::Array(mapped))
 }
 
 // Error object embedded in a 200 body / SSE data line ({"error": {...}} or {"error": "..."}).
@@ -480,15 +526,7 @@ fn to_openai_request(req: &Value, base: &str, stream: bool) -> Value {
         "messages": messages,
     });
 
-    // api.openai.com rejects max_tokens on current models; compat providers expect it.
-    if let Some(mt) = req.get("max_tokens") {
-        let field = if base.contains("api.openai.com") { "max_completion_tokens" } else { "max_tokens" };
-        out[field] = mt.clone();
-    }
-    if stream {
-        out["stream"] = json!(true);
-        out["stream_options"] = json!({ "include_usage": true });
-    }
+    apply_chat_common(&mut out, req, "max_tokens", base, stream);
     if let Some(stops) = req.get("stop_sequences") {
         out["stop"] = stops.clone();
     }
@@ -501,22 +539,9 @@ fn to_openai_request(req: &Value, base: &str, stream: bool) -> Value {
         };
     }
     if let Some(tools) = req.get("tools").and_then(|v| v.as_array()) {
-        let mapped: Vec<Value> = tools
-            .iter()
-            .filter(|t| t.get("name").is_some()) // skip server-tool entries with no schema
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.get("name").cloned().unwrap_or(Value::Null),
-                        "description": t.get("description").cloned().unwrap_or(Value::Null),
-                        "parameters": t.get("input_schema").cloned().unwrap_or(json!({ "type": "object" })),
-                    },
-                })
-            })
-            .collect();
-        if !mapped.is_empty() {
-            out["tools"] = Value::Array(mapped);
+        // Skip server-tool entries with no schema.
+        if let Some(mapped) = map_chat_tools(tools, "input_schema", |t| t.get("name").is_some()) {
+            out["tools"] = mapped;
         }
     }
     match req.pointer("/tool_choice/type").and_then(|v| v.as_str()) {
@@ -531,7 +556,7 @@ fn to_openai_request(req: &Value, base: &str, stream: bool) -> Value {
     out
 }
 
-fn tool_result_text(content: Option<&Value>) -> String {
+pub(crate) fn tool_result_text(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(blocks)) => blocks
@@ -597,6 +622,28 @@ fn to_anthropic_response(j: &Value, model: &str) -> Value {
     })
 }
 
+// Append an upstream chunk to `buf`, drain complete SSE lines, and parse each `data:` JSON
+// payload. Returns (events, done) — done once a `[DONE]` sentinel is seen (later lines drop).
+// Parses slices in place before draining, so no per-line String allocation.
+fn drain_sse(buf: &mut String, chunk: &[u8]) -> (Vec<Value>, bool) {
+    let mut events = Vec::new();
+    buf.push_str(&String::from_utf8_lossy(chunk));
+    while let Some(nl) = buf.find('\n') {
+        let data = buf[..nl].trim_end_matches('\r').strip_prefix("data:").map(str::trim);
+        let done = data == Some("[DONE]");
+        if !done {
+            if let Some(j) = data.and_then(|d| serde_json::from_str::<Value>(d).ok()) {
+                events.push(j);
+            }
+        }
+        buf.drain(..nl + 1);
+        if done {
+            return (events, true);
+        }
+    }
+    (events, false)
+}
+
 // ---- streaming translation (OpenAI SSE chunks → Anthropic SSE events) ----
 
 struct SseWriter<'a> {
@@ -645,17 +692,10 @@ async fn stream_response(sock: &mut TcpStream, upstream: reqwest::Response, mode
 
     let mut buf = String::new();
     let mut bytes = upstream.bytes_stream();
-    'outer: while let Some(chunk) = bytes.next().await {
+    while let Some(chunk) = bytes.next().await {
         let Ok(chunk) = chunk else { break };
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(nl) = buf.find('\n') {
-            let line = buf[..nl].trim_end_matches('\r').to_string();
-            buf.drain(..nl + 1);
-            let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
-            if data == "[DONE]" {
-                break 'outer;
-            }
-            let Ok(j) = serde_json::from_str::<Value>(data) else { continue };
+        let (events, done) = drain_sse(&mut buf, &chunk);
+        for j in events {
 
             // Mid-stream error (OpenRouter and friends send 200 + {"error": …} in the stream,
             // e.g. rate limits or "model does not support tool use"). Swallowing it would hand
@@ -765,6 +805,9 @@ async fn stream_response(sock: &mut TcpStream, upstream: reqwest::Response, mode
                 }
             }
         }
+        if done {
+            break;
+        }
     }
 
     if let Some((idx, _)) = open {
@@ -807,34 +850,13 @@ async fn proxy_responses(sock: &mut TcpStream, base: &str, key: &str, body: &[u8
     let model = req.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let chat_req = responses_to_chat(&req, base, stream);
 
-    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-    let upstream = http_client().post(&url).bearer_auth(key).json(&chat_req).send().await;
-    let upstream = match upstream {
-        Ok(r) => r,
-        Err(e) => return respond_json(sock, 502, &err_body("api_error", &format!("upstream unreachable: {}", e))).await,
+    let Some(upstream) = send_chat(sock, base, key, &chat_req).await? else {
+        return Ok(());
     };
-
-    if !upstream.status().is_success() {
-        let status = upstream.status().as_u16();
-        let text = upstream.text().await.unwrap_or_default();
-        let msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|j| j.pointer("/error/message").and_then(|v| v.as_str()).map(String::from))
-            .unwrap_or(text);
-        return respond_json(sock, status, &err_body("api_error", &msg)).await;
-    }
-
     if stream {
         stream_responses(sock, upstream, &model).await
     } else {
-        let json: Value = match upstream.json().await {
-            Ok(j) => j,
-            Err(e) => return respond_json(sock, 502, &err_body("api_error", &format!("bad upstream body: {}", e))).await,
-        };
-        if let Some(msg) = upstream_error(&json) {
-            return respond_json(sock, 502, &err_body("api_error", &msg)).await;
-        }
-        respond_json(sock, 200, &chat_to_responses(&json, &model).to_string()).await
+        respond_translated(sock, upstream, &model, chat_to_responses).await
     }
 }
 
@@ -915,32 +937,12 @@ fn responses_to_chat(req: &Value, base: &str, stream: bool) -> Value {
         "messages": messages,
     });
 
-    if let Some(mt) = req.get("max_output_tokens") {
-        let field = if base.contains("api.openai.com") { "max_completion_tokens" } else { "max_tokens" };
-        out[field] = mt.clone();
-    }
-    if stream {
-        out["stream"] = json!(true);
-        out["stream_options"] = json!({ "include_usage": true });
-    }
+    apply_chat_common(&mut out, req, "max_output_tokens", base, stream);
     // Responses tools are flat ({type, name, description, parameters}); chat nests under "function".
     if let Some(tools) = req.get("tools").and_then(|v| v.as_array()) {
-        let mapped: Vec<Value> = tools
-            .iter()
-            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("function") && t.get("name").is_some())
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.get("name").cloned().unwrap_or(Value::Null),
-                        "description": t.get("description").cloned().unwrap_or(Value::Null),
-                        "parameters": t.get("parameters").cloned().unwrap_or(json!({ "type": "object" })),
-                    },
-                })
-            })
-            .collect();
-        if !mapped.is_empty() {
-            out["tools"] = Value::Array(mapped);
+        let is_fn = |t: &Value| t.get("type").and_then(|v| v.as_str()) == Some("function") && t.get("name").is_some();
+        if let Some(mapped) = map_chat_tools(tools, "parameters", is_fn) {
+            out["tools"] = mapped;
         }
     }
     match req.get("tool_choice") {
@@ -1096,17 +1098,10 @@ async fn stream_responses(sock: &mut TcpStream, upstream: reqwest::Response, mod
 
     let mut buf = String::new();
     let mut bytes = upstream.bytes_stream();
-    'outer: while let Some(chunk) = bytes.next().await {
+    while let Some(chunk) = bytes.next().await {
         let Ok(chunk) = chunk else { break };
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(nl) = buf.find('\n') {
-            let line = buf[..nl].trim_end_matches('\r').to_string();
-            buf.drain(..nl + 1);
-            let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
-            if data == "[DONE]" {
-                break 'outer;
-            }
-            let Ok(j) = serde_json::from_str::<Value>(data) else { continue };
+        let (events, done) = drain_sse(&mut buf, &chunk);
+        for j in events {
 
             // Mid-stream error (200 + {"error": …}) → surface as response.failed so Codex aborts
             // with a readable message instead of retrying an empty turn forever.
@@ -1194,6 +1189,9 @@ async fn stream_responses(sock: &mut TcpStream, upstream: reqwest::Response, mod
                     }
                 }
             }
+        }
+        if done {
+            break;
         }
     }
 

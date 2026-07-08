@@ -1,6 +1,6 @@
 // anthropic.rs — Anthropic OAuth token exchange, model listing, and the Messages
 // API streaming proxy. All run from Rust to avoid the webview's CORS limits.
-use crate::stream::{check_stream_status, json_or_err, pump_sse, StreamEvent};
+use crate::stream::{check_stream_status, http_client, json_or_err, pump_sse, StreamEvent};
 use std::ops::ControlFlow;
 
 // Anthropic's OAuth token endpoint sends no CORS headers, so the webview can't
@@ -9,7 +9,7 @@ use std::ops::ControlFlow;
 // the parsed JSON token response is returned on success.
 #[tauri::command]
 pub async fn anthropic_oauth_token(body: serde_json::Value) -> Result<serde_json::Value, String> {
-    let res = reqwest::Client::new()
+    let res = http_client()
         .post("https://console.anthropic.com/v1/oauth/token")
         .header("Content-Type", "application/json")
         .json(&body)
@@ -24,7 +24,7 @@ pub async fn anthropic_oauth_token(body: serde_json::Value) -> Result<serde_json
 // Returns the raw /v1/models JSON; the webview maps it to picker entries.
 #[tauri::command]
 pub async fn anthropic_list_models(token: String, oauth: bool) -> Result<serde_json::Value, String> {
-    let mut req = reqwest::Client::new()
+    let mut req = http_client()
         .get("https://api.anthropic.com/v1/models?limit=100")
         .header("anthropic-version", "2023-06-01");
     req = if oauth {
@@ -51,7 +51,7 @@ pub async fn anthropic_messages_stream(
     on_event: tauri::ipc::Channel<StreamEvent>,
 ) -> Result<(), String> {
     let cancel = crate::stream::cancel_guard(&stream_id);
-    let mut req = reqwest::Client::new()
+    let mut req = http_client()
         .post("https://api.anthropic.com/v1/messages")
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")

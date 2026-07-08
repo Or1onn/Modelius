@@ -1,6 +1,6 @@
 // openai.rs — "Sign in with ChatGPT" (Codex OAuth): loopback callback capture,
 // token exchange/refresh, and the Responses API streaming proxy.
-use crate::stream::{check_stream_status, json_or_err, pump_sse, StreamEvent};
+use crate::stream::{check_stream_status, http_client, json_or_err, pump_sse, StreamEvent};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -106,7 +106,7 @@ pub async fn openai_await_callback(state: String) -> Result<String, String> {
 // Token exchange / refresh for the OpenAI OAuth flow (form-encoded, no CORS).
 #[tauri::command]
 pub async fn openai_oauth_token(form: HashMap<String, String>) -> Result<serde_json::Value, String> {
-    let res = reqwest::Client::new()
+    let res = http_client()
         .post("https://auth.openai.com/oauth/token")
         .form(&form)
         .send()
@@ -126,7 +126,7 @@ pub async fn openai_responses_stream(
     on_event: tauri::ipc::Channel<StreamEvent>,
 ) -> Result<(), String> {
     let cancel = crate::stream::cancel_guard(&stream_id);
-    let mut builder = reqwest::Client::new()
+    let mut builder = http_client()
         .post("https://chatgpt.com/backend-api/codex/responses")
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")

@@ -1,6 +1,6 @@
 // compat.rs — generic OpenAI-compatible endpoints (Ollama, Groq, OpenRouter, …):
 // model listing + chat-completions SSE proxy, CORS-free. `provider` is only the error label.
-use crate::stream::{check_stream_status, json_or_err, pump_sse, StreamEvent};
+use crate::stream::{check_stream_status, http_client, json_or_err, pump_sse, StreamEvent};
 use std::ops::ControlFlow;
 
 fn join_url(base: &str, path: &str) -> String {
@@ -10,7 +10,7 @@ fn join_url(base: &str, path: &str) -> String {
 // GET {base}/models — used to validate an endpoint and list its models.
 #[tauri::command]
 pub async fn compat_list_models(base_url: String, api_key: String) -> Result<serde_json::Value, String> {
-    let mut builder = reqwest::Client::new().get(join_url(&base_url, "/models"));
+    let mut builder = http_client().get(join_url(&base_url, "/models"));
     if !api_key.is_empty() {
         builder = builder.header("authorization", format!("Bearer {}", api_key));
     }
@@ -22,7 +22,7 @@ pub async fn compat_list_models(base_url: String, api_key: String) -> Result<ser
 // array (e.g. ["completion","vision"]). Used to learn whether a local model accepts images.
 #[tauri::command]
 pub async fn ollama_show(base_url: String, model: String) -> Result<serde_json::Value, String> {
-    let res = reqwest::Client::new()
+    let res = http_client()
         .post(join_url(&base_url, "/api/show"))
         .json(&serde_json::json!({ "model": model }))
         .send()
@@ -42,7 +42,7 @@ pub async fn compat_chat_stream(
     on_event: tauri::ipc::Channel<StreamEvent>,
 ) -> Result<(), String> {
     let cancel = crate::stream::cancel_guard(&stream_id);
-    let mut builder = reqwest::Client::new()
+    let mut builder = http_client()
         .post(join_url(&base_url, "/chat/completions"))
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")

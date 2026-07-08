@@ -5,6 +5,13 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+// One shared upstream client: reuses pooled TLS connections across the many sequential calls a
+// chat session makes. A per-request Client::new() would pay DNS + TCP + TLS handshake every time.
+pub(crate) fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 // Cancellation registry: maps a per-request stream id to a flag the pump loop polls.
 // The webview flips it via `cancel_stream` when the user hits Stop, so the proxy drops
 // the upstream connection instead of streaming a response nobody is reading.
@@ -108,15 +115,12 @@ where
         }
         buf.extend_from_slice(&bytes);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("data:") else { continue };
-            let data = rest.trim();
-            if data.is_empty() {
-                continue;
-            }
-            if on_data(data).is_break() {
+            // Parse the line in place, then drain it — avoids a Vec allocation per SSE line.
+            let line = String::from_utf8_lossy(&buf[..pos]);
+            let data = line.trim().strip_prefix("data:").map(str::trim).unwrap_or("");
+            let brk = !data.is_empty() && on_data(data).is_break();
+            buf.drain(..=pos);
+            if brk {
                 return Ok(());
             }
         }
