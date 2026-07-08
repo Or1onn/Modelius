@@ -4,14 +4,28 @@
 // chat/screen switch; CodeScreen subscribes via useCodeSession and renders.
 import { useCallback, useSyncExternalStore } from "react";
 import { HARNESSES, HARNESS_BY_ID } from "@/entities/agent/model/harnesses";
+import {
+  DEFAULT_CODE_MODEL,
+  sameChoice,
+  choiceFitsHarness,
+  defaultModelForHarness,
+  type CodeModelChoice,
+} from "@/entities/agent/model/codeModel";
+import { getGateways, gatewaySecretKey } from "@/entities/agent/model/gateways";
+import { OLLAMA_HOST } from "@/entities/session/model/ollamaSession";
+import { getCodexAuth } from "@/entities/session/model/openaiSession";
+import { getAnthropicAccessToken } from "@/entities/session/model/anthropicSession";
+import { getKey } from "@/entities/session/model/keys";
+import { KEY_PROVIDER_BASE } from "@/entities/session/model/keyProviders";
+import { secretGet } from "@/shared/api/secrets";
 import { runAgentToSteps, applyDelta, type Step } from "@/features/run-agent/lib/agentChannel";
 import { getCodeChats, loadCodeBody, saveCodeBody, upsertCodeChat, codeIndexEntryFrom } from "@/entities/agent/model/codeChats";
+import { invalidateCodeUsage } from "@/pages/code/model/codeUsage";
 
 type Phase = "idle" | "running";
 
-// Default harness + its first model (used for a fresh session, before any saved body loads).
+// Default harness (used for a fresh session, before any saved body loads).
 const DEFAULT_HARNESS = HARNESSES[0].id;
-const firstModelOf = (harnessId: string): string => HARNESS_BY_ID[harnessId]?.models()[0]?.id ?? "";
 
 // Immutable view the component subscribes to (re-created per commit).
 export interface CodeSessionView {
@@ -19,7 +33,7 @@ export interface CodeSessionView {
   phase: Phase;
   cwd: string;
   harnessId: string;
-  modelId: string;
+  model: CodeModelChoice;
   permissionMode: string;
   contextTokens: number; // prompt tokens of the last turn (context-window fill); 0 until first result
   cost: number | null; // cumulative USD reported by the last result
@@ -32,7 +46,7 @@ interface CodeSession {
   phase: Phase;
   cwd: string;
   harnessId: string;
-  modelId: string;
+  model: CodeModelChoice;
   permissionMode: string;
   contextTokens: number;
   cost: number | null;
@@ -54,7 +68,7 @@ function rebuildView(s: CodeSession): void {
     phase: s.phase,
     cwd: s.cwd,
     harnessId: s.harnessId,
-    modelId: s.modelId,
+    model: s.model,
     permissionMode: s.permissionMode,
     contextTokens: s.contextTokens,
     cost: s.cost,
@@ -73,17 +87,19 @@ function schedulePersist(s: CodeSession): void {
   if (s.saveTimer) clearTimeout(s.saveTimer);
   s.saveTimer = setTimeout(() => {
     s.saveTimer = null;
-    const entry = codeIndexEntryFrom(s.chatId, s.steps, s.createdAt, s.title);
+    const entry = codeIndexEntryFrom(s.chatId, s.steps, s.createdAt, s.title, s.cwd);
     if (!entry) return; // no user turn yet — nothing to index
     void saveCodeBody(s.chatId, {
       steps: s.steps,
       cwd: s.cwd,
       harnessId: s.harnessId,
-      modelId: s.modelId,
+      modelId: s.model.id, // legacy field, kept for older builds
+      model: s.model,
       permissionMode: s.permissionMode,
       title: s.title,
     });
     upsertCodeChat(entry);
+    invalidateCodeUsage(); // hero stats recompute next time the empty state opens
   }, 400) as unknown as number;
 }
 
@@ -97,7 +113,7 @@ function ensure(chatId: string): CodeSession {
     phase: "idle",
     cwd: "",
     harnessId: DEFAULT_HARNESS,
-    modelId: firstModelOf(DEFAULT_HARNESS),
+    model: DEFAULT_CODE_MODEL,
     permissionMode: "acceptEdits",
     contextTokens: 0,
     cost: null,
@@ -125,7 +141,10 @@ async function load(s: CodeSession): Promise<void> {
     s.steps = body.steps;
     s.cwd = body.cwd;
     if (body.harnessId && HARNESS_BY_ID[body.harnessId]) s.harnessId = body.harnessId;
-    if (body.modelId) s.modelId = body.modelId;
+    if (body.model) s.model = body.model;
+    // A saved pair can be inconsistent (e.g. a legacy body, or a save from before the guard) —
+    // the harness CLI hard-errors on a foreign model id, so re-align here.
+    if (!choiceFitsHarness(s.model, s.harnessId)) s.model = defaultModelForHarness(s.harnessId);
     s.permissionMode = body.permissionMode;
     s.title = body.title;
   }
@@ -172,16 +191,16 @@ export function setCodeHarness(chatId: string, harnessId: string): void {
   const h = HARNESS_BY_ID[harnessId];
   if (!h || s.harnessId === harnessId) return;
   s.harnessId = harnessId;
-  // Keep the model valid for the new harness's model set.
-  if (!h.models().some((m) => m.id === s.modelId)) s.modelId = firstModelOf(harnessId);
+  // A model pick only makes sense for the harness family it belongs to (codex ↔ claude-code).
+  if (!choiceFitsHarness(s.model, harnessId)) s.model = defaultModelForHarness(harnessId);
   s.dirty = true;
   commit(s);
 }
 
-export function setCodeModel(chatId: string, modelId: string): void {
+export function setCodeModel(chatId: string, choice: CodeModelChoice): void {
   const s = ensure(chatId);
-  if (s.modelId === modelId) return;
-  s.modelId = modelId;
+  if (sameChoice(s.model, choice)) return;
+  s.model = choice;
   s.dirty = true;
   commit(s);
 }
@@ -196,6 +215,38 @@ export function setCodePermissionMode(chatId: string, permissionMode: string): v
 
 // ---- Run ----
 
+// Resolve the endpoint the run should ultimately land on. Native kinds (anthropic/codex) →
+// no target (each CLI's own login); everything else routes through the per-run local gateway:
+// Ollama serves both protocols so the target matches the harness's own dialect (pure passthrough);
+// a user gateway carries its declared protocol; connected providers are OpenAI-compatible.
+// Throws a user-readable message on missing config/keys.
+export interface SendTarget {
+  protocol: "anthropic" | "openai";
+  baseUrl: string;
+  apiKey: string;
+}
+
+async function resolveRouting(model: CodeModelChoice, harnessId: string): Promise<SendTarget | undefined> {
+  if (model.kind === "anthropic" || model.kind === "codex") return undefined;
+  if (!model.id) throw new Error("Pick a model for this environment first (add a gateway or connect a provider).");
+  if (model.kind === "ollama") {
+    const proto = HARNESS_BY_ID[harnessId]?.protocol ?? "anthropic";
+    return { protocol: proto, baseUrl: proto === "openai" ? `${OLLAMA_HOST}/v1` : OLLAMA_HOST, apiKey: "ollama" };
+  }
+  if (model.kind === "gateway") {
+    const g = getGateways().find((g) => g.id === model.gatewayId);
+    if (!g) throw new Error(`Gateway for "${model.label}" is no longer configured — pick another model.`);
+    const key = await secretGet(gatewaySecretKey(g.id)).catch(() => null);
+    if (!key) throw new Error(`API key for gateway "${g.name}" is missing from the keychain — re-add the gateway.`);
+    return { protocol: g.protocol ?? "anthropic", baseUrl: g.baseUrl, apiKey: key };
+  }
+  const base = model.providerId === "openai" ? "https://api.openai.com/v1" : KEY_PROVIDER_BASE[model.providerId];
+  if (!base) throw new Error(`Unknown provider "${model.providerId}" — pick another model.`);
+  const key = await getKey(model.providerId).catch(() => "");
+  if (!key) throw new Error(`No API key saved for ${model.providerId} — connect it in Providers.`);
+  return { protocol: "openai", baseUrl: base, apiKey: key };
+}
+
 // Drive one agent turn. Appends the user step, streams transcript steps, ends idle.
 export async function sendCodeMessage(chatId: string, prompt: string): Promise<void> {
   const s = ensure(chatId);
@@ -207,13 +258,41 @@ export async function sendCodeMessage(chatId: string, prompt: string): Promise<v
   s.phase = "running";
   commit(s);
 
+  // Last line of defense: never hand a foreign model id to the harness CLI (codex only serves
+  // its own account's models; claude-code covers everything else via env routing / the bridge).
+  if (!choiceFitsHarness(s.model, s.harnessId)) {
+    const h = HARNESS_BY_ID[s.harnessId];
+    s.steps = [
+      ...s.steps,
+      { type: "text", text: `⚠️ "${s.model.label}" can't run on the ${h?.name ?? s.harnessId} environment — pick a model from this environment's list.` },
+    ];
+    s.phase = "idle";
+    commit(s);
+    return;
+  }
+
+  let target: SendTarget | undefined;
+  try {
+    target = await resolveRouting(s.model, s.harnessId);
+  } catch (e) {
+    s.steps = [...s.steps, { type: "text", text: `⚠️ ${e instanceof Error ? e.message : String(e)}` }];
+    s.phase = "idle";
+    commit(s);
+    return;
+  }
+  // Native runs prefer the account connected in Providers when available (codex → auth.json in an
+  // isolated CODEX_HOME; claude → CLAUDE_CODE_OAUTH_TOKEN env); otherwise the CLI's own login.
+  const codexAuth = s.model.kind === "codex" ? (await getCodexAuth().catch(() => null)) ?? undefined : undefined;
+  const claudeToken =
+    s.model.kind === "anthropic" ? (await getAnthropicAccessToken().catch(() => null)) ?? undefined : undefined;
+
   const controller = new AbortController();
   s.abort = controller;
   const runId = crypto.randomUUID();
   const permissionMode = s.permissionMode;
   try {
     for await (const delta of runAgentToSteps(
-      { harness: s.harnessId, model: s.modelId, prompt: text, cwd: s.cwd, permissionMode },
+      { harness: s.harnessId, model: s.model.id, prompt: text, cwd: s.cwd, permissionMode, target, codexAuth, claudeToken },
       runId,
       controller.signal
     )) {

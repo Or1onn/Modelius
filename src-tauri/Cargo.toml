@@ -27,11 +27,19 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["process", "io-util"] }
-reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["process", "io-util", "net", "time"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
 keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
 chacha20poly1305 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 which = "6"
+humantime = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

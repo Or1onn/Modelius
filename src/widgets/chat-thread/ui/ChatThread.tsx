@@ -223,7 +223,7 @@ function ReasoningBlock({ text, streaming }: { text: string; streaming: boolean 
         <span style={{ flex: 1, textAlign: "left" }}>{streaming ? "Thinking…" : "Thinking"}</span>
         <Icon name="chevronD" size={13} style={{ transform: open ? "none" : "rotate(-90deg)", opacity: 0.6 }} />
       </button>
-      {open && <div className="reasoning-body">{text}</div>}
+      {open && <div className="reasoning-body md"><Markdown text={text} /></div>}
     </div>
   );
 }

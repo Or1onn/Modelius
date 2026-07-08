@@ -4,6 +4,11 @@ mod agent;
 mod anthropic;
 mod artifacts;
 mod compat;
+mod gateway;
+mod git;
+mod harness;
+mod installer;
+mod node_runtime;
 mod openai;
 mod secrets;
 mod stream;
@@ -41,6 +46,11 @@ pub fn run() {
             compat::ollama_show,
             stream::cancel_stream,
             agent::agent_run,
+            installer::harness_status,
+            installer::harness_install,
+            installer::harness_logged_in,
+            git::git_branches,
+            git::git_checkout,
             artifacts::artifact_write,
             artifacts::artifact_read,
             secrets::secret_set,

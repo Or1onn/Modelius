@@ -15,7 +15,8 @@ export const KEY_PROVIDER_IDS = Object.keys(KEY_PROVIDER_BASE);
 // Cache namespace — bump when the cached list's contents change (e.g. the OpenRouter cap was
 // removed, so a previously-cached 40-item list must be dropped in favour of the full catalog).
 // v3: "image-generation" chat models (e.g. gemini-2.0-flash-preview-image-generation) no longer filtered.
-const CACHE_V = "v3";
+// v4: OpenRouter/compat `name` now preserved (was collapsed to the id) — drop id-only cached lists.
+const CACHE_V = "v4";
 
 export function isKeyProvider(pid: string): boolean {
   return pid in KEY_PROVIDER_BASE;

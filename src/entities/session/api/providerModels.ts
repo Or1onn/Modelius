@@ -59,9 +59,9 @@ async function fetchModels(provider: string, key: string): Promise<RemoteModel[]
 // Models from an OpenAI-compatible endpoint (custom provider). Rust proxy under Tauri
 // (CORS-free); direct fetch in browser dev. No cache — called once from the add form.
 export async function listCompatModels(baseUrl: string, key: string): Promise<RemoteModel[]> {
-  let json: { data?: { id: string }[] };
+  let json: { data?: { id: string; name?: string }[] };
   if (isTauri()) {
-    json = await invoke<{ data?: { id: string }[] }>("compat_list_models", { baseUrl, apiKey: key });
+    json = await invoke<{ data?: { id: string; name?: string }[] }>("compat_list_models", { baseUrl, apiKey: key });
   } else {
     const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
       headers: key ? { Authorization: `Bearer ${key}` } : {},
@@ -69,7 +69,9 @@ export async function listCompatModels(baseUrl: string, key: string): Promise<Re
     if (!res.ok) throw new Error(`Endpoint ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
     json = await res.json();
   }
-  return ((json.data || []) as { id: string }[])
-    .map((m) => ({ id: m.id, name: m.id }))
+  // OpenRouter (and some compat endpoints) return a human `name` ("Anthropic: Claude 3.5 Sonnet");
+  // fall back to the id for endpoints that only expose ids (e.g. Ollama, Groq).
+  return ((json.data || []) as { id: string; name?: string }[])
+    .map((m) => ({ id: m.id, name: m.name || m.id }))
     .sort((a, b) => a.id.localeCompare(b.id));
 }

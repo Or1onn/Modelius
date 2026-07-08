@@ -113,7 +113,16 @@ export default function App() {
     deleteChat(id);
     dropSession(id); // drop live session so a stray commit can't resurrect the chat
     clearDraft(id);
-    if (id === activeChatId) gotoNewChat(); // fall back to the new-chat slot
+    if (id !== activeChatId) return;
+    // Deleting the chat we're viewing: land on a fresh new-chat slot. If the deleted chat *was*
+    // the slot, mint a new id so ChatScreen actually remounts clean (same id wouldn't).
+    if (id === newChatId) {
+      const fresh = crypto.randomUUID();
+      setNewChatId(fresh);
+      setActiveChatId(fresh);
+    } else {
+      gotoNewChat();
+    }
   };
 
   // Code mode has its own chats — mirror the activeChatId / new-slot pattern above.
@@ -139,7 +148,14 @@ export default function App() {
   const removeCode = (id: string) => {
     deleteCodeChat(id);
     dropCodeSession(id);
-    if (id === activeCodeChatId) gotoNewCode();
+    if (id !== activeCodeChatId) return;
+    if (id === newCodeChatId) {
+      const fresh = crypto.randomUUID();
+      setNewCodeChatId(fresh);
+      setActiveCodeChatId(fresh);
+    } else {
+      gotoNewCode();
+    }
   };
 
   // "New" and Cmd+N are mode-aware: create a code session in Code mode, else a chat.

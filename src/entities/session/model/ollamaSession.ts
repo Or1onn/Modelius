@@ -6,8 +6,9 @@ import { listCompatModels, type RemoteModel } from "@/entities/session/api/provi
 
 // Ollama serves an OpenAI-compatible API here; no key. Streaming/listing reuse the compat proxy.
 export const OLLAMA_BASE = "http://localhost:11434/v1";
-// Native API root (no /v1) — /api/show reports per-model capabilities the OpenAI-compat list omits.
-const OLLAMA_HOST = OLLAMA_BASE.replace(/\/v1\/?$/, "");
+// Native API root (no /v1) — /api/show reports per-model capabilities the OpenAI-compat list
+// omits. Also the Anthropic-compatible base Code mode points the claude CLI at (v0.14+).
+export const OLLAMA_HOST = OLLAMA_BASE.replace(/\/v1\/?$/, "");
 const CACHE_KEY = "ollama";
 const CAP_KEY = "ollama:caps"; // Record<modelId, capabilities[]>
 

@@ -1,9 +1,9 @@
 // Sidebar.tsx — left nav: logo, actions, screen nav, chat history, user footer.
-import type { CSSProperties } from "react";
+import { useRef, type CSSProperties } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { useChatStore } from "@/entities/chat/model/chats";
 import { useCodeChatStore } from "@/entities/agent/model/codeChats";
-import { ChatGroup, groupHistory, type ScreenId } from "@/app/ui/ChatGroup";
+import { ChatGroup, groupHistory, groupByProject, type ScreenId } from "@/app/ui/ChatGroup";
 import { UpdateBanner } from "@/widgets/update-banner/ui/UpdateBanner";
 
 const NAV: { id: ScreenId; label: string; icon: string; beta?: boolean }[] = [
@@ -24,21 +24,25 @@ const MODES: { id: ScreenId; label: string; icon: string }[] = [
 ];
 
 function ModeToggle({ screen, setScreen }: { screen: ScreenId; setScreen: (s: ScreenId) => void }) {
-  // Active mode index drives the sliding highlight; -1 (a non-mode screen like Providers) hides it.
-  const active = MODES.findIndex((m) => m.id === screen);
+  // Active mode index drives the sliding highlight. On a non-mode screen (Providers/Memory/Settings)
+  // the index is -1; park the bar on the last-used mode instead of hiding it.
+  const idx = MODES.findIndex((m) => m.id === screen);
+  const lastMode = useRef(0);
+  if (idx >= 0) lastMode.current = idx;
+  const active = idx >= 0 ? idx : lastMode.current;
   return (
     <div
       className="mode-seg"
       role="tablist"
       style={{ gridTemplateColumns: `repeat(${MODES.length}, 1fr)`, "--seg-n": MODES.length, "--seg-i": active } as CSSProperties}
     >
-      <span className="mode-seg-ind" style={{ opacity: active < 0 ? 0 : 1 }} />
-      {MODES.map((m) => (
+      <span className="mode-seg-ind" />
+      {MODES.map((m, i) => (
         <button
           key={m.id}
           role="tab"
           aria-selected={screen === m.id}
-          className={"mode-seg-btn" + (screen === m.id ? " on" : "")}
+          className={"mode-seg-btn" + (i === active ? " on" : "")}
           onClick={() => setScreen(m.id)}
         >
           <Icon name={m.icon} size={15} />
@@ -119,7 +123,7 @@ export function Sidebar({
             <span className="sb-ic">
               <Icon name={a.icon} size={16} />
             </span>
-            <span className="sb-row-label">{a.label}</span>
+            <span className="sb-row-label">{a.id === "new" && isCode ? "New session" : a.label}</span>
           </button>
         ))}
       </div>
@@ -127,7 +131,7 @@ export function Sidebar({
       <div className="sb-divider" />
 
       <div className="sb-group">
-        {NAV.map((n) => (
+        {(isCode ? NAV.filter((n) => n.id !== "settings") : NAV).map((n) => (
           <button key={n.id} className={"sb-row" + (screen === n.id ? " on" : "")} onClick={() => setScreen(n.id)}>
             <span className="sb-ic">
               <Icon name={n.icon} size={16} />
@@ -140,7 +144,7 @@ export function Sidebar({
 
       <div className="sb-recents">
         <div className="sb-recents-list">
-          {groupHistory(chats).map((g) => (
+          {(isCode ? groupByProject(chats) : groupHistory(chats)).map((g) => (
             <ChatGroup
               key={g.id}
               group={g}

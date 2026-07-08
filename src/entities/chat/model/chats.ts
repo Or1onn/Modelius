@@ -19,6 +19,7 @@ export interface ChatIndexEntry {
   createdAt: number;
   updatedAt: number;
   pinned?: boolean; // user-pinned → floats to its own section
+  cwd?: string; // Code mode only: project folder — the sidebar groups sessions by it
 }
 
 let indexCache: ChatIndexEntry[] = [];

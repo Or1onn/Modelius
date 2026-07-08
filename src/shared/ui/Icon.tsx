@@ -6,7 +6,8 @@ import {
   Sparkles, ArrowRight, Play, TrendingUp, Gauge, Copy, RefreshCw, Settings, Pencil,
   Eye, EyeOff, Key, CircleAlert, CircleCheck, CircleX, Link2, Cpu, SlidersHorizontal,
   Ellipsis, Upload, Brain, Code, PanelLeftClose, PanelLeftOpen, Pin, Trash2, Globe,
-  Moon, Sun, Download, GitBranch, Terminal, Mic, Circle, FilePlus2, type LucideIcon,
+  Moon, Sun, Download, GitBranch, Terminal, Mic, Circle, FilePlus2,
+  Folder, ArrowUp, type LucideIcon,
 } from "lucide-react";
 
 // name → lucide component. Names kept from the old set so call sites don't change.
@@ -64,6 +65,8 @@ const ICONS: Record<string, LucideIcon> = {
   mic: Mic,
   dot: Circle,
   addctx: FilePlus2,
+  folder: Folder,
+  arrowUp: ArrowUp,
 };
 
 interface IconProps {

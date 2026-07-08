@@ -12,6 +12,7 @@ export type ToolItem = { id?: string; verb: string; file: string; add?: number; 
 export type Step =
   | { type: "user"; text: string }
   | { type: "text"; text: string }
+  | { type: "thinking"; text: string }
   | { type: "toolgroup"; items: ToolItem[] }
   | { type: "edit"; file: string; add: number; del: number }
   | { type: "diff"; path: string; rows: DiffRow[] };
@@ -26,6 +27,7 @@ export type StepDelta =
 // Raw events from Rust (agent.rs AgentEvent), tagged like StreamEvent.
 type AgentEvent =
   | { type: "text"; data: string }
+  | { type: "thinking"; data: string }
   | { type: "tool_use"; data: { id: string; verb: string; file: string; edit: { old: string; new: string } | null } }
   | { type: "tool_result"; data: { id: string; output: string } }
   | { type: "result"; data: { model: string; cost: number | null; context_tokens: number } }
@@ -38,11 +40,21 @@ export interface RunAgentParams {
   prompt: string;
   cwd: string;
   permissionMode: string;
+  // Endpoint the run lands on (absent → the CLI's own login). Rust starts the per-run local
+  // gateway between the CLI and this target; the key stays env-only, never argv.
+  target?: { protocol: "anthropic" | "openai"; baseUrl: string; apiKey: string };
+  // ChatGPT OAuth tokens from the app's Providers login — Rust materializes them as the codex
+  // CLI's auth.json in an isolated CODEX_HOME (absent → the CLI's own `codex login`).
+  codexAuth?: { idToken: string; accessToken: string; refreshToken?: string; accountId: string };
+  // Claude OAuth access token from the app's Providers login — injected as CLAUDE_CODE_OAUTH_TOKEN
+  // (absent → the CLI's own `claude` login).
+  claudeToken?: string;
 }
 
 // Map a single agent event to a transcript delta (null = no visible change, e.g. terminal result).
 function toDelta(ev: AgentEvent): StepDelta | null {
   if (ev.type === "text") return { op: "append", step: { type: "text", text: ev.data } };
+  if (ev.type === "thinking") return { op: "append", step: { type: "thinking", text: ev.data } };
   if (ev.type === "tool_use") {
     const { id, verb, file, edit } = ev.data;
     const item: ToolItem = { id, verb, file };
@@ -66,7 +78,13 @@ function toDelta(ev: AgentEvent): StepDelta | null {
 // Fold a delta into the transcript: prose appends; adjacent tool calls collapse into one group;
 // a result patches its matching tool item (by id) in place.
 export function applyDelta(steps: Step[], d: StepDelta): Step[] {
-  if (d.op === "append") return [...steps, d.step];
+  if (d.op === "append") {
+    // Adjacent thinking segments merge into one collapsible block (like adjacent tool calls).
+    const last = steps[steps.length - 1];
+    if (d.step.type === "thinking" && last?.type === "thinking")
+      return [...steps.slice(0, -1), { ...last, text: `${last.text}\n\n${d.step.text}` }];
+    return [...steps, d.step];
+  }
   if (d.op === "tool") {
     const last = steps[steps.length - 1];
     if (last?.type === "toolgroup")
@@ -120,6 +138,9 @@ export async function* runAgentToSteps(params: RunAgentParams, streamId: string,
     prompt: params.prompt,
     cwd: params.cwd,
     permissionMode: params.permissionMode,
+    target: params.target,
+    codexAuth: params.codexAuth,
+    claudeToken: params.claudeToken,
     streamId,
     onEvent: channel,
   });

@@ -30,6 +30,34 @@ export function groupHistory(chats: ChatIndexEntry[]): HistGroup[] {
   ];
 }
 
+// Last path segment of a folder — the group label for Code sessions.
+function folderName(path: string): string {
+  if (!path) return "No folder";
+  const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
+// Code mode: bucket sessions by their project folder (cwd) instead of by date.
+// `chats` arrives sorted newest-first, so each group's first item dates the folder.
+export function groupByProject(chats: ChatIndexEntry[]): HistGroup[] {
+  const pinned: ChatIndexEntry[] = [];
+  const byFolder = new Map<string, ChatIndexEntry[]>();
+  for (const c of chats) {
+    if (c.pinned) {
+      pinned.push(c);
+      continue;
+    }
+    const key = c.cwd || "";
+    const bucket = byFolder.get(key);
+    if (bucket) bucket.push(c);
+    else byFolder.set(key, [c]);
+  }
+  const folders = [...byFolder.entries()]
+    .sort((a, b) => (b[1][0]?.updatedAt ?? 0) - (a[1][0]?.updatedAt ?? 0))
+    .map(([path, items]) => ({ id: "folder:" + path, label: folderName(path), items, defaultOpen: true }));
+  return [{ id: "pinned", label: "Pinned", items: pinned, defaultOpen: true }, ...folders];
+}
+
 // Collapsible date group of chats.
 export function ChatGroup({
   group,

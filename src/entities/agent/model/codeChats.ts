@@ -6,6 +6,7 @@ import { isTauri } from "@/shared/api/tauri";
 import { vaultEncrypt, vaultDecrypt } from "@/shared/api/secrets";
 import { db, type ChatIndexEntry } from "@/entities/chat/model/chats";
 import type { Step } from "@/features/run-agent/lib/agentChannel";
+import { fromLegacyModelId, type CodeModelChoice } from "@/entities/agent/model/codeModel";
 
 // ---- Index (encrypted localStorage blob + in-RAM cache, reactive) ----
 
@@ -108,7 +109,8 @@ export interface CodeChatBody {
   steps: Step[];
   cwd: string;
   harnessId: string;
-  modelId: string;
+  modelId: string; // kept alongside `model` so pre-routing builds can still open the chat
+  model?: CodeModelChoice;
   permissionMode: string;
   title: string;
 }
@@ -158,6 +160,8 @@ export async function loadCodeBody(id: string): Promise<CodeChatBody | null> {
       cwd: b.cwd ?? "",
       harnessId: b.harnessId ?? "",
       modelId: b.modelId ?? "",
+      // Legacy bodies carry only modelId — those were always Anthropic picks.
+      model: b.model ?? (b.modelId ? fromLegacyModelId(b.modelId) : undefined),
       // Migrate old bodies that stored a boolean acceptEdits.
       permissionMode: b.permissionMode ?? (b.acceptEdits === false ? "default" : "acceptEdits"),
       title: b.title ?? "",
@@ -185,7 +189,7 @@ export async function deleteCodeBody(id: string): Promise<void> {
 }
 
 // Build an index entry from the transcript: title/preview from the first user step's prompt.
-export function codeIndexEntryFrom(id: string, steps: Step[], createdAt: number, title?: string): ChatIndexEntry | null {
+export function codeIndexEntryFrom(id: string, steps: Step[], createdAt: number, title?: string, cwd?: string): ChatIndexEntry | null {
   const firstUser = steps.find((s): s is Extract<Step, { type: "user" }> => s.type === "user");
   if (!firstUser) return null; // skip empty code chats
   const snippet = firstUser.text.trim().replace(/\s+/g, " ");
@@ -196,5 +200,6 @@ export function codeIndexEntryFrom(id: string, steps: Step[], createdAt: number,
     preview: snippet.slice(0, 120),
     createdAt,
     updatedAt: Date.now(),
+    cwd: cwd || "",
   };
 }

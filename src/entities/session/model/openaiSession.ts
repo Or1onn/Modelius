@@ -14,12 +14,14 @@ export const SCOPES = "openid profile email offline_access";
 
 const ACCESS_KEY = "modelius.openai.access";
 const REFRESH_KEY = "modelius.openai.refresh";
+const ID_KEY = "modelius.openai.id"; // id_token JWT — the codex CLI needs it in auth.json
 const META_KEY = "modelius.oauthmeta.openai"; // localStorage: non-secret presence + accountId
 export const OPENAI_OAUTH_EVT = "modelius-openai-oauth-changed";
 
 export interface OpenAIToken {
   accessToken: string;
   refreshToken?: string;
+  idToken?: string;
   accountId: string;
   expiresAt?: number; // epoch ms
 }
@@ -50,8 +52,9 @@ async function read(): Promise<OpenAIToken | null> {
   const accessToken = await secretGet(ACCESS_KEY);
   if (!accessToken) return null;
   const refreshToken = (await secretGet(REFRESH_KEY)) ?? undefined;
+  const idToken = (await secretGet(ID_KEY)) ?? undefined;
   const meta = readMeta();
-  return { accessToken, refreshToken, accountId: meta?.accountId ?? "", expiresAt: meta?.expiresAt };
+  return { accessToken, refreshToken, idToken, accountId: meta?.accountId ?? "", expiresAt: meta?.expiresAt };
 }
 
 async function write(token: OpenAIToken | null): Promise<void> {
@@ -59,6 +62,8 @@ async function write(token: OpenAIToken | null): Promise<void> {
     await secretSet(ACCESS_KEY, token.accessToken);
     if (token.refreshToken) await secretSet(REFRESH_KEY, token.refreshToken);
     else await secretDelete(REFRESH_KEY);
+    if (token.idToken) await secretSet(ID_KEY, token.idToken);
+    else await secretDelete(ID_KEY);
     try {
       localStorage.setItem(
         META_KEY,
@@ -70,6 +75,7 @@ async function write(token: OpenAIToken | null): Promise<void> {
   } else {
     await secretDelete(ACCESS_KEY);
     await secretDelete(REFRESH_KEY);
+    await secretDelete(ID_KEY);
     try {
       localStorage.removeItem(META_KEY);
     } catch {
@@ -95,6 +101,7 @@ function fromResponse(data: TokenResponse, prev?: OpenAIToken): OpenAIToken {
   return {
     accessToken: data.access_token,
     refreshToken: data.refresh_token || prev?.refreshToken,
+    idToken: data.id_token || prev?.idToken,
     accountId: accountIdFromIdToken(data.id_token) || prev?.accountId || "",
     expiresAt: data.expires_in ? Date.now() + data.expires_in * 1000 : undefined,
   };
@@ -136,6 +143,34 @@ async function refresh(token: OpenAIToken): Promise<OpenAIToken | null> {
   } catch {
     return null;
   }
+}
+
+// Full token set for the codex CLI's auth.json (agent runs on the connected ChatGPT account).
+// Refreshes when near-expiry — or when id_token is missing (logins saved before it was stored),
+// since the refresh grant returns a fresh one. null → fall back to the CLI's own login.
+export interface CodexAuth {
+  idToken: string;
+  accessToken: string;
+  refreshToken?: string;
+  accountId: string;
+}
+
+export async function getCodexAuth(): Promise<CodexAuth | null> {
+  let token = await read();
+  if (!token) return null;
+  const expiringSoon = token.expiresAt !== undefined && Date.now() + 60_000 >= token.expiresAt;
+  if (expiringSoon || !token.idToken) {
+    const refreshed = await refresh(token);
+    if (refreshed) token = refreshed;
+    else if (expiringSoon) return null; // keep stored state; getOpenAIAuth owns the drop-on-fail path
+  }
+  if (!token.idToken) return null;
+  return {
+    idToken: token.idToken,
+    accessToken: token.accessToken,
+    refreshToken: token.refreshToken,
+    accountId: token.accountId,
+  };
 }
 
 // Usable access token + account id, refreshing first if near-expiry.

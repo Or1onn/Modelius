@@ -5,10 +5,21 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Icon } from "@/shared/ui/Icon";
 import { Markdown } from "@/shared/lib/markdown";
-import { ProviderLogo } from "@/entities/model/ui/ProviderLogo";
-import { PROVIDERS, MODEL_BY_ID } from "@/entities/model/model/registry";
-import { HARNESSES, HARNESS_BY_ID, PERMISSION_MODES, PERMISSION_LABEL } from "@/entities/agent/model/harnesses";
+import { MODEL_BY_ID } from "@/entities/model/model/registry";
+import { HARNESSES, HARNESS_BY_ID, PERMISSION_MODES, PERMISSION_LABEL, type NativeKind } from "@/entities/agent/model/harnesses";
+import { useHarnessStatuses, refreshHarnessStatuses, installHarness, cliLoggedIn } from "@/entities/agent/model/harnessStatus";
+import { hasAnthropicOAuth } from "@/entities/session/model/anthropicSession";
+import { hasOpenAIOAuth } from "@/entities/session/model/openaiSession";
+import { AuthModal } from "@/pages/code/ui/AuthModal";
+import { choiceKey, type CodeModelChoice } from "@/entities/agent/model/codeModel";
+import { ModelMenu, type ModelMenuItem } from "@/entities/model/ui/ModelMenu";
+import { peekCodeModelGroups, listCodeModelGroups, type CodeModelGroup } from "@/entities/agent/model/codeModels";
+import { useGateways } from "@/entities/agent/model/gateways";
+import { GatewayModal } from "@/pages/code/ui/GatewayModal";
+import { listBranches, checkoutBranch } from "@/entities/agent/model/git";
 import { type Step, type DiffRow, type ToolItem } from "@/features/run-agent/lib/agentChannel";
+import { CodeStats, PLogo } from "@/pages/code/ui/CodeStats";
+import { getRecentFolders, pushRecentFolder } from "@/pages/code/model/recentFolders";
 import {
   useCodeSession,
   sendCodeMessage,
@@ -41,15 +52,20 @@ function hlLine(code: string): ReactNode[] {
 }
 
 // ---- small model badge (provider logo + name) ----
-function ModelBadge({ modelId }: { modelId: string }) {
-  const m = MODEL_BY_ID[modelId];
-  if (!m) return <span>{modelId}</span>;
+function badgePid(model: CodeModelChoice): string {
+  if (model.kind === "anthropic") return "anthropic";
+  if (model.kind === "codex") return "openai";
+  if (model.kind === "ollama") return "ollama";
+  if (model.kind === "connected") return model.providerId;
+  return "";
+}
+
+function ModelBadge({ model }: { model: CodeModelChoice }) {
+  const pid = badgePid(model);
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-      <span className="model-pick-logo" style={{ color: PROVIDERS[m.provider]?.color }}>
-        <ProviderLogo pid={m.provider} short={PROVIDERS[m.provider]?.short ?? "?"} />
-      </span>
-      <span style={{ fontWeight: 520 }}>{m.name}</span>
+      {pid && <PLogo pid={pid} />}
+      <span style={{ fontWeight: 520 }}>{model.label}</span>
     </span>
   );
 }
@@ -154,9 +170,26 @@ function ToolGroup({ items }: { items: ToolItem[] }) {
   );
 }
 
+// Collapsible reasoning trace between steps — Code-mode twin of chat's ReasoningBlock.
+// Collapsed by default: a run can emit many of these and they'd flood the transcript.
+function ThinkingBlock({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="reasoning cd-reasoning">
+      <button className="reasoning-head" onClick={() => setOpen((v) => !v)}>
+        <Icon name="spark" size={12} style={{ color: "var(--accent)" }} />
+        <span style={{ flex: 1, textAlign: "left" }}>Thinking</span>
+        <Icon name="chevronD" size={13} style={{ transform: open ? "none" : "rotate(-90deg)", opacity: 0.6 }} />
+      </button>
+      {open && <div className="reasoning-body md"><Markdown text={text} /></div>}
+    </div>
+  );
+}
+
 function StepView({ step }: { step: Step }) {
   if (step.type === "user") return <div className="cd-user"><div className="cd-user-bubble">{step.text}</div></div>;
   if (step.type === "text") return <div className="cd-text md"><Markdown text={step.text} /></div>;
+  if (step.type === "thinking") return <ThinkingBlock text={step.text} />;
   if (step.type === "toolgroup") return <ToolGroup items={step.items} />;
   if (step.type === "edit") {
     return (
@@ -173,12 +206,18 @@ function StepView({ step }: { step: Step }) {
   return null;
 }
 
-// ---- generic upward dropdown for the Environment / Model pickers ----
-function Picker({ label, logo, items, onSelect }: {
+// ---- generic dropdown for the Environment / Model / Permission / folder / branch pickers ----
+interface PickItem { id: string; label: string; sub?: string; check?: boolean; disabled?: boolean; subErr?: boolean; trailing?: ReactNode }
+function Picker({ label, logo, items, onSelect, onOpen, down, btnClass, menuHeader, footer }: {
   label: string;
   logo?: ReactNode;
-  items: { id: string; label: string }[];
+  items: PickItem[];
   onSelect: (id: string) => void;
+  onOpen?: () => void; // fired on closed → open (e.g. re-probe installed CLIs)
+  down?: boolean; // open downward (header) instead of upward (composer)
+  btnClass?: string;
+  menuHeader?: string;
+  footer?: { label: string; onSelect: () => void };
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -192,18 +231,36 @@ function Picker({ label, logo, items, onSelect }: {
   }, [open]);
   return (
     <div className="cd-pick" ref={ref} style={{ position: "relative" }}>
-      <button className="cd-model-pick" onClick={() => setOpen((v) => !v)} title={label}>
+      <button className={btnClass || "cd-model-pick"} onClick={() => { if (!open) onOpen?.(); setOpen((v) => !v); }} title={label}>
         {logo}
         <span style={{ fontWeight: 520 }}>{label}</span>
-        <Icon name="chevron" size={10} style={{ transform: "rotate(-90deg)", opacity: 0.6 }} />
+        <Icon name="chevronD" size={12} style={{ opacity: 0.55 }} />
       </button>
       {open && (
-        <div className="cd-pick-menu">
+        <div className={"cd-pick-menu" + (down ? " down" : "")}>
+          {menuHeader && <div className="cd-pick-head">{menuHeader}</div>}
           {items.map((it) => (
-            <button key={it.id} className="cd-pick-item" onClick={() => { onSelect(it.id); setOpen(false); }}>
-              {it.label}
+            <button
+              key={it.id}
+              className={"cd-pick-item" + (it.disabled ? " disabled" : "")}
+              aria-disabled={it.disabled || undefined}
+              onClick={() => { if (it.disabled) return; onSelect(it.id); setOpen(false); }}
+            >
+              <span className="cd-pick-label">
+                <span className="cd-pick-name">{it.label}</span>
+                {it.sub && <span className={"cd-pick-sub mono" + (it.subErr ? " err" : "")}>{it.sub}</span>}
+              </span>
+              {it.trailing ?? (it.check && <Icon name="check" size={15} />)}
             </button>
           ))}
+          {footer && (
+            <>
+              <div className="cd-pick-div" />
+              <button className="cd-pick-item cd-pick-action" onClick={() => { footer.onSelect(); setOpen(false); }}>
+                <span className="cd-pick-label">{footer.label}</span>
+              </button>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -272,18 +329,53 @@ function ContextRing({ tokens, limit, cost, modelName }: { tokens: number; limit
 }
 
 export function CodeScreen({ chatId }: { chatId: string }) {
-  const { steps, phase, cwd, harnessId, modelId, permissionMode, contextTokens, cost } = useCodeSession(chatId);
+  const { steps, phase, cwd, harnessId, model, permissionMode, contextTokens, cost } = useCodeSession(chatId);
   const [input, setInput] = useState("");
+  const [recents, setRecents] = useState<string[]>(() => getRecentFolders());
+  const [branches, setBranches] = useState<string[]>([]);
+  const [branch, setBranch] = useState("");
+  const [modelGroups, setModelGroups] = useState<CodeModelGroup[]>(() => peekCodeModelGroups(harnessId));
+  const [gatewaysOpen, setGatewaysOpen] = useState(false);
+  const [authNeed, setAuthNeed] = useState<NativeKind | null>(null);
+  const gateways = useGateways();
+  const harnessStatuses = useHarnessStatuses();
   const harness = HARNESS_BY_ID[harnessId];
-  const models = harness.models();
+  // Registry entry only exists for Anthropic picks — drives the context-ring limit.
+  const registryModel = model.kind === "anthropic" ? MODEL_BY_ID[model.id] : undefined;
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const hintRef = useRef<HTMLDivElement>(null);
+  const [showHint, setShowHint] = useState(false);
   const busy = phase === "running";
+
+  // Revalidate async groups (Ollama daemon, connected providers); re-peek on gateway/harness change.
+  useEffect(() => {
+    setModelGroups(peekCodeModelGroups(harnessId));
+    let alive = true;
+    void listCodeModelGroups(harnessId).then((g) => { if (alive) setModelGroups(g); });
+    return () => { alive = false; };
+  }, [gateways.length, harnessId]);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [steps, phase]);
+
+  // Probe which harness CLIs are installed (drives the download affordance in the picker).
+  useEffect(() => {
+    void refreshHarnessStatuses();
+  }, []);
+
+  // Load the workspace's git branches whenever the folder changes (empty → picker hides).
+  useEffect(() => {
+    let alive = true;
+    void listBranches(cwd).then((info) => {
+      if (!alive) return;
+      setBranches(info.branches);
+      setBranch(info.current);
+    });
+    return () => { alive = false; };
+  }, [cwd]);
 
   function autosize() {
     const ta = taRef.current;
@@ -292,14 +384,55 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
   }
 
-  async function pickFolder() {
-    const dir = await openDialog({ directory: true, title: "Select a project folder" });
-    if (typeof dir === "string") setCodeCwd(chatId, dir);
+  function selectFolder(dir: string) {
+    setCodeCwd(chatId, dir);
+    pushRecentFolder(dir);
+    setRecents(getRecentFolders());
   }
 
-  function send() {
+  async function pickFolder() {
+    const dir = await openDialog({ directory: true, title: "Select a project folder" });
+    if (typeof dir === "string") selectFolder(dir);
+  }
+
+  // Reveal (and shake, if already shown) the folder coach-mark when a send is attempted before a
+  // folder is chosen. rAF so the animate() target exists on the first reveal.
+  function pokeFolder() {
+    setShowHint(true);
+    requestAnimationFrame(() => {
+      const el = hintRef.current;
+      if (!el || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+      el.animate(
+        [{ transform: "translateX(0)" }, { transform: "translateX(-4px)" }, { transform: "translateX(4px)" },
+         { transform: "translateX(-3px)" }, { transform: "translateX(3px)" }, { transform: "translateX(0)" }],
+        { duration: 380, easing: "ease" }
+      );
+    });
+  }
+
+  function selectBranch(next: string) {
+    if (busy || next === branch) return;
+    const prev = branch;
+    setBranch(next);
+    checkoutBranch(cwd, next).catch(() => setBranch(prev)); // revert on a failed checkout (e.g. dirty tree)
+  }
+
+  // Native picks run on the CLI's own account: gate the send behind sign-in when neither the
+  // app's Providers login nor the CLI's credentials exist. `force` = user chose "continue anyway"
+  // (detection is best-effort, never hard-block). Input stays put until the send actually goes.
+  async function send(force = false) {
     const text = input.trim();
-    if (!text || busy || !cwd) return;
+    if (busy) return;
+    if (!cwd) { pokeFolder(); return; } // no workspace yet — nudge the folder coach-mark instead
+    if (!text) return;
+    const kind = harness?.native?.kind;
+    if (!force && kind && model.kind === kind) {
+      const connected = kind === "anthropic" ? hasAnthropicOAuth() : hasOpenAIOAuth();
+      if (!connected && !(await cliLoggedIn(harnessId))) {
+        setAuthNeed(kind);
+        return;
+      }
+    }
     setInput("");
     setTimeout(() => { if (taRef.current) taRef.current.style.height = "auto"; }, 0);
     void sendCodeMessage(chatId, text);
@@ -311,26 +444,40 @@ export function CodeScreen({ chatId }: { chatId: string }) {
 
   return (
     <div className="cd-wrap">
-      {/* Header: workspace folder + harness tag */}
+      {/* Header: workspace folder selector */}
       <header className="cd-top">
         <div className="cd-top-title">
-          <span className="cd-title-text">{cwd ? basename(cwd) : "Code mode"}</span>
+          <Picker
+            down
+            btnClass={"cd-folder-btn" + (cwd ? "" : " empty")}
+            label={cwd ? basename(cwd) : "Select folder"}
+            logo={<Icon name="folder" size={15} />}
+            menuHeader="Recent"
+            items={recents.map((d) => ({ id: d, label: basename(d), sub: d, check: d === cwd }))}
+            footer={{ label: "Open folder…", onSelect: pickFolder }}
+            onSelect={selectFolder}
+          />
         </div>
+        {showHint && !cwd && (
+          <div className="cd-folder-hint" role="status" ref={hintRef}>
+            <span className="cd-folder-hint-arrow" />
+            <div className="cd-folder-hint-txt">
+              <span className="cd-folder-hint-title">Choose a project folder to begin</span>
+              <span className="cd-folder-hint-sub">The agent reads, runs, and edits only inside this folder.</span>
+            </div>
+          </div>
+        )}
       </header>
 
       {/* Transcript */}
       <div className="cd-thread" ref={scrollRef}>
         <div className="cd-thread-inner">
-          {steps.length === 0 && !busy && (
-            <p className="cd-text" style={{ color: "var(--text-4)" }}>
-              {cwd ? "Describe a change, a bug, or a task — the agent will work in your project folder." : "Select a project folder to begin."}
-            </p>
-          )}
+          {steps.length === 0 && !busy && <CodeStats />}
           {steps.map((step, i) => <StepView key={i} step={step} />)}
           {busy && (
             <div className="cd-working">
               <span className="cd-work-dot" />
-              <span>Working — <ModelBadge modelId={modelId} /></span>
+              <span>Working — <ModelBadge model={model} /></span>
             </div>
           )}
         </div>
@@ -346,51 +493,100 @@ export function CodeScreen({ chatId }: { chatId: string }) {
             placeholder={busy ? "Agent is working…" : cwd ? "Describe a change, a bug, or a task…" : "Select a project folder first…"}
             rows={1}
             onChange={(e) => { setInput(e.target.value); autosize(); }}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }}
           />
           <div className="cd-comp-bar">
             <button className="cd-comp-tool" onClick={pickFolder} title="Add files (select a project folder)">
               <Icon name="plus" size={17} />
             </button>
-            <Picker
-              label={harness.name}
-              logo={<Icon name="terminal" size={13} />}
-              items={HARNESSES.map((h) => ({ id: h.id, label: h.name }))}
-              onSelect={(id) => setCodeHarness(chatId, id)}
+            <ModelMenu
+              items={modelGroups.flatMap((g) =>
+                g.models.map((c): ModelMenuItem => ({
+                  key: choiceKey(c),
+                  label: c.label,
+                  group: g.label,
+                  pid: badgePid(c),
+                  modelId: c.kind === "connected" ? c.id : undefined,
+                }))
+              )}
+              selectedKey={choiceKey(model)}
+              onSelect={(key) => {
+                const choice = modelGroups.flatMap((g) => g.models).find((c) => choiceKey(c) === key);
+                if (choice) setCodeModel(chatId, choice);
+              }}
+              triggerLabel={model.label}
+              triggerPid={badgePid(model)}
+              triggerModelId={model.kind === "connected" ? model.id : undefined}
+              footer={harness?.routable ? { label: "Add gateway…", onSelect: () => setGatewaysOpen(true) } : undefined}
             />
             <Picker
-              label={MODEL_BY_ID[modelId]?.name ?? modelId ?? "Model"}
-              logo={modelId ? <span className="model-pick-logo" style={{ color: PROVIDERS[MODEL_BY_ID[modelId]?.provider]?.color }}><ProviderLogo pid={MODEL_BY_ID[modelId]?.provider ?? ""} short={PROVIDERS[MODEL_BY_ID[modelId]?.provider]?.short ?? "?"} /></span> : undefined}
-              items={models.map((m) => ({ id: m.id, label: m.name }))}
-              onSelect={(id) => setCodeModel(chatId, id)}
+              label={harness.name}
+              items={HARNESSES.map((h) => {
+                const st = harnessStatuses[h.id];
+                const missing = st?.installed === false;
+                return {
+                  id: h.id,
+                  label: h.name,
+                  disabled: missing,
+                  sub: st?.error ?? (st?.installing ? "Installing…" : undefined),
+                  subErr: !!st?.error,
+                  trailing: missing ? (
+                    <span
+                      className="cd-pick-get"
+                      role="button"
+                      title={`Install ${h.name} (npm)`}
+                      onClick={(e) => { e.stopPropagation(); void installHarness(h.id); }}
+                    >
+                      {st?.installing ? <span className="cd-pick-spin" /> : <Icon name="download" size={15} />}
+                    </span>
+                  ) : undefined,
+                };
+              })}
+              onSelect={(id) => setCodeHarness(chatId, id)}
+              onOpen={() => void refreshHarnessStatuses()}
             />
             <span style={{ flex: 1 }} />
             <button
               className={"cd-send" + (busy ? " stop" : input.trim() && cwd ? " on" : "")}
-              onClick={busy ? stop : send}
-              disabled={!busy && (!input.trim() || !cwd)}
+              onClick={() => (busy ? stop() : void send())}
+              disabled={!busy && !input.trim()}
               title={busy ? "Stop" : "Send"}
             >
-              {busy ? <span className="cd-send-spin" /> : <Icon name="send" size={15} />}
+              {busy ? <span className="cd-send-spin" /> : <Icon name="arrowUp" size={16} />}
             </button>
           </div>
         </div>
 
-        {/* Controls row under the input: permission + branch left, context ring far right */}
+        {/* Controls row under the input: permission left, branch + context ring right */}
         <div className="cd-underbar">
           <Picker
             label={PERMISSION_LABEL[permissionMode] ?? permissionMode}
-            logo={<Icon name="shield" size={13} />}
             items={PERMISSION_MODES.map((m) => ({ id: m.id, label: m.label }))}
             onSelect={(id) => setCodePermissionMode(chatId, id)}
           />
-          <button className="cd-proj" onClick={pickFolder} title={cwd || "Select a project folder"}>
-            <Icon name="gitBranch" size={12} />{cwd ? basename(cwd) : "Select folder"}
-          </button>
           <span style={{ flex: 1 }} />
-          <ContextRing tokens={contextTokens} limit={ctxLimit(MODEL_BY_ID[modelId]?.ctx)} cost={cost} modelName={MODEL_BY_ID[modelId]?.name ?? modelId ?? "Model"} />
+          {branches.length > 0 && (
+            <Picker
+              label={branch || "branch"}
+              logo={<Icon name="gitBranch" size={13} />}
+              items={branches.map((b) => ({ id: b, label: b, check: b === branch }))}
+              onSelect={selectBranch}
+            />
+          )}
+          <ContextRing tokens={contextTokens} limit={ctxLimit(registryModel?.ctx)} cost={cost} modelName={model.label} />
         </div>
       </div>
+
+      {gatewaysOpen && <GatewayModal onClose={() => setGatewaysOpen(false)} />}
+      {authNeed && (
+        <AuthModal
+          kind={authNeed}
+          harnessId={harnessId}
+          harnessName={harness?.name ?? harnessId}
+          onClose={() => setAuthNeed(null)}
+          onDone={() => { setAuthNeed(null); void send(true); }}
+        />
+      )}
     </div>
   );
 }
