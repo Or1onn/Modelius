@@ -19,6 +19,14 @@ fn dek() -> Result<[u8; 32], String> {
     if let Some(k) = DEK.get() {
         return Ok(*k);
     }
+    // Serialize the first-run load/generate: without this, two concurrent callers could each
+    // generate a different DEK — one cached here, the other persisted to the keychain — making
+    // data encrypted this session undecryptable on the next launch.
+    static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = INIT.lock().map_err(|e| e.to_string())?;
+    if let Some(k) = DEK.get() {
+        return Ok(*k);
+    }
     let key: [u8; 32] = match secrets::get(DEK_KEY)? {
         Some(b64) => {
             let bytes = STANDARD.decode(b64).map_err(|e| e.to_string())?;
