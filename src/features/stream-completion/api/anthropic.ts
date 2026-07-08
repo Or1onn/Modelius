@@ -1,12 +1,12 @@
 // anthropic.ts — Claude (Messages API) streaming, proxied through Rust (subscription
 // OAuth accounts reject browser-origin requests with a CORS org error).
 import { invoke } from "@tauri-apps/api/core";
-import { SYSTEM_PROMPT } from "@/shared/config/prompts";
 import type { ChatMsg, Delta } from "@/entities/model/model/backend";
 import { anthropicEffortTier, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
 import { getKey } from "@/entities/session/model/keys";
 import { getAnthropicAccessToken, disconnectAnthropicOAuth } from "@/entities/session/model/anthropicSession";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
+import { systemBase, systemInstructions } from "@/features/stream-completion/lib/instructions";
 
 // Extended thinking lands with Claude 3.7; older 3.x models 400 on the param.
 function anthropicSupportsThinking(model: string): boolean {
@@ -46,7 +46,7 @@ export async function* streamClaude(
     }
   }
   // Shared system contract (carries the summary block after compaction).
-  const sysBase = messages.find((m) => m.role === "system")?.content || SYSTEM_PROMPT;
+  const sysBase = systemBase(messages);
   // Messages API requires max_tokens (no "unlimited"). Only a ceiling, billed per
   // actual output. 8192 = safe max across every registry model.
   const body: Record<string, unknown> = { model, max_tokens: 8192, stream: true, messages: msgs };
@@ -87,7 +87,7 @@ export async function* streamClaude(
     const key = await getKey("anthropic");
     if (!key) throw new Error("No Anthropic API key or account connected.");
     token = key;
-    body.system = modelName ? `${sysBase}\nYou are powered by the model named ${modelName}.` : sysBase;
+    body.system = systemInstructions(messages, modelName);
   }
 
   // Bridge the Rust channel into this generator. `oauth` (subscription) = not metered; the key path bills.

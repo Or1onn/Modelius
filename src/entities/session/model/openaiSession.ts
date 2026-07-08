@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { clearModelCache } from "@/shared/lib/modelCache";
 import { secretGet, secretSet, secretDelete } from "@/shared/api/secrets";
+import { readOAuthMeta, oauthPresent, oauthExpiringSoon, type OAuthPresenceMeta } from "@/entities/session/model/oauthShared";
 
 // OAuth client/flow constants — shared with the connect feature.
 export const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -33,20 +34,11 @@ export interface TokenResponse {
   expires_in?: number;
 }
 
-interface OAuthMeta {
-  expiresAt?: number;
+interface OAuthMeta extends OAuthPresenceMeta {
   accountId: string;
-  hasRefresh: boolean;
 }
 
-function readMeta(): OAuthMeta | null {
-  try {
-    const raw = localStorage.getItem(META_KEY);
-    return raw ? (JSON.parse(raw) as OAuthMeta) : null;
-  } catch {
-    return null;
-  }
-}
+const readMeta = () => readOAuthMeta<OAuthMeta>(META_KEY);
 
 async function read(): Promise<OpenAIToken | null> {
   const accessToken = await secretGet(ACCESS_KEY);
@@ -114,11 +106,7 @@ export async function saveOpenAIToken(data: TokenResponse): Promise<void> {
 
 // Sync presence from non-secret meta: usable if it has a refresh token or isn't expired.
 export function hasOpenAIOAuth(): boolean {
-  const meta = readMeta();
-  if (!meta) return false;
-  if (meta.hasRefresh) return true;
-  if (meta.expiresAt === undefined) return true;
-  return Date.now() < meta.expiresAt;
+  return oauthPresent(readMeta());
 }
 
 export async function disconnectOpenAIOAuth(): Promise<void> {
@@ -158,7 +146,7 @@ export interface CodexAuth {
 export async function getCodexAuth(): Promise<CodexAuth | null> {
   let token = await read();
   if (!token) return null;
-  const expiringSoon = token.expiresAt !== undefined && Date.now() + 60_000 >= token.expiresAt;
+  const expiringSoon = oauthExpiringSoon(token.expiresAt);
   if (expiringSoon || !token.idToken) {
     const refreshed = await refresh(token);
     if (refreshed) token = refreshed;
@@ -177,8 +165,7 @@ export async function getCodexAuth(): Promise<CodexAuth | null> {
 export async function getOpenAIAuth(): Promise<{ token: string; accountId: string } | null> {
   const token = await read();
   if (!token) return null;
-  const expiringSoon = token.expiresAt !== undefined && Date.now() + 60_000 >= token.expiresAt;
-  if (expiringSoon) {
+  if (oauthExpiringSoon(token.expiresAt)) {
     const refreshed = await refresh(token);
     if (!refreshed) {
       await write(null); // refresh failed → drop so UI flips to disconnected

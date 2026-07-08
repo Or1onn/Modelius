@@ -40,12 +40,42 @@ function logoStyle(brand: string) {
 
 const modelsOf = (pid: string) => MODELS.filter((m) => m.provider === pid);
 
-// Cost tier (1–3) from the provider's priciest model; 0 = local.
+// One source of truth for "which model list does this provider show": the local daemon's
+// installed models, an OAuth account's models, a key's live catalog — or null (static registry).
+// peek() is the sync cache read for instant render; fetch() revalidates.
+function providerModelSource(
+  pid: string,
+  viaKey: boolean,
+  viaOAuth: boolean
+): { peek: () => RemoteModel[] | null; fetch: () => Promise<RemoteModel[]> } | null {
+  if (PROVIDERS[pid].local) return { peek: () => peekOllamaModels(), fetch: () => listOllamaModels() };
+  if (viaOAuth && pid === "openai") {
+    const codex = () => CODEX_MODELS.map((m) => ({ id: m.id, name: m.name }));
+    return { peek: codex, fetch: async () => codex() };
+  }
+  if (viaOAuth && pid === "anthropic")
+    return { peek: () => peekClaudeAccountModels(), fetch: () => listClaudeAccountModels() };
+  if (KEY_LIVE.has(pid) && viaKey)
+    return { peek: () => peekKeyProviderModels(pid), fetch: () => listKeyProviderModels(pid) };
+  if (LIVE.has(pid) && viaKey) return { peek: () => peekModels(pid), fetch: () => listModels(pid) };
+  return null;
+}
+
+// Cost tier (1–3) from the provider's priciest model; 0 = local. The registry is static,
+// so tiers are computed once and cached (CostNode renders on every key/OAuth event).
+const COST_TIER = new Map<string, number>();
 function costTier(pid: string) {
-  if (PROVIDERS[pid].local) return 0;
-  const ms = modelsOf(pid);
-  const max = ms.length ? Math.max(...ms.map((m) => m.cost)) : 0;
-  return max < 0.002 ? 1 : max < 0.008 ? 2 : 3;
+  let t = COST_TIER.get(pid);
+  if (t === undefined) {
+    if (PROVIDERS[pid].local) t = 0;
+    else {
+      const ms = modelsOf(pid);
+      const max = ms.length ? Math.max(...ms.map((m) => m.cost)) : 0;
+      t = max < 0.002 ? 1 : max < 0.008 ? 2 : 3;
+    }
+    COST_TIER.set(pid, t);
+  }
+  return t;
 }
 
 function CostNode({ pid }: { pid: string }) {
@@ -318,38 +348,24 @@ function ManageInline({
   }, [viaKey, viaOAuth, pid, getKey]);
 
   // Live model list: installed models for Ollama, account models for OAuth, key's real list for live keys, else registry.
-  const willFetch = local || viaOAuth || ((LIVE.has(pid) || KEY_LIVE.has(pid)) && viaKey);
+  const src = providerModelSource(pid, viaKey, viaOAuth);
   // Seed from cache for instant render (no loading flash); effect revalidates. null = cold → loading.
-  const [live, setLive] = useState<RemoteModel[] | null>(() => {
-    if (local) return peekOllamaModels();
-    if (viaOAuth && pid === "openai") return CODEX_MODELS.map((m) => ({ id: m.id, name: m.name }));
-    if (viaOAuth && pid === "anthropic") return peekClaudeAccountModels();
-    if (LIVE.has(pid) && viaKey) return peekModels(pid);
-    if (KEY_LIVE.has(pid) && viaKey) return peekKeyProviderModels(pid);
-    return [];
-  });
+  const [live, setLive] = useState<RemoteModel[] | null>(() => (src ? src.peek() : []));
   useEffect(() => {
-    if (!willFetch) return;
+    if (!src) return;
     let alive = true;
-    (async () => {
-      try {
-        if (local) {
-          const ms = alive ? await listOllamaModels() : [];
-          if (alive) {
-            setLive(ms);
-            report("up"); // daemon answered → reachable (even with zero models)
-          }
-        } else if (viaOAuth && pid === "anthropic") setLive(alive ? await listClaudeAccountModels() : []);
-        else if (viaOAuth && pid === "openai") setLive(CODEX_MODELS.map((m) => ({ id: m.id, name: m.name })));
-        else if (KEY_LIVE.has(pid) && viaKey) setLive(alive ? await listKeyProviderModels(pid) : []);
-        else setLive(await listModels(pid));
-      } catch {
-        if (alive) {
-          setLive([]);
-          if (local) report("down"); // daemon unreachable → not running / not installed
-        }
-      }
-    })();
+    src
+      .fetch()
+      .then((ms) => {
+        if (!alive) return;
+        setLive(ms);
+        if (local) report("up"); // daemon answered → reachable (even with zero models)
+      })
+      .catch(() => {
+        if (!alive) return;
+        setLive([]);
+        if (local) report("down"); // daemon unreachable → not running / not installed
+      });
     return () => {
       alive = false;
     };
@@ -536,33 +552,18 @@ export function ProviderRow({
   const { connected: oaiConnected } = useOpenAIAuth();
   const viaKey = !local && hasKey(pid);
   const viaOAuth = (pid === "anthropic" && anthConnected) || (pid === "openai" && oaiConnected);
-  const willFetch = local || viaOAuth || ((LIVE.has(pid) || KEY_LIVE.has(pid)) && viaKey);
+  const src = providerModelSource(pid, viaKey, viaOAuth);
 
-  function seedCount(): number | null {
-    if (local) return peekOllamaModels()?.length ?? null;
-    if (viaOAuth && pid === "openai") return CODEX_MODELS.length;
-    if (viaOAuth && pid === "anthropic") return peekClaudeAccountModels()?.length ?? null;
-    if (LIVE.has(pid) && viaKey) return peekModels(pid)?.length ?? null;
-    if (KEY_LIVE.has(pid) && viaKey) return peekKeyProviderModels(pid)?.length ?? null;
-    return null;
-  }
-  const [liveCount, setLiveCount] = useState<number | null>(seedCount);
+  const [liveCount, setLiveCount] = useState<number | null>(() => (src ? src.peek()?.length ?? null : null));
   useEffect(() => {
-    if (!willFetch) return;
+    if (!src) return;
     let alive = true;
-    (async () => {
-      try {
-        let ms: RemoteModel[];
-        if (local) ms = await listOllamaModels();
-        else if (viaOAuth && pid === "anthropic") ms = await listClaudeAccountModels();
-        else if (viaOAuth && pid === "openai") ms = CODEX_MODELS.map((m) => ({ id: m.id, name: m.name }));
-        else if (KEY_LIVE.has(pid) && viaKey) ms = await listKeyProviderModels(pid);
-        else ms = await listModels(pid);
-        if (alive) setLiveCount(ms.length);
-      } catch {
+    src
+      .fetch()
+      .then((ms) => alive && setLiveCount(ms.length))
+      .catch(() => {
         /* keep the registry fallback */
-      }
-    })();
+      });
     return () => {
       alive = false;
     };

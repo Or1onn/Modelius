@@ -2,12 +2,13 @@
 // direct browser fetch otherwise (dev). Keyed providers (Gemini/Groq) bill per token with real
 // pricing; local endpoints (Ollama) are unmetered.
 import { invoke } from "@tauri-apps/api/core";
-import { SYSTEM_PROMPT } from "@/shared/config/prompts";
 import { getKey } from "@/entities/session/model/keys";
 import { supportsImageOutput } from "@/entities/model/lib/pricingSource";
 import { isKeyProvider } from "@/entities/session/model/keyProviders";
 import { isTauri } from "@/shared/api/tauri";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
+import { systemInstructions } from "@/features/stream-completion/lib/instructions";
+import { sseJson } from "@/features/stream-completion/lib/sse";
 import type { Backend, ChatMsg, Delta } from "@/entities/model/model/backend";
 import type { EffortLevel } from "@/entities/model/model/apiIds";
 
@@ -30,8 +31,7 @@ export async function* streamCompat(
   const metered = isKeyProvider(backend.providerId ?? "");
 
   // Same system contract as the other providers: shared prompt + model self-id line.
-  const base = messages.find((m) => m.role === "system")?.content || SYSTEM_PROMPT;
-  const sysContent = modelName ? `${base}\nYou are powered by the model named ${modelName}.` : base;
+  const sysContent = systemInstructions(messages, modelName);
   const reqMsgs = [
     { role: "system", content: sysContent },
     ...messages.filter((m) => m.role !== "system").map((m) => ({ role: m.role, content: m.content })),
@@ -84,52 +84,29 @@ async function* browserStream(baseUrl: string, name: string, key: string, body: 
     },
     body: JSON.stringify(body),
   });
-  if (!res.ok || !res.body) {
-    const detail = await res.text().catch(() => "");
-    throw new Error(`${name} ${res.status}: ${detail.slice(0, 300)}`);
-  }
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const l = line.trim();
-      if (!l.startsWith("data:")) continue;
-      const data = l.slice(5).trim();
-      if (data === "[DONE]") return;
-      try {
-        const json = JSON.parse(data);
-        const delta: string | undefined = json.choices?.[0]?.delta?.content;
-        if (delta) yield { kind: "text", text: delta };
-        // Image-output models: images arrive as data URLs in delta.images (streaming) or message.images.
-        const imgs = json.choices?.[0]?.delta?.images ?? json.choices?.[0]?.message?.images;
-        if (Array.isArray(imgs))
-          for (const im of imgs) {
-            const url = im?.image_url?.url;
-            if (typeof url === "string") yield { kind: "image", dataUrl: url };
-          }
-        const fr: string | undefined = json.choices?.[0]?.finish_reason;
-        if (fr) yield { kind: "stop", reason: fr };
-        // DeepSeek streams the trace as `reasoning_content`; OpenRouter normalizes it to `reasoning`.
-        const think: string | undefined = json.choices?.[0]?.delta?.reasoning_content ?? json.choices?.[0]?.delta?.reasoning;
-        if (think) yield { kind: "thinking", text: think };
-        if (json.usage)
-          yield {
-            kind: "usage",
-            inputTokens: json.usage.prompt_tokens,
-            outputTokens: json.usage.completion_tokens,
-            reasoningTokens: json.usage.completion_tokens_details?.reasoning_tokens,
-            metered,
-            cost: typeof json.usage.cost === "number" ? json.usage.cost : undefined,
-          };
-      } catch {
-        /* ignore keep-alive / partial lines */
+  for await (const json of sseJson(res, name)) {
+    const delta: string | undefined = json.choices?.[0]?.delta?.content;
+    if (delta) yield { kind: "text", text: delta };
+    // Image-output models: images arrive as data URLs in delta.images (streaming) or message.images.
+    const imgs = json.choices?.[0]?.delta?.images ?? json.choices?.[0]?.message?.images;
+    if (Array.isArray(imgs))
+      for (const im of imgs) {
+        const url = im?.image_url?.url;
+        if (typeof url === "string") yield { kind: "image", dataUrl: url };
       }
-    }
+    const fr: string | undefined = json.choices?.[0]?.finish_reason;
+    if (fr) yield { kind: "stop", reason: fr };
+    // DeepSeek streams the trace as `reasoning_content`; OpenRouter normalizes it to `reasoning`.
+    const think: string | undefined = json.choices?.[0]?.delta?.reasoning_content ?? json.choices?.[0]?.delta?.reasoning;
+    if (think) yield { kind: "thinking", text: think };
+    if (json.usage)
+      yield {
+        kind: "usage",
+        inputTokens: json.usage.prompt_tokens,
+        outputTokens: json.usage.completion_tokens,
+        reasoningTokens: json.usage.completion_tokens_details?.reasoning_tokens,
+        metered,
+        cost: typeof json.usage.cost === "number" ? json.usage.cost : undefined,
+      };
   }
 }

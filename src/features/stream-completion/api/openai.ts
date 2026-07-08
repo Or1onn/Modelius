@@ -1,9 +1,10 @@
 // openai.ts — OpenAI Responses API streaming: key path (direct fetch) + ChatGPT subscription path (via Rust).
 import { invoke } from "@tauri-apps/api/core";
-import { SYSTEM_PROMPT } from "@/shared/config/prompts";
 import { getKey } from "@/entities/session/model/keys";
 import { getOpenAIAuth, disconnectOpenAIOAuth } from "@/entities/session/model/openaiSession";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
+import { systemInstructions } from "@/features/stream-completion/lib/instructions";
+import { sseJson } from "@/features/stream-completion/lib/sse";
 import type { ChatMsg, Delta, ImagePart } from "@/entities/model/model/backend";
 
 const dataUrl = (img: ImagePart) => `data:${img.mime};base64,${img.data}`;
@@ -46,8 +47,7 @@ export async function* streamChatGPT(
   if (!auth) throw new Error("No Codex account connected.");
 
   // Codex needs non-empty `instructions`; naming the model lets it self-report instead of guessing "GPT-5".
-  const base = messages.find((m) => m.role === "system")?.content || SYSTEM_PROMPT;
-  const instructions = modelName ? `${base}\nYou are powered by the model named ${modelName}.` : base;
+  const instructions = systemInstructions(messages, modelName);
   const input = toResponsesInput(messages);
 
   const body: Record<string, unknown> = { model, instructions, input, stream: true, store: false };
@@ -81,8 +81,7 @@ export async function* streamChat(
   if (!key) throw new Error("No OpenAI API key configured.");
 
   // Shared system contract + model self-id goes into `instructions` (Responses has no system message).
-  const base = messages.find((m) => m.role === "system")?.content || SYSTEM_PROMPT;
-  const instructions = modelName ? `${base}\nYou are powered by the model named ${modelName}.` : base;
+  const instructions = systemInstructions(messages, modelName);
   const tools: Record<string, unknown>[] = [];
   if (web) tools.push({ type: "web_search" });
   // The model invokes gpt-image itself when the turn asks for an image; unused, the tool costs nothing.
@@ -106,61 +105,34 @@ export async function* streamChat(
     }),
   });
 
-  if (!res.ok || !res.body) {
-    const detail = await res.text().catch(() => "");
-    const retry = Number(res.headers.get("retry-after"));
-    const suffix = Number.isFinite(retry) && retry > 0 ? ` (retry-after: ${retry}s)` : "";
-    throw new Error(`OpenAI ${res.status}${suffix}: ${detail.slice(0, 300)}`);
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const l = line.trim();
-      if (!l.startsWith("data:")) continue;
-      const data = l.slice(5).trim();
-      if (data === "[DONE]") return;
-      let json;
-      try {
-        json = JSON.parse(data);
-      } catch {
-        continue; /* keep-alive / partial line */
+  for await (const json of sseJson(res, "OpenAI")) {
+    switch (json.type) {
+      case "response.output_text.delta":
+        if (typeof json.delta === "string") yield { kind: "text", text: json.delta };
+        break;
+      case "response.reasoning_summary_text.delta":
+        if (typeof json.delta === "string") yield { kind: "thinking", text: json.delta };
+        break;
+      // A finished image_generation tool call carries the whole image (base64) in `result`.
+      case "response.output_item.done": {
+        const it = json.item;
+        if (it?.type === "image_generation_call" && typeof it.result === "string")
+          yield { kind: "image", dataUrl: `data:image/${it.output_format || "png"};base64,${it.result}` };
+        break;
       }
-      switch (json.type) {
-        case "response.output_text.delta":
-          if (typeof json.delta === "string") yield { kind: "text", text: json.delta };
-          break;
-        case "response.reasoning_summary_text.delta":
-          if (typeof json.delta === "string") yield { kind: "thinking", text: json.delta };
-          break;
-        // A finished image_generation tool call carries the whole image (base64) in `result`.
-        case "response.output_item.done": {
-          const it = json.item;
-          if (it?.type === "image_generation_call" && typeof it.result === "string")
-            yield { kind: "image", dataUrl: `data:image/${it.output_format || "png"};base64,${it.result}` };
-          break;
-        }
-        case "response.completed":
-        case "response.incomplete": {
-          // input_tokens already includes cached tokens — don't pass cacheRead or costOf double-counts.
-          const u = json.response?.usage;
-          if (u)
-            yield { kind: "usage", inputTokens: u.input_tokens ?? 0, outputTokens: u.output_tokens ?? 0, reasoningTokens: u.output_tokens_details?.reasoning_tokens, metered: true };
-          const r: string | undefined = json.response?.incomplete_details?.reason;
-          if (r) yield { kind: "stop", reason: r };
-          return;
-        }
-        case "response.failed":
-        case "error":
-          throw new Error(json.response?.error?.message ?? json.message ?? "OpenAI response failed");
+      case "response.completed":
+      case "response.incomplete": {
+        // input_tokens already includes cached tokens — don't pass cacheRead or costOf double-counts.
+        const u = json.response?.usage;
+        if (u)
+          yield { kind: "usage", inputTokens: u.input_tokens ?? 0, outputTokens: u.output_tokens ?? 0, reasoningTokens: u.output_tokens_details?.reasoning_tokens, metered: true };
+        const r: string | undefined = json.response?.incomplete_details?.reason;
+        if (r) yield { kind: "stop", reason: r };
+        return;
       }
+      case "response.failed":
+      case "error":
+        throw new Error(json.response?.error?.message ?? json.message ?? "OpenAI response failed");
     }
   }
 }

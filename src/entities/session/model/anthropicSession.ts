@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { clearModelCache } from "@/shared/lib/modelCache";
 import { secretGet, secretSet, secretDelete } from "@/shared/api/secrets";
+import { readOAuthMeta, oauthPresent, oauthExpiringSoon, type OAuthPresenceMeta } from "@/entities/session/model/oauthShared";
 
 // Public OAuth client (Claude Code / `claude setup-token`) — shared with the connect feature.
 export const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -29,19 +30,7 @@ export interface TokenResponse {
   expires_in?: number;
 }
 
-interface OAuthMeta {
-  expiresAt?: number;
-  hasRefresh: boolean;
-}
-
-function readMeta(): OAuthMeta | null {
-  try {
-    const raw = localStorage.getItem(META_KEY);
-    return raw ? (JSON.parse(raw) as OAuthMeta) : null;
-  } catch {
-    return null;
-  }
-}
+const readMeta = () => readOAuthMeta<OAuthPresenceMeta>(META_KEY);
 
 async function read(): Promise<OAuthToken | null> {
   const accessToken = await secretGet(ACCESS_KEY);
@@ -87,11 +76,7 @@ export async function saveAnthropicToken(data: TokenResponse): Promise<void> {
 
 // Sync presence from non-secret meta: usable if it has a refresh token or isn't expired.
 export function hasAnthropicOAuth(): boolean {
-  const meta = readMeta();
-  if (!meta) return false;
-  if (meta.hasRefresh) return true;
-  if (meta.expiresAt === undefined) return true;
-  return Date.now() < meta.expiresAt;
+  return oauthPresent(readMeta());
 }
 
 export async function disconnectAnthropicOAuth(): Promise<void> {
@@ -117,8 +102,7 @@ async function refresh(token: OAuthToken): Promise<OAuthToken | null> {
 export async function getAnthropicAccessToken(): Promise<string | null> {
   const token = await read();
   if (!token) return null;
-  const expiringSoon = token.expiresAt !== undefined && Date.now() + 60_000 >= token.expiresAt;
-  if (expiringSoon) {
+  if (oauthExpiringSoon(token.expiresAt)) {
     const refreshed = await refresh(token);
     if (!refreshed) {
       await write(null); // refresh failed → drop so UI flips to disconnected

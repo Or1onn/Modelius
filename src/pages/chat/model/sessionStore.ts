@@ -47,7 +47,6 @@ export interface SessionView {
   loading: boolean; // saved body still being fetched — suppress the new-chat hero
   customPrompt: string; // per-chat persona; "" = inherit the global custom instructions
   summary: string; // compacted brief of old turns (for the context-fill indicator)
-  covered: number; // leading messages folded into `summary`
   siblings: Message[][]; // inactive alternative threads (branching)
 }
 
@@ -96,7 +95,6 @@ function rebuildView(s: Session): void {
     loading: s.loading,
     customPrompt: s.customPrompt,
     summary: s.summary,
-    covered: s.covered,
     siblings: s.siblings,
   };
 }
@@ -240,6 +238,40 @@ function setPhase(s: Session, phase: Phase): void {
 
 // ---- Orchestration ----
 
+// Thread messages → API messages (text + image payloads).
+const toChatMsgs = (msgs: Message[]): ChatMsg[] =>
+  msgs.map((m) => ({ role: m.role, content: m.text, images: m.images?.map((im) => ({ mime: im.mime, data: im.data })) }));
+
+// System prompt: custom instructions first (per-chat persona overrides the global setting),
+// then long-term memory, then the per-chat summary (and optionally a code appendix).
+function buildSystemPrompt(s: Session, summary: string, appendix = ""): string {
+  const custom = s.customPrompt.trim() || getCustomInstructions().trim();
+  const mem = memoryBlock();
+  return (
+    SYSTEM_PROMPT +
+    (custom ? `\n\n${custom}` : "") +
+    (mem ? `\n\nWhat you remember about the user:\n${mem}` : "") +
+    (summary ? `\n\nSummary of earlier conversation:\n${summary}` : "") +
+    appendix
+  );
+}
+
+// "auto" effort tracks the routed difficulty; explicit levels pass through.
+const resolveAutoEffort = (effort: EffortLevel | "auto", difficulty: number | undefined): EffortLevel =>
+  effort === "auto" ? effortForDifficulty(difficulty ?? 0) : effort;
+
+// Streaming patch fields shared by every per-delta update and finalize path.
+const streamFields = (acc: string, reason: string, genImgs: string[]) => ({
+  shown: acc,
+  reasoning: reason || undefined,
+  genImages: genImgs.length ? genImgs : undefined,
+});
+const finalizeFields = (acc: string, reason: string, genImgs: string[]) => ({
+  ...streamFields(acc, reason, genImgs),
+  text: acc,
+  streaming: false,
+});
+
 // Name the model that actually answered, not the routed pick (pickBackend may run an
 // OpenAI route on a ChatGPT account or fall back). Override only when they diverge.
 function backendBadge(backend: Backend, decision: Decision): { label: string; provider: string } | undefined {
@@ -338,8 +370,7 @@ async function dispatch(s: Session, p: SendParams, history: Message[], appendUse
 
   // Name the model that actually answered (pickBackend may diverge from the routed pick).
   const manual = modelSel ? { label: modelSel.label, provider: modelSel.provider } : backendBadge(backend, decision);
-  // "auto" effort tracks the routed difficulty; explicit levels pass through.
-  const eff = effort === "auto" ? effortForDifficulty(decision.classification.difficulty ?? 0) : effort;
+  const eff = resolveAutoEffort(effort, decision.classification.difficulty);
   void realSend(s, decision, history, backend, manual, thinking, eff, fullText, imgs, !!modelSel, web);
 }
 
@@ -390,20 +421,11 @@ async function continueSend(s: Session, p: Omit<SendParams, "fullText" | "images
   }
   const backend = p.modelSel ? p.modelSel.backend : pickBackend(decision);
   if (backend.kind === "none") return;
-  const eff = p.effort === "auto" ? effortForDifficulty(decision.classification?.difficulty ?? 0) : p.effort;
+  const eff = resolveAutoEffort(p.effort, decision.classification?.difficulty);
 
   // Context = everything up to and including the partial assistant (its text becomes the prefill).
-  const recent: ChatMsg[] = s.messages
-    .slice(s.covered, idx + 1)
-    .map((m) => ({ role: m.role, content: m.text, images: m.images?.map((im) => ({ mime: im.mime, data: im.data })) }));
-  const custom = s.customPrompt.trim() || getCustomInstructions().trim();
-  const mem = memoryBlock();
-  const sysContent =
-    SYSTEM_PROMPT +
-    (custom ? `\n\n${custom}` : "") +
-    (mem ? `\n\nWhat you remember about the user:\n${mem}` : "") +
-    (s.summary ? `\n\nSummary of earlier conversation:\n${s.summary}` : "");
-  const apiMessages: ChatMsg[] = [{ role: "system", content: sysContent }, ...recent];
+  const recent = toChatMsgs(s.messages.slice(s.covered, idx + 1));
+  const apiMessages: ChatMsg[] = [{ role: "system", content: buildSystemPrompt(s, s.summary) }, ...recent];
 
   const controller = new AbortController();
   s.abort = controller;
@@ -414,7 +436,7 @@ async function continueSend(s: Session, p: Omit<SendParams, "fullText" | "images
   const genImgs = [...(last.genImages ?? [])];
   let usage: Extract<Delta, { kind: "usage" }> | undefined;
   patchAt(s, idx, { streaming: true, shown: acc, truncated: undefined });
-  const update = () => patchAt(s, idx, { shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined });
+  const update = () => patchAt(s, idx, streamFields(acc, reason, genImgs));
 
   try {
     for await (const delta of streamLLM(backend, apiMessages, p.thinking, eff, p.web, controller.signal)) {
@@ -426,7 +448,7 @@ async function continueSend(s: Session, p: Omit<SendParams, "fullText" | "images
       update();
     }
     if (controller.signal.aborted) {
-      patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false, truncated: true });
+      patchAt(s, idx, { ...finalizeFields(acc, reason, genImgs), truncated: true });
       return;
     }
     // Fold the continuation's output tokens into the existing usage (input was billed already).
@@ -434,11 +456,11 @@ async function continueSend(s: Session, p: Omit<SendParams, "fullText" | "images
     const u = usage
       ? { inputTokens: prev?.inputTokens ?? usage.inputTokens, outputTokens: (prev?.outputTokens ?? 0) + usage.outputTokens, cacheRead: prev?.cacheRead, cacheWrite: prev?.cacheWrite, reasoningTokens: prev?.reasoningTokens }
       : prev;
-    patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false, usage: u, truncated: isMaxTokens(stopReason) || undefined });
+    patchAt(s, idx, { ...finalizeFields(acc, reason, genImgs), usage: u, truncated: isMaxTokens(stopReason) || undefined });
     if (acc.trim()) void extractAndSave(acc);
   } catch {
     // Keep the partial and leave "Continue" available; don't clobber with a ⚠️ error bubble.
-    patchAt(s, idx, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false, truncated: true });
+    patchAt(s, idx, { ...finalizeFields(acc, reason, genImgs), truncated: true });
   } finally {
     if (s.abort === controller) s.abort = null;
     setPhase(s, "idle");
@@ -524,9 +546,7 @@ async function realSend(
 
   // Re-inject verbatim only artifacts the summary references and not already in the recent
   // window. Bounded by a token cap; dropped (oldest-first) ids logged.
-  const recent: ChatMsg[] = history
-    .slice(cov)
-    .map((m) => ({ role: m.role, content: m.text, images: m.images?.map((im) => ({ mime: im.mime, data: im.data })) }));
+  const recent = toChatMsgs(history.slice(cov));
   const inRecent = new Set(recent.flatMap((m) => largeBlockIds(m.content)));
   const wanted = [...new Set(referencedIds(sumText))].filter((id) => !inRecent.has(id));
   let codeBudget = win * 0.3;
@@ -547,16 +567,7 @@ async function realSend(
     ? `\n\nReferenced code artifacts (verbatim, do not summarize):\n${blocks.join("\n\n")}`
     : "";
 
-  // Custom instructions first (per-chat persona overrides the global setting), then long-term
-  // memory, then the per-chat summary.
-  const custom = s.customPrompt.trim() || getCustomInstructions().trim();
-  const mem = memoryBlock();
-  const sysContent =
-    SYSTEM_PROMPT +
-    (custom ? `\n\n${custom}` : "") +
-    (mem ? `\n\nWhat you remember about the user:\n${mem}` : "") +
-    (sumText ? `\n\nSummary of earlier conversation:\n${sumText}` : "") +
-    codeAppendix;
+  const sysContent = buildSystemPrompt(s, sumText, codeAppendix);
   const userMsg: ChatMsg = {
     role: "user",
     content: fullText,
@@ -587,7 +598,7 @@ async function realSend(
       modelProvider: manual?.provider,
     });
   };
-  const update = () => patchLastStreaming(s, { shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined });
+  const update = () => patchLastStreaming(s, streamFields(acc, reason, genImgs));
 
   try {
     for await (const delta of streamLLM(backend, apiMessages, reasoningOn, effortLevel, web, controller.signal)) {
@@ -601,7 +612,7 @@ async function realSend(
     }
     // User stopped: keep whatever streamed, skip usage/cost/memory for this partial turn.
     if (controller.signal.aborted) {
-      if (started) patchLastStreaming(s, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false });
+      if (started) patchLastStreaming(s, finalizeFields(acc, reason, genImgs));
       return;
     }
     if (!started) begin(); // empty completion — still show a turn
@@ -619,7 +630,7 @@ async function realSend(
       : undefined;
     const priceSource = cost != null ? (exact != null ? "live" : priceSource_(backend.model) ?? undefined) : undefined;
     const asstIndex = s.messages.length - 1; // this turn's assistant message; stable (append-only)
-    patchAt(s, asstIndex, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false, usage: u, latencyMs, cost, priceSource, truncated: isMaxTokens(stopReason) || undefined });
+    patchAt(s, asstIndex, { ...finalizeFields(acc, reason, genImgs), usage: u, latencyMs, cost, priceSource, truncated: isMaxTokens(stopReason) || undefined });
     if (acc.trim()) void extractAndSave(acc); // persist large code the model returned
     // Reconcile durable user facts off the critical path, throttled to every MEMORY_EVERY-th
     // turn (1st, 4th, …) to cut cost/noise. Ops add/update/delete against known facts; tag the
@@ -635,7 +646,7 @@ async function realSend(
   } catch (err) {
     // Abort surfaces as a fetch error on the browser paths — finalize the partial, not an error.
     if (controller.signal.aborted) {
-      if (started) patchLastStreaming(s, { text: acc, shown: acc, reasoning: reason || undefined, genImages: genImgs.length ? genImgs : undefined, streaming: false });
+      if (started) patchLastStreaming(s, finalizeFields(acc, reason, genImgs));
     } else {
       const msg = `⚠️ ${humanizeError(err instanceof Error ? err.message : "Request failed")}`;
       if (!started) begin();

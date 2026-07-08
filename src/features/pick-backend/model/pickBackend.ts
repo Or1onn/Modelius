@@ -98,7 +98,7 @@ function ollamaTier(id: string): ModelTier {
 }
 
 // Installed Ollama models as routable registry entries (free, local, tier → weights). Sync (cache peek).
-export function ollamaRegistryModels(): Model[] {
+function ollamaRegistryModels(): Model[] {
   return (peekOllamaModels() ?? []).map((m) => ({
     id: m.id,
     name: m.name,
@@ -209,36 +209,34 @@ export const modelAllowsWeb = (m: Model): boolean => {
   return false;
 };
 
+// Picker-option builders shared by listAvailableModels/peekAvailableModels.
+const codexOptions = (): ModelOption[] =>
+  CODEX_MODELS.map((m) => ({ key: `chatgpt:${m.id}`, label: m.name, provider: "openai", backend: { kind: "chatgpt", model: m.id, label: m.name } }));
+const openaiOptions = (models: RemoteModel[]): ModelOption[] =>
+  models.map((m) => ({ key: `openai:${m.id}`, label: m.name, provider: "openai", backend: { kind: "openai", model: m.id, label: m.name } }));
+const anthropicOptions = (models: { id: string; name: string }[]): ModelOption[] =>
+  models.map((m) => ({ key: `anthropic:${m.id}`, label: m.name, provider: "anthropic", backend: { kind: "anthropic", model: m.id, label: m.name } }));
+// Current-gen ids for a Claude account when the live list is unavailable/cold.
+const claudeFallbackModels = (): { id: string; name: string }[] =>
+  (["opus", "sonnet", "haiku"] as ClaudeFamily[]).map((f) => ({
+    id: claudeIdByFamily[f],
+    name: `Claude ${f[0].toUpperCase()}${f.slice(1)}`,
+  }));
+
 // User-pickable models by connection. ChatGPT account → curated Codex models (no
 // list endpoint); else a live list (sub via /v1/models, key via listModels).
 export async function listAvailableModels(): Promise<ModelOption[]> {
   const out: ModelOption[] = [];
 
-  if (hasOpenAIOAuth()) {
-    for (const m of CODEX_MODELS)
-      out.push({ key: `chatgpt:${m.id}`, label: m.name, provider: "openai", backend: { kind: "chatgpt", model: m.id, label: m.name } });
-  } else if (hasKey("openai")) {
-    const models = await listModels("openai").catch(() => [] as RemoteModel[]);
-    for (const m of models)
-      out.push({ key: `openai:${m.id}`, label: m.name, provider: "openai", backend: { kind: "openai", model: m.id, label: m.name } });
-  }
+  if (hasOpenAIOAuth()) out.push(...codexOptions());
+  else if (hasKey("openai")) out.push(...openaiOptions(await listModels("openai").catch(() => [] as RemoteModel[])));
 
   // Prefer OAuth over key — matches streamClaude.
   if (hasAnthropicOAuth()) {
     const live = currentClaudeModels(await fetchClaudeSubscriptionModels().catch(() => [] as RemoteModel[]));
-    // Fall back to current-gen ids if the list call is unavailable.
-    const models = live.length
-      ? live
-      : (["opus", "sonnet", "haiku"] as ClaudeFamily[]).map((f) => ({
-          id: claudeIdByFamily[f],
-          name: `Claude ${f[0].toUpperCase()}${f.slice(1)}`,
-        }));
-    for (const m of models)
-      out.push({ key: `anthropic:${m.id}`, label: m.name, provider: "anthropic", backend: { kind: "anthropic", model: m.id, label: m.name } });
+    out.push(...anthropicOptions(live.length ? live : claudeFallbackModels()));
   } else if (hasKey("anthropic")) {
-    const models = await listModels("anthropic").catch(() => [] as RemoteModel[]);
-    for (const m of models)
-      out.push({ key: `anthropic:${m.id}`, label: m.name, provider: "anthropic", backend: { kind: "anthropic", model: m.id, label: m.name } });
+    out.push(...anthropicOptions(await listModels("anthropic").catch(() => [] as RemoteModel[])));
   }
 
   for (const pid of KEY_PROVIDER_IDS)
@@ -253,27 +251,14 @@ export async function listAvailableModels(): Promise<ModelOption[]> {
 export function peekAvailableModels(): ModelOption[] {
   const out: ModelOption[] = [];
 
-  if (hasOpenAIOAuth()) {
-    for (const m of CODEX_MODELS)
-      out.push({ key: `chatgpt:${m.id}`, label: m.name, provider: "openai", backend: { kind: "chatgpt", model: m.id, label: m.name } });
-  } else if (hasKey("openai")) {
-    for (const m of peekModels("openai") ?? [])
-      out.push({ key: `openai:${m.id}`, label: m.name, provider: "openai", backend: { kind: "openai", model: m.id, label: m.name } });
-  }
+  if (hasOpenAIOAuth()) out.push(...codexOptions());
+  else if (hasKey("openai")) out.push(...openaiOptions(peekModels("openai") ?? []));
 
   if (hasAnthropicOAuth()) {
     const live = peekClaudeAccountModels();
-    const models = live?.length
-      ? live
-      : (["opus", "sonnet", "haiku"] as ClaudeFamily[]).map((f) => ({
-          id: claudeIdByFamily[f],
-          name: `Claude ${f[0].toUpperCase()}${f.slice(1)}`,
-        }));
-    for (const m of models)
-      out.push({ key: `anthropic:${m.id}`, label: m.name, provider: "anthropic", backend: { kind: "anthropic", model: m.id, label: m.name } });
+    out.push(...anthropicOptions(live?.length ? live : claudeFallbackModels()));
   } else if (hasKey("anthropic")) {
-    for (const m of peekModels("anthropic") ?? [])
-      out.push({ key: `anthropic:${m.id}`, label: m.name, provider: "anthropic", backend: { kind: "anthropic", model: m.id, label: m.name } });
+    out.push(...anthropicOptions(peekModels("anthropic") ?? []));
   }
 
   for (const pid of KEY_PROVIDER_IDS)

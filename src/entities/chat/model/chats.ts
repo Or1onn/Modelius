@@ -22,96 +22,121 @@ export interface ChatIndexEntry {
   cwd?: string; // Code mode only: project folder — the sidebar groups sessions by it
 }
 
-let indexCache: ChatIndexEntry[] = [];
-let idxHydrated = false;
-let idxHydrating: Promise<void> | null = null;
+// Index-store factory: encrypted localStorage blob + in-RAM cache, reactive via a window event.
+// Also instantiated by codeChats.ts (Code mode's index — same behavior, separate namespace).
+export function makeChatIndexStore(indexKey: string, evt: string, deleteBody: (id: string) => Promise<void>) {
+  let cache: ChatIndexEntry[] = [];
+  let sorted: ChatIndexEntry[] | null = null; // memoized getAll() result; reset on every write
+  let hydrated = false;
+  let hydrating: Promise<void> | null = null;
+  // A title set by the user via rename is sticky: it survives index rebuilds from session
+  // persistence (which would otherwise re-derive the title from the chat content).
+  const renamed = new Set<string>();
 
-// Decrypt + load the index into RAM once. Idempotent. Tolerant of legacy plaintext.
-export function hydrateChatIndex(): Promise<void> {
-  if (idxHydrated) return Promise.resolve();
-  if (!idxHydrating)
-    idxHydrating = (async () => {
-      try {
-        const raw = localStorage.getItem(INDEX_KEY);
-        if (raw) {
-          const arr = JSON.parse(await vaultDecrypt(raw));
-          if (Array.isArray(arr)) indexCache = (arr as ChatIndexEntry[]).filter((c) => c && typeof c.id === "string");
+  // Decrypt + load the index into RAM once. Idempotent. Tolerant of legacy plaintext.
+  function hydrate(): Promise<void> {
+    if (hydrated) return Promise.resolve();
+    if (!hydrating)
+      hydrating = (async () => {
+        try {
+          const raw = localStorage.getItem(indexKey);
+          if (raw) {
+            const arr = JSON.parse(await vaultDecrypt(raw));
+            if (Array.isArray(arr)) {
+              cache = (arr as ChatIndexEntry[]).filter((c) => c && typeof c.id === "string");
+              sorted = null;
+            }
+          }
+        } catch {
+          /* keep empty */
         }
+        hydrated = true;
+        window.dispatchEvent(new Event(evt));
+      })();
+    return hydrating;
+  }
+
+  function getAll(): ChatIndexEntry[] {
+    if (!sorted) sorted = cache.slice().sort((a, b) => b.updatedAt - a.updatedAt);
+    return sorted;
+  }
+
+  function save(list: ChatIndexEntry[]): void {
+    cache = list;
+    sorted = null;
+    window.dispatchEvent(new Event(evt));
+    void (async () => {
+      try {
+        localStorage.setItem(indexKey, await vaultEncrypt(JSON.stringify(list)));
       } catch {
-        /* keep empty */
+        /* ignore */
       }
-      idxHydrated = true;
-      window.dispatchEvent(new Event(EVT));
     })();
-  return idxHydrating;
+  }
+
+  function upsert(entry: ChatIndexEntry): void {
+    const list = getAll().slice();
+    const i = list.findIndex((c) => c.id === entry.id);
+    if (i >= 0) {
+      // Carry over user-set state that session persistence doesn't know about.
+      const prev = list[i];
+      list[i] = {
+        ...entry,
+        pinned: entry.pinned ?? prev.pinned,
+        title: renamed.has(entry.id) ? prev.title : entry.title,
+      };
+    } else list.push(entry);
+    save(list);
+  }
+
+  function del(id: string): void {
+    renamed.delete(id);
+    save(getAll().filter((c) => c.id !== id));
+    void deleteBody(id);
+  }
+
+  // Pin/unpin a chat (floats it into the Pinned section).
+  function pin(id: string, pinned: boolean): void {
+    save(getAll().map((c) => (c.id === id ? { ...c, pinned } : c)));
+  }
+
+  // Rename a chat; the new title becomes sticky against later content-derived rebuilds.
+  function rename(id: string, title: string): void {
+    const t = title.trim();
+    if (!t) return;
+    renamed.add(id);
+    save(getAll().map((c) => (c.id === id ? { ...c, title: t } : c)));
+  }
+
+  // Subscribe to index changes (same-tab: custom event; cross-tab: storage).
+  function useSubscribe(): void {
+    const [, force] = useReducer((x: number) => x + 1, 0);
+    useEffect(() => {
+      const h = () => force();
+      window.addEventListener(evt, h);
+      window.addEventListener("storage", h);
+      return () => {
+        window.removeEventListener(evt, h);
+        window.removeEventListener("storage", h);
+      };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+  }
+
+  return { hydrate, getAll, upsert, del, pin, rename, useSubscribe };
 }
 
-export function getChats(): ChatIndexEntry[] {
-  return indexCache.slice().sort((a, b) => b.updatedAt - a.updatedAt);
-}
+const store = makeChatIndexStore(INDEX_KEY, EVT, (id) => deleteChatBody(id));
 
-// A title set by the user via rename is sticky: it survives index rebuilds from session
-// persistence (which would otherwise re-derive the title from the chat content).
-const renamed = new Set<string>();
+export const hydrateChatIndex = store.hydrate;
+export const getChats = store.getAll;
+export const upsertChat = store.upsert;
+export const deleteChat = store.del;
+export const pinChat = store.pin;
+export const renameChat = store.rename;
 
-function saveIndex(list: ChatIndexEntry[]): void {
-  indexCache = list;
-  window.dispatchEvent(new Event(EVT));
-  void (async () => {
-    try {
-      localStorage.setItem(INDEX_KEY, await vaultEncrypt(JSON.stringify(list)));
-    } catch {
-      /* ignore */
-    }
-  })();
-}
-
-export function upsertChat(entry: ChatIndexEntry): void {
-  const list = getChats();
-  const i = list.findIndex((c) => c.id === entry.id);
-  if (i >= 0) {
-    // Carry over user-set state that session persistence doesn't know about.
-    const prev = list[i];
-    list[i] = {
-      ...entry,
-      pinned: entry.pinned ?? prev.pinned,
-      title: renamed.has(entry.id) ? prev.title : entry.title,
-    };
-  } else list.push(entry);
-  saveIndex(list);
-}
-
-export function deleteChat(id: string): void {
-  renamed.delete(id);
-  saveIndex(getChats().filter((c) => c.id !== id));
-  void deleteChatBody(id);
-}
-
-// Pin/unpin a chat (floats it into the Pinned section).
-export function pinChat(id: string, pinned: boolean): void {
-  saveIndex(getChats().map((c) => (c.id === id ? { ...c, pinned } : c)));
-}
-
-// Rename a chat; the new title becomes sticky against later content-derived rebuilds.
-export function renameChat(id: string, title: string): void {
-  const t = title.trim();
-  if (!t) return;
-  renamed.add(id);
-  saveIndex(getChats().map((c) => (c.id === id ? { ...c, title: t } : c)));
-}
-
-// Subscribe to index changes (same-tab: custom event; cross-tab: storage).
 export function useChatStore() {
-  const [, force] = useReducer((x: number) => x + 1, 0);
-  useEffect(() => {
-    const h = () => force();
-    window.addEventListener(EVT, h);
-    window.addEventListener("storage", h);
-    return () => {
-      window.removeEventListener(EVT, h);
-      window.removeEventListener("storage", h);
-    };
-  }, []);
+  store.useSubscribe();
   return { getChats, upsertChat, deleteChat, pinChat, renameChat };
 }
 
@@ -139,6 +164,74 @@ export async function db() {
   return dbPromise;
 }
 
+// Body-store factory: encrypted rows in the shared `chats` SQLite table (localStorage fallback,
+// keyed by `prefix`). Also instantiated by codeChats.ts. load() returns parsed-but-unvalidated
+// JSON — each caller validates its own body shape.
+export function makeBodyStore(prefix: string) {
+  async function save(id: string, value: unknown): Promise<void> {
+    const data = await vaultEncrypt(JSON.stringify(value));
+    if (isTauri()) {
+      try {
+        const d = await db();
+        await d.execute(
+          "INSERT INTO chats (id, data, updated_at) VALUES ($1, $2, $3) " +
+            "ON CONFLICT(id) DO UPDATE SET data = $2, updated_at = $3",
+          [id, data, Date.now()]
+        );
+        return;
+      } catch {
+        /* fall through to localStorage */
+      }
+    }
+    try {
+      localStorage.setItem(prefix + id, data);
+    } catch {
+      /* quota/full — drop silently */
+    }
+  }
+
+  async function load(id: string): Promise<any | null> {
+    let raw: string | null = null;
+    if (isTauri()) {
+      try {
+        const d = await db();
+        const rows = await d.select<{ data: string }[]>("SELECT data FROM chats WHERE id = $1", [id]);
+        raw = rows[0]?.data ?? null;
+      } catch {
+        raw = null;
+      }
+    }
+    if (raw === null) raw = localStorage.getItem(prefix + id); // browser / fallback-saved body
+    if (!raw) return null;
+    try {
+      return JSON.parse(await vaultDecrypt(raw));
+    } catch {
+      return null;
+    }
+  }
+
+  async function del(id: string): Promise<void> {
+    if (isTauri()) {
+      try {
+        const d = await db();
+        await d.execute("DELETE FROM chats WHERE id = $1", [id]);
+        return;
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      localStorage.removeItem(prefix + id);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return { save, load, del };
+}
+
+const bodyStore = makeBodyStore(BODY_PREFIX);
+
 // Drop transient streaming state before persisting (reload renders from `text`).
 // Fold a mid-stream turn's `shown` into `text`, else flush-on-switch saves an empty reply.
 function sanitize(messages: Message[]): Message[] {
@@ -147,65 +240,16 @@ function sanitize(messages: Message[]): Message[] {
 
 export async function saveChatBody(id: string, body: ChatBody): Promise<void> {
   const siblings = body.siblings?.length ? body.siblings.map(sanitize) : undefined;
-  const data = await vaultEncrypt(JSON.stringify({ ...body, messages: sanitize(body.messages), siblings }));
-  if (isTauri()) {
-    try {
-      const d = await db();
-      await d.execute(
-        "INSERT INTO chats (id, data, updated_at) VALUES ($1, $2, $3) " +
-          "ON CONFLICT(id) DO UPDATE SET data = $2, updated_at = $3",
-        [id, data, Date.now()]
-      );
-      return;
-    } catch {
-      /* fall through to localStorage */
-    }
-  }
-  try {
-    localStorage.setItem(BODY_PREFIX + id, data);
-  } catch {
-    /* quota/full — drop silently */
-  }
+  await bodyStore.save(id, { ...body, messages: sanitize(body.messages), siblings });
 }
 
 export async function loadChatBody(id: string): Promise<ChatBody | null> {
-  let raw: string | null = null;
-  if (isTauri()) {
-    try {
-      const d = await db();
-      const rows = await d.select<{ data: string }[]>("SELECT data FROM chats WHERE id = $1", [id]);
-      raw = rows[0]?.data ?? null;
-    } catch {
-      raw = null;
-    }
-  }
-  if (raw === null) raw = localStorage.getItem(BODY_PREFIX + id); // browser / fallback-saved body
-  if (!raw) return null;
-  try {
-    const b = JSON.parse(await vaultDecrypt(raw));
-    if (!Array.isArray(b?.messages)) return null;
-    return { messages: b.messages, summary: b.summary ?? "", covered: b.covered ?? 0, title: b.title ?? "", customPrompt: b.customPrompt ?? "", siblings: Array.isArray(b.siblings) ? b.siblings : undefined };
-  } catch {
-    return null;
-  }
+  const b = await bodyStore.load(id);
+  if (!Array.isArray(b?.messages)) return null;
+  return { messages: b.messages, summary: b.summary ?? "", covered: b.covered ?? 0, title: b.title ?? "", customPrompt: b.customPrompt ?? "", siblings: Array.isArray(b.siblings) ? b.siblings : undefined };
 }
 
-export async function deleteChatBody(id: string): Promise<void> {
-  if (isTauri()) {
-    try {
-      const d = await db();
-      await d.execute("DELETE FROM chats WHERE id = $1", [id]);
-      return;
-    } catch {
-      /* ignore */
-    }
-  }
-  try {
-    localStorage.removeItem(BODY_PREFIX + id);
-  } catch {
-    /* ignore */
-  }
-}
+export const deleteChatBody = bodyStore.del;
 
 // Build an index entry. Title: LLM-generated if available, else "New chat" until `settled`,
 // then the first user turn. Preview from first user turn, modelId from last assistant.
