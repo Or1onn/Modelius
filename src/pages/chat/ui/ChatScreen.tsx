@@ -9,6 +9,8 @@ import { PROVIDERS, type Message, type PolicyId, type ImageRef } from "@/entitie
 import type { ModelOption } from "@/entities/model/model/backend";
 import { anthropicEffortTier, ctxForBackend, EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
 import { estimateTokens, ctxTokens, fmtCompact } from "@/shared/lib/tokens";
+import { useOutsideClick } from "@/shared/lib/useOutsideClick";
+import { useAutosize } from "@/shared/lib/useAutosize";
 import { listAvailableModels, peekAvailableModels, optionAllowsImages, optionAllowsWeb } from "@/features/pick-backend/model/pickBackend";
 import { supportsReasoning } from "@/entities/model/lib/pricingSource";
 import { makeArtifact, rememberArtifactTitle, isLargePaste, wrapFence, type Artifact } from "@/entities/artifact/model/artifacts";
@@ -64,17 +66,10 @@ function PersonaButton({ value, onSave }: { value: string; onSave: (text: string
   }, [value, open]);
 
   // Outside-click autosaves and closes.
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: globalThis.MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
-        onSave(draft.trim());
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [open, draft, onSave]);
+  useOutsideClick(wrapRef, open, () => {
+    onSave(draft.trim());
+    setOpen(false);
+  });
 
   return (
     <div className="persona-wrap" ref={wrapRef}>
@@ -186,25 +181,9 @@ export function ChatScreen({
     };
   }, [modelMenuOpen]);
 
-  // Close the model menu on an outside click.
-  useEffect(() => {
-    if (!modelMenuOpen) return;
-    const onDown = (e: globalThis.MouseEvent) => {
-      if (modelPickRef.current && !modelPickRef.current.contains(e.target as Node)) setModelMenuOpen(false);
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [modelMenuOpen]);
-
-  // Close the composer "+" menu on an outside click.
-  useEffect(() => {
-    if (!addMenuOpen) return;
-    const onDown = (e: globalThis.MouseEvent) => {
-      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node)) setAddMenuOpen(false);
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [addMenuOpen]);
+  // Close the model menu / composer "+" menu on an outside click.
+  useOutsideClick(modelPickRef, modelMenuOpen, () => setModelMenuOpen(false));
+  useOutsideClick(addMenuRef, addMenuOpen, () => setAddMenuOpen(false));
 
   // Collapse the effort flyout and clear the search whenever the model menu closes.
   useEffect(() => {
@@ -238,10 +217,13 @@ export function ChatScreen({
     o.backend.kind === "chatgpt" ? "Codex" : PROVIDERS[o.provider]?.name ?? o.provider;
 
   // Filter the live model list by the search query (matches model name, provider id, and group name).
+  // Memoized — large lists (OpenRouter: 300+) would otherwise re-filter on every unrelated render.
   const q = modelQuery.trim().toLowerCase();
-  const filteredOptions = q
-    ? options.filter((o) => (o.label + " " + o.provider + " " + groupName(o)).toLowerCase().includes(q))
-    : options;
+  const filteredOptions = useMemo(
+    () => (q ? options.filter((o) => (o.label + " " + o.provider + " " + groupName(o)).toLowerCase().includes(q)) : options),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [options, q]
+  );
   const autoMatches = !q || "auto routed by policy".includes(q);
 
   // On open with no search, page far enough to include the selected model and flag it for scroll-into-view;
@@ -266,12 +248,7 @@ export function ChatScreen({
     }
   };
 
-  function autosize() {
-    const ta = taRef.current;
-    if (!ta) return;
-    ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, 260) + "px";
-  }
+  const autosize = useAutosize(taRef, 260);
 
   // Restore the textarea height for a draft restored on mount/chat-switch.
   useEffect(autosize, [chatId]);

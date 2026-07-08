@@ -29,13 +29,27 @@ function norm(id: string): string {
   return id.toLowerCase().split("/").pop()!.replace(/[^a-z0-9]/g, "");
 }
 
+// Parsed-catalog memo: the accessors below run in hot paths (routing, render), so re-parsing the
+// multi-KB JSON per call is wasteful. Re-parses only when the stored string changes.
+let memoRaw: string | null = null;
+let memoAt = 0;
+let memoCatalog: Catalog | null = null;
+
 function read(): Catalog | null {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (!raw) return null;
-    const e = JSON.parse(raw) as { at: number; rates?: Record<string, Rate>; caps?: Record<string, boolean>; vis?: Record<string, boolean>; imgOut?: Record<string, boolean> };
-    // `rates`/`caps`/`vis`/`imgOut` absent → an older cache shape; treat as stale so it's refetched.
-    if (e.rates && e.caps && e.vis && e.imgOut && Date.now() - e.at < TTL) return { rates: e.rates, caps: e.caps, vis: e.vis, imgOut: e.imgOut };
+    if (raw !== memoRaw) {
+      memoRaw = raw;
+      memoCatalog = null;
+      const e = JSON.parse(raw) as { at: number; rates?: Record<string, Rate>; caps?: Record<string, boolean>; vis?: Record<string, boolean>; imgOut?: Record<string, boolean> };
+      // `rates`/`caps`/`vis`/`imgOut` absent → an older cache shape; treat as stale so it's refetched.
+      if (e.rates && e.caps && e.vis && e.imgOut) {
+        memoAt = e.at;
+        memoCatalog = { rates: e.rates, caps: e.caps, vis: e.vis, imgOut: e.imgOut };
+      }
+    }
+    if (memoCatalog && Date.now() - memoAt < TTL) return memoCatalog;
   } catch {
     /* ignore */
   }

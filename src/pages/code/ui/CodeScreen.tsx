@@ -5,6 +5,9 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Icon } from "@/shared/ui/Icon";
 import { Markdown } from "@/shared/lib/markdown";
+import { ctxTokens } from "@/shared/lib/tokens";
+import { useOutsideClick } from "@/shared/lib/useOutsideClick";
+import { useAutosize } from "@/shared/lib/useAutosize";
 import { MODEL_BY_ID } from "@/entities/model/model/registry";
 import { HARNESSES, HARNESS_BY_ID, PERMISSION_MODES, PERMISSION_LABEL, type NativeKind } from "@/entities/agent/model/harnesses";
 import { useHarnessStatuses, refreshHarnessStatuses, installHarness, cliLoggedIn } from "@/entities/agent/model/harnessStatus";
@@ -221,14 +224,7 @@ function Picker({ label, logo, items, onSelect, onOpen, down, btnClass, menuHead
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [open]);
+  useOutsideClick(ref, open, () => setOpen(false));
   return (
     <div className="cd-pick" ref={ref} style={{ position: "relative" }}>
       <button className={btnClass || "cd-model-pick"} onClick={() => { if (!open) onOpen?.(); setOpen((v) => !v); }} title={label}>
@@ -267,16 +263,6 @@ function Picker({ label, logo, items, onSelect, onOpen, down, btnClass, menuHead
   );
 }
 
-// Parse a registry ctx label ("200K" / "1M") into a token count for the fill ring.
-function ctxLimit(label: string | undefined): number {
-  if (!label) return 0;
-  const m = /([\d.]+)\s*([KM])?/i.exec(label);
-  if (!m) return 0;
-  const n = parseFloat(m[1]);
-  const mult = m[2]?.toUpperCase() === "M" ? 1e6 : m[2]?.toUpperCase() === "K" ? 1e3 : 1;
-  return Math.round(n * mult);
-}
-
 const fmtTokens = (n: number): string =>
   n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "K" : String(n);
 
@@ -285,14 +271,7 @@ const fmtTokens = (n: number): string =>
 function ContextRing({ tokens, limit, cost, modelName }: { tokens: number; limit: number; cost: number | null; modelName: string }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [open]);
+  useOutsideClick(ref, open, () => setOpen(false));
   const pct = limit > 0 ? Math.min(1, tokens / limit) : 0;
   const r = 6.5;
   const c = 2 * Math.PI * r;
@@ -377,12 +356,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     return () => { alive = false; };
   }, [cwd]);
 
-  function autosize() {
-    const ta = taRef.current;
-    if (!ta) return;
-    ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
-  }
+  const autosize = useAutosize(taRef, 200);
 
   function selectFolder(dir: string) {
     setCodeCwd(chatId, dir);
@@ -573,7 +547,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
               onSelect={selectBranch}
             />
           )}
-          <ContextRing tokens={contextTokens} limit={ctxLimit(registryModel?.ctx)} cost={cost} modelName={model.label} />
+          <ContextRing tokens={contextTokens} limit={registryModel?.ctx ? ctxTokens(registryModel.ctx) : 0} cost={cost} modelName={model.label} />
         </div>
       </div>
 

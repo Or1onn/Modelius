@@ -4,6 +4,7 @@
 // to onSelect. Reuses the .model-pick / .model-menu styles ChatScreen introduced.
 import { Fragment, useEffect, useRef, useState, type UIEvent } from "react";
 import { Icon } from "@/shared/ui/Icon";
+import { useOutsideClick } from "@/shared/lib/useOutsideClick";
 import { PROVIDERS } from "@/entities/model/model/registry";
 import { ProviderLogo } from "@/entities/model/ui/ProviderLogo";
 
@@ -50,14 +51,7 @@ export function ModelMenu({
   const wrapRef = useRef<HTMLDivElement>(null);
   const scrollPending = useRef(false);
 
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [open]);
+  useOutsideClick(wrapRef, open, () => setOpen(false));
 
   const q = query.trim().toLowerCase();
   const filtered = q

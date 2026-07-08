@@ -28,13 +28,21 @@ export async function cached<T>(key: string, fetcher: () => Promise<T>): Promise
 }
 
 // Synchronous read (no fetch): fresh cached value or null — init state without a loading flash.
+// Parsed entries are memoized per key (peek runs in render paths); re-parses only when the
+// stored string changes.
+const peekMemo = new Map<string, { raw: string; entry: Entry<unknown> }>();
+
 export function peek<T>(key: string): T | null {
   try {
     const raw = localStorage.getItem(PREFIX + key);
-    if (raw) {
-      const e = JSON.parse(raw) as Entry<T>;
-      if (Date.now() - e.at < TTL) return e.data;
+    if (!raw) return null;
+    let m = peekMemo.get(key);
+    if (!m || m.raw !== raw) {
+      m = { raw, entry: JSON.parse(raw) as Entry<unknown> };
+      peekMemo.set(key, m);
     }
+    const e = m.entry as Entry<T>;
+    if (Date.now() - e.at < TTL) return e.data;
   } catch {
     /* ignore */
   }

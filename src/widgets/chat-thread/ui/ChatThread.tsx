@@ -5,6 +5,7 @@ import { branchGroup } from "@/pages/chat/lib/branches";
 import { ModelBadge } from "@/entities/model/ui/ModelBadge";
 import { Markdown, segmentBody } from "@/shared/lib/markdown";
 import { fmtCompact } from "@/shared/lib/tokens";
+import { useAutosize } from "@/shared/lib/useAutosize";
 import { POLICIES, type PolicyId, type Message } from "@/entities/model/model/registry";
 import { isLargeBlock, isFileArtifact, makeArtifact, wrapFence, type Artifact } from "@/entities/artifact/model/artifacts";
 
@@ -109,12 +110,7 @@ function UserRow({
   const [draft, setDraft] = useState(msg.text);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
-  const autosize = () => {
-    const ta = taRef.current;
-    if (!ta) return;
-    ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, 320) + "px";
-  };
+  const autosize = useAutosize(taRef, 320);
   // On entering edit mode: focus, size to content, caret at end.
   useEffect(() => {
     if (!editing) return;
@@ -337,6 +333,20 @@ export function ChatThread({
   // Active + sibling threads, for the per-position branch navigator.
   const allThreads = useMemo(() => [...siblings, messages], [siblings, messages]);
 
+  // Branch groups per position, computed once per thread change — calling branchGroup per row
+  // would rescan every sibling thread for each message on every streaming update.
+  const branchGroups = useMemo(() => {
+    const map = new Map<number, ReturnType<typeof branchGroup>>();
+    if (!siblings.length) return map;
+    for (let i = 0; i < messages.length; i++) {
+      const g = branchGroup(allThreads, messages, i);
+      if (g) map.set(i, g);
+    }
+    return map;
+    // allThreads is rebuilt from siblings+messages, so it covers both.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allThreads]);
+
   return (
     <>
     <div
@@ -351,7 +361,7 @@ export function ChatThread({
     >
       <div className="thread-inner">
         {messages.map((msg, i) => {
-          const grp = onSwitchBranch && siblings.length ? branchGroup(allThreads, messages, i) : null;
+          const grp = onSwitchBranch ? branchGroups.get(i) ?? null : null;
           const nav = grp ? (
             <BranchNav
               n={grp.versions.length}
