@@ -70,7 +70,7 @@ export const artifactId = (code: string) => "code-" + hash8(code.trim());
 // Remembered file attachment (titleOf holds only real filenames) → always a card, any size.
 export const isFileArtifact = (code: string) => titleOf.has(artifactId(code));
 
-export const ARTIFACT_MIN_BYTES = 4096; // 4 KB
+const ARTIFACT_MIN_BYTES = 4096; // 4 KB
 const byteSize = (s: string) => new TextEncoder().encode(s).length;
 
 // Human-readable size for artifact cards (e.g. "834 B", "12 KB").

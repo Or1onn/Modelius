@@ -6,7 +6,7 @@ import { useCodeChatStore } from "@/entities/agent/model/codeChats";
 import { ChatGroup, groupHistory, groupByProject, type ScreenId } from "@/app/ui/ChatGroup";
 import { UpdateBanner } from "@/widgets/update-banner/ui/UpdateBanner";
 
-const NAV: { id: ScreenId; label: string; icon: string; beta?: boolean }[] = [
+const NAV: { id: ScreenId; label: string; icon: string }[] = [
   { id: "providers", label: "Providers", icon: "providers" },
   { id: "memory", label: "Memory", icon: "memory" },
   { id: "settings", label: "Settings", icon: "cog" },
@@ -137,7 +137,6 @@ export function Sidebar({
               <Icon name={n.icon} size={16} />
             </span>
             <span className="sb-row-label">{n.label}</span>
-            {n.beta && <span className="sb-beta">BETA</span>}
           </button>
         ))}
       </div>
