@@ -39,7 +39,20 @@ interface Entry {
   createdAt: number;
 }
 
-const entries = new Map<string, Entry>();
+// Preserve the registry across Vite HMR. Without this, a hot update replaces this module with a
+// fresh (empty) `entries` map, orphaning live Chat instances mid-turn. On the next render `ensure`
+// recreates each chat empty and `load` repopulates it from disk — but the async `persist` of the
+// latest turn may not have flushed yet, so the live transcript gets clobbered back to the previous
+// turn. Reusing the same map across HMR keeps the in-memory Chats (and in-flight turns) intact.
+// Dev-only; `import.meta.hot` is undefined in a production build, so this is a plain new Map there.
+const entries: Map<string, Entry> =
+  (import.meta.hot?.data as { entries?: Map<string, Entry> } | undefined)?.entries ?? new Map<string, Entry>();
+if (import.meta.hot) {
+  import.meta.hot.accept();
+  import.meta.hot.dispose((data: { entries?: Map<string, Entry> }) => {
+    data.entries = entries;
+  });
+}
 
 function defaultConfig(): CodeConfig {
   return { harness: DEFAULT_HARNESS, model: DEFAULT_CODE_MODEL, cwd: "", permissionMode: "acceptEdits" };

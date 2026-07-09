@@ -1,7 +1,6 @@
 // codeTransport.ts — a custom AI SDK ChatTransport that drives a coding-CLI harness. Instead of an
 // HTTP endpoint it invokes the Rust `agent_run` command (a dumb pipe of raw CLI stdout lines),
-// decodes each line with the per-harness transform, and streams AI SDK UIMessageChunks. Mirrors
-// 1code's IPCChatTransport, stripped to Modelius's needs.
+// decodes each line with the per-harness transform, and streams AI SDK UIMessageChunks.
 import type { ChatTransport, UIMessage, UIMessageChunk } from "ai";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { createTransformer } from "./transform";
@@ -45,7 +44,7 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
     return new ReadableStream<UIMessageChunk>({
       start: (controller) => {
         // Our transform yields the (structurally identical) local chunk shape; the SDK's generic
-        // UIMessageChunk type is stricter, so cast at the boundary (mirrors 1code's `any`).
+        // UIMessageChunk type is stricter, so cast at the boundary.
         const push = (chunk: unknown) => {
           try {
             controller.enqueue(chunk as UIMessageChunk);

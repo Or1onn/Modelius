@@ -142,7 +142,7 @@ export function ChatScreen({
     setModelSelState(sel);
   };
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const [modelQuery, setModelQuery] = useState(""); // 1code-style search filter in the picker
+  const [modelQuery, setModelQuery] = useState(""); // search filter in the picker
   const [thinking, setThinking] = useState(false); // request the reasoning trace
   const [web, setWeb] = useState(true); // server-side web search — on by default
   const [addMenuOpen, setAddMenuOpen] = useState(false); // composer "+" menu (files + web search)

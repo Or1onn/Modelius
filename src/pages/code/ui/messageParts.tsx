@@ -1,5 +1,5 @@
 // messageParts.tsx — render an AI SDK assistant message's `parts` into the Code transcript.
-// Ports the 1code render ideas onto Modelius primitives (Icon, Markdown, cd-* CSS):
+// Renders onto Modelius primitives (Icon, Markdown, cd-* CSS):
 //  - tool calls carry a lifecycle (pending spinner → done/error);
 //  - ≥3 consecutive exploration tools (Read/Grep/Glob/Web*) collapse into one "Explored N" group;
 //  - when a final text answer follows the tools, the tools fold behind an "N steps" toggle and the
@@ -46,7 +46,7 @@ function DiffRows({ rows, lang }: { rows: DiffRow[]; lang?: string }) {
 // Map a tool part → the row display model (verb, target, lifecycle, optional diff). Tools arrive as
 // static `tool-<Name>` parts (name in the type) since we don't register a tool schema; `verb` is the
 // resolved name.
-export function toToolItem(part: any, verb: string): ToolItem {
+function toToolItem(part: any, verb: string): ToolItem {
   const input = (part.input ?? {}) as any;
   const file: string = input.command ?? input.file_path ?? input.path ?? input.pattern ?? "";
   const lang = langFromPath(input.file_path ?? input.path);

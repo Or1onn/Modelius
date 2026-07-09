@@ -647,7 +647,7 @@ input, textarea { font-family: inherit; }
   padding: 5px; background: var(--surface-1); border: 1px solid var(--border-2); border-radius: var(--radius);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
 }
-/* Search/filter row at the top of the picker (1code-style) */
+/* Search/filter row at the top of the picker */
 .model-menu-search {
   display: flex; align-items: center; gap: 7px; padding: 5px 9px 7px; margin-bottom: 4px;
   border-bottom: 1px solid var(--border);
