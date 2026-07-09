@@ -4,14 +4,6 @@
 // Adding a harness = one entry here + one entry in the front-end registry (harnesses.ts).
 use crate::gateway::Proto;
 
-// Which stdout decoder the CLI's output needs (see agent.rs Parser). Several CLIs share one
-// format: Claude Code forks emit ClaudeStreamJson; Qwen Code's stream-json is Claude-compatible.
-#[derive(Clone, Copy)]
-pub(crate) enum OutputFormat {
-    ClaudeStreamJson,
-    CodexJsonl,
-}
-
 // How the CLI gets onto the user's machine (installer.rs): a global npm package.
 pub(crate) enum Install {
     Npm(&'static str),
@@ -68,7 +60,6 @@ pub(crate) struct HarnessSpec {
     // installs (resolved via the agents prefix / PATH).
     pub bin_hint: &'static [&'static str],
     pub protocol: Proto, // gateway inbound side when the run is routed
-    pub output: OutputFormat,
     pub argv: &'static [Arg],
     // Args emitted by Arg::Resume when continuing a prior session; {id} → the session id the
     // CLI reported on the previous run (Claude: stream-json init; Codex: thread.started).
@@ -106,13 +97,15 @@ static HARNESSES: &[HarnessSpec] = &[
         extra_env: &[],
         bin_hint: &[],
         protocol: Proto::Anthropic,
-        output: OutputFormat::ClaudeStreamJson,
         argv: &[
             Arg::Lit("-p"),
             Arg::Prompt,
             Arg::Lit("--output-format"),
             Arg::Lit("stream-json"),
             Arg::Lit("--verbose"), // required for stream-json under -p
+            // Token-level streaming: emits `stream_event` deltas (text + tool-input) the TS
+            // transform turns into AI SDK chunks (features/run-agent/lib/transform.ts).
+            Arg::Lit("--include-partial-messages"),
             Arg::Resume,
             Arg::ModelFlag("--model"),
             Arg::Permission(claude_permission),
@@ -143,7 +136,6 @@ static HARNESSES: &[HarnessSpec] = &[
         extra_env: &[],
         bin_hint: &[],
         protocol: Proto::OpenAi,
-        output: OutputFormat::CodexJsonl,
         argv: &[
             Arg::Lit("exec"),
             Arg::Resume, // `resume <id>` is a subcommand — must directly follow `exec`

@@ -6,7 +6,7 @@ import { hydrateSettings, useSettings } from "@/entities/settings/model/settings
 import { deleteChat, pinChat, renameChat, hydrateChatIndex } from "@/entities/chat/model/chats";
 import { deleteCodeChat, pinCodeChat, renameCodeChat, hydrateCodeIndex } from "@/entities/agent/model/codeChats";
 import { dropSession, isEmptySession } from "@/pages/chat/model/sessionStore";
-import { dropCodeSession, isEmptyCodeSession } from "@/pages/code/model/codeSessionStore";
+import { dropCodeChat, isEmptyCodeChat } from "@/features/run-agent/lib/codeChatRegistry";
 import { listOllamaModels } from "@/entities/session/model/ollamaSession";
 import { hasKey } from "@/entities/session/model/keys";
 import { KEY_PROVIDER_IDS, listKeyProviderModels } from "@/entities/session/model/keyProviders";
@@ -130,7 +130,7 @@ export default function App() {
   const [newCodeChatId, setNewCodeChatId] = useState(activeCodeChatId);
   const gotoNewCode = (): string => {
     let id = newCodeChatId;
-    if (!isEmptyCodeSession(id)) {
+    if (!isEmptyCodeChat(id)) {
       id = crypto.randomUUID();
       setNewCodeChatId(id);
     }
@@ -147,7 +147,7 @@ export default function App() {
   };
   const removeCode = (id: string) => {
     deleteCodeChat(id);
-    dropCodeSession(id);
+    dropCodeChat(id);
     if (id !== activeCodeChatId) return;
     if (id === newCodeChatId) {
       const fresh = crypto.randomUUID();

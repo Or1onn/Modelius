@@ -1,44 +1,24 @@
-// agent.rs — run an external agentic coding CLI as a subprocess, decode its stdout with the
-// parser its HarnessSpec names (see harness.rs), and forward transcript events to the webview
-// over a Tauri channel. Non-native model picks route the CLI through the per-run local gateway
-// (see gateway.rs) so the real provider key never enters the CLI process.
+// agent.rs — run an external agentic coding CLI as a subprocess and forward its raw stdout lines
+// to the webview over a Tauri channel (a "dumb pipe"). All decoding of the CLI's stream-json /
+// JSONL into the AI SDK UIMessageChunk model happens in TS (features/run-agent/lib/transform.ts).
+// Non-native model picks route the CLI through the per-run local gateway (see gateway.rs) so the
+// real provider key never enters the CLI process.
 // Mirrors the LLM streaming path (see stream.rs / compat.rs): one command, events over a Channel,
 // cancellation via the shared cancel registry.
-use crate::harness::{Arg, EnvSpec, HarnessSpec, OutputFormat};
+use crate::harness::{Arg, EnvSpec, HarnessSpec};
 use crate::stream::cancel_guard;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-// Transcript events sent back to the webview. Shape mirrors the front-end Step union
-// (see pages/code/ui/CodeScreen.tsx): text prose, tool-call rows, run-command rows, a final result.
+// Events sent back to the webview. `Line` carries one raw stdout line from the CLI (decoded in TS);
+// `Error` is a spawn/exit failure; `Done` marks stdout EOF.
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub(crate) enum AgentEvent {
-    Text(String),
-    // A reasoning/thinking trace segment (rendered as a collapsible block, like chat mode).
-    Thinking(String),
-    // A tool call the agent made: id (to match its later result) + verb (Read/Edit/Bash/PowerShell/…)
-    // + the file the tool touched or the command it ran. For Edit/Write, `edit` carries the before/after
-    // text so the front end can render a colored diff instead of the raw tool_result.
-    ToolUse { id: String, verb: String, file: String, edit: Option<EditDiff> },
-    // The result of a prior tool call, matched to the ToolUse by id. `output` is truncated.
-    ToolResult { id: String, output: String },
-    // The CLI's own session/thread id (Claude: stream-json init; Codex: thread.started) — the
-    // front end persists it and passes it back as `resume` so the next turn continues the session.
-    SessionId(String),
-    // Terminal success: the model that answered, optional total cost (USD), and the prompt-token
-    // count of the final turn (input + cache tokens) — how full the model's context window is.
-    Result { model: String, cost: Option<f64>, context_tokens: u64 },
+pub(crate) enum PipeEvent {
+    Line(String),
     Error(String),
     Done,
-}
-
-// Before/after text for an Edit (old_string → new_string) or Write (empty → content).
-#[derive(Clone, serde::Serialize)]
-pub(crate) struct EditDiff {
-    old: String,
-    new: String,
 }
 
 // Where a routed run should ultimately land: the target endpoint's protocol + base + real key.
@@ -203,266 +183,6 @@ fn write_codex_home(app: &tauri::AppHandle, auth: &CodexAuth) -> Result<std::pat
     Ok(dir)
 }
 
-// Cap diff text so a large Edit/Write can't flood the transcript (char-safe, no marker).
-fn cap(s: &str) -> String {
-    const MAX: usize = 8000;
-    if s.chars().count() <= MAX { s.to_string() } else { s.chars().take(MAX).collect() }
-}
-
-// Cap tool output so a big file read can't flood the transcript (char-safe).
-fn truncate(s: &str) -> String {
-    const MAX: usize = 4000;
-    let s = s.trim_end();
-    if s.chars().count() <= MAX {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(MAX).collect();
-    format!("{}\n… (truncated)", cut)
-}
-
-// Stateful stdout decoder, one variant per OutputFormat. `handle` maps one line into agent
-// events and returns true on the terminal event; `finish` runs at EOF for whole-document formats.
-enum Parser {
-    Claude,
-    Codex { started: std::collections::HashSet<String> },
-}
-
-impl Parser {
-    fn new(format: OutputFormat) -> Self {
-        match format {
-            OutputFormat::ClaudeStreamJson => Parser::Claude,
-            OutputFormat::CodexJsonl => Parser::Codex { started: std::collections::HashSet::new() },
-        }
-    }
-
-    fn handle(&mut self, line: &str, on_event: &tauri::ipc::Channel<AgentEvent>) -> bool {
-        match self {
-            Parser::Claude => handle_claude_line(line, on_event),
-            Parser::Codex { started } => handle_codex_line(line, on_event, started),
-        }
-    }
-
-    fn finish(&mut self, _on_event: &tauri::ipc::Channel<AgentEvent>) {}
-}
-
-// Map one line of Claude Code stream-json into agent events. Returns true on the terminal `result`.
-// Qwen Code's stream-json emits the same event shapes, so it shares this decoder.
-fn handle_claude_line(line: &str, on_event: &tauri::ipc::Channel<AgentEvent>) -> bool {
-    let Ok(j) = serde_json::from_str::<serde_json::Value>(line) else { return false };
-    match j.get("type").and_then(|v| v.as_str()) {
-        // First line of every run: carries the session id the next turn can --resume.
-        Some("system") => {
-            if j.get("subtype").and_then(|v| v.as_str()) == Some("init") {
-                if let Some(id) = j.get("session_id").and_then(|v| v.as_str()) {
-                    let _ = on_event.send(AgentEvent::SessionId(id.to_string()));
-                }
-            }
-            false
-        }
-        Some("assistant") => {
-            if let Some(content) = j.pointer("/message/content").and_then(|v| v.as_array()) {
-                for block in content {
-                    match block.get("type").and_then(|v| v.as_str()) {
-                        Some("text") => {
-                            if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                                if !t.trim().is_empty() {
-                                    let _ = on_event.send(AgentEvent::Text(t.to_string()));
-                                }
-                            }
-                        }
-                        Some("thinking") => {
-                            if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
-                                if !t.trim().is_empty() {
-                                    let _ = on_event.send(AgentEvent::Thinking(t.to_string()));
-                                }
-                            }
-                        }
-                        Some("tool_use") => {
-                            let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("Tool");
-                            let input = block.get("input");
-                            let get = |k: &str| input.and_then(|i| i.get(k)).and_then(|v| v.as_str());
-                            // Primary target: a shell command (Bash/PowerShell/…), else the file/path/pattern
-                            // the tool acted on. Covers file tools, shell tools, and MCP tools uniformly.
-                            let file = get("command").or_else(|| get("file_path")).or_else(|| get("path")).or_else(|| get("pattern")).unwrap_or("");
-                            // Edit/Write → carry before/after text for a rendered diff (capped so a big write can't flood).
-                            let edit = if name.eq_ignore_ascii_case("edit") {
-                                Some(EditDiff { old: cap(get("old_string").unwrap_or("")), new: cap(get("new_string").unwrap_or("")) })
-                            } else if name.eq_ignore_ascii_case("write") {
-                                Some(EditDiff { old: String::new(), new: cap(get("content").unwrap_or("")) })
-                            } else if name.eq_ignore_ascii_case("multiedit") {
-                                // Combine every edit's before/after into one diff (join in edit order).
-                                input.and_then(|i| i.get("edits")).and_then(|v| v.as_array()).map(|edits| {
-                                    let join = |key: &str| edits.iter().filter_map(|e| e.get(key).and_then(|v| v.as_str())).collect::<Vec<_>>().join("\n");
-                                    EditDiff { old: cap(&join("old_string")), new: cap(&join("new_string")) }
-                                })
-                            } else {
-                                None
-                            };
-                            let _ = on_event.send(AgentEvent::ToolUse { id, verb: name.to_string(), file: file.to_string(), edit });
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            false
-        }
-        // tool_result blocks arrive as `user` messages; match them to their ToolUse by id.
-        Some("user") => {
-            if let Some(content) = j.pointer("/message/content").and_then(|v| v.as_array()) {
-                for block in content {
-                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                        let id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let output = truncate(&crate::gateway::tool_result_text(block.get("content")));
-                        if !output.is_empty() {
-                            let _ = on_event.send(AgentEvent::ToolResult { id, output });
-                        }
-                    }
-                }
-            }
-            false
-        }
-        Some("result") => {
-            let model = j.pointer("/modelUsage").and_then(|m| m.as_object()).and_then(|m| m.keys().next().cloned()).unwrap_or_default();
-            let cost = j.get("total_cost_usd").and_then(|v| v.as_f64());
-            // Prompt tokens of the final request = how full the context window is.
-            let u = |k: &str| j.pointer(&format!("/usage/{}", k)).and_then(|v| v.as_u64()).unwrap_or(0);
-            let context_tokens = u("input_tokens") + u("cache_creation_input_tokens") + u("cache_read_input_tokens");
-            let _ = on_event.send(AgentEvent::Result { model, cost, context_tokens });
-            true
-        }
-        _ => false,
-    }
-}
-
-// Map one line of `codex exec --json` JSONL into agent events. Returns true on the terminal
-// turn.completed / turn.failed / stream error. `started` tracks command items whose ToolUse was
-// already sent on item.started, so item.completed only patches in the result.
-fn handle_codex_line(
-    line: &str,
-    on_event: &tauri::ipc::Channel<AgentEvent>,
-    started: &mut std::collections::HashSet<String>,
-) -> bool {
-    let Ok(j) = serde_json::from_str::<serde_json::Value>(line) else { return false };
-    let ev = j.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match ev {
-        // Carries the thread id the next turn can `exec resume`.
-        "thread.started" => {
-            if let Some(id) = j.get("thread_id").and_then(|v| v.as_str()) {
-                let _ = on_event.send(AgentEvent::SessionId(id.to_string()));
-            }
-            false
-        }
-        "turn.completed" => {
-            let u = |k: &str| j.pointer(&format!("/usage/{}", k)).and_then(|v| v.as_u64()).unwrap_or(0);
-            let _ = on_event.send(AgentEvent::Result {
-                model: String::new(),
-                cost: None,
-                context_tokens: u("input_tokens") + u("cached_input_tokens"),
-            });
-            true
-        }
-        "turn.failed" => {
-            let msg = j.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("turn failed");
-            let _ = on_event.send(AgentEvent::Error(msg.to_string()));
-            true
-        }
-        "error" => {
-            let msg = j.get("message").and_then(|v| v.as_str()).unwrap_or("stream error");
-            let _ = on_event.send(AgentEvent::Error(msg.to_string()));
-            true
-        }
-        "item.started" | "item.completed" => {
-            let item = j.get("item").unwrap_or(&serde_json::Value::Null);
-            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let get = |k: &str| item.get(k).and_then(|v| v.as_str()).unwrap_or("");
-            let completed = ev == "item.completed";
-            match item.get("type").and_then(|v| v.as_str()) {
-                Some("agent_message") if completed => {
-                    let t = get("text");
-                    if !t.trim().is_empty() {
-                        let _ = on_event.send(AgentEvent::Text(t.to_string()));
-                    }
-                }
-                Some("reasoning") if completed => {
-                    let t = get("text");
-                    if !t.trim().is_empty() {
-                        let _ = on_event.send(AgentEvent::Thinking(t.to_string()));
-                    }
-                }
-                Some("command_execution") => {
-                    if started.insert(id.clone()) {
-                        let _ = on_event.send(AgentEvent::ToolUse {
-                            id: id.clone(),
-                            verb: "Ran".to_string(),
-                            file: get("command").to_string(),
-                            edit: None,
-                        });
-                    }
-                    if completed {
-                        let out = truncate(get("aggregated_output"));
-                        if !out.is_empty() {
-                            let _ = on_event.send(AgentEvent::ToolResult { id, output: out });
-                        }
-                    }
-                }
-                Some("file_change") if completed => {
-                    for (i, ch) in item.get("changes").and_then(|v| v.as_array()).unwrap_or(&Vec::new()).iter().enumerate() {
-                        let verb = match ch.get("kind").and_then(|v| v.as_str()) {
-                            Some("add") => "Write",
-                            Some("delete") => "Deleted",
-                            _ => "Edit",
-                        };
-                        let _ = on_event.send(AgentEvent::ToolUse {
-                            id: format!("{}:{}", id, i),
-                            verb: verb.to_string(),
-                            file: ch.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            edit: None,
-                        });
-                    }
-                }
-                Some("mcp_tool_call") => {
-                    if started.insert(id.clone()) {
-                        let _ = on_event.send(AgentEvent::ToolUse {
-                            id: id.clone(),
-                            verb: get("tool").to_string(),
-                            file: get("server").to_string(),
-                            edit: None,
-                        });
-                    }
-                    if completed {
-                        let out = truncate(&item.get("result").map(|v| if v.is_string() { v.as_str().unwrap_or("").to_string() } else { v.to_string() }).unwrap_or_default());
-                        if !out.is_empty() {
-                            let _ = on_event.send(AgentEvent::ToolResult { id, output: out });
-                        }
-                    }
-                }
-                Some("web_search") if completed => {
-                    let _ = on_event.send(AgentEvent::ToolUse {
-                        id,
-                        verb: "Searched".to_string(),
-                        file: get("query").to_string(),
-                        edit: None,
-                    });
-                }
-                // An `error` *item* is a non-fatal notice (e.g. the model-metadata warning); Codex
-                // keeps going. Surface it as prose, not an AgentEvent::Error — the front end treats
-                // Error as terminal and would stop rendering the rest of the run. Real failures
-                // arrive as turn.failed / a top-level error event (both terminal, handled above).
-                Some("error") if completed => {
-                    let t = get("message");
-                    if !t.trim().is_empty() {
-                        let _ = on_event.send(AgentEvent::Text(format!("⚠️ {}", t)));
-                    }
-                }
-                _ => {} // todo_list / item.updated noise
-            }
-            false
-        }
-        _ => false, // turn.started
-    }
-}
-
 // Run a harness turn: spawn the CLI in `cwd`, stream its stdout as agent events, honor cancellation.
 // `target` (absent for native-login runs) starts the per-run gateway and re-points the CLI at it.
 #[tauri::command]
@@ -478,7 +198,7 @@ pub async fn agent_run(
     codex_auth: Option<CodexAuth>,
     claude_token: Option<String>,
     stream_id: String,
-    on_event: tauri::ipc::Channel<AgentEvent>,
+    on_event: tauri::ipc::Channel<PipeEvent>,
 ) -> Result<(), String> {
     let cancel = cancel_guard(&stream_id);
     let spec = crate::harness::spec(&harness).ok_or_else(|| format!("unknown harness: {}", harness))?;
@@ -490,7 +210,7 @@ pub async fn agent_run(
         Some(p) => p,
         None => {
             let msg = format!("'{}' not found — install it from the Environment picker.", spec.bin);
-            let _ = on_event.send(AgentEvent::Error(msg.clone()));
+            let _ = on_event.send(PipeEvent::Error(msg.clone()));
             return Err(msg);
         }
     };
@@ -501,7 +221,7 @@ pub async fn agent_run(
         && !crate::node_runtime::system_node_acceptable()
     {
         if let Err(e) = crate::node_runtime::ensure(&app).await {
-            let _ = on_event.send(AgentEvent::Error(e.clone()));
+            let _ = on_event.send(PipeEvent::Error(e.clone()));
             return Err(e);
         }
     }
@@ -544,7 +264,7 @@ pub async fn agent_run(
                 g.shutdown();
             }
             let msg = format!("failed to start '{}': {} (is it installed and on PATH?)", spec.bin, e);
-            let _ = on_event.send(AgentEvent::Error(msg.clone()));
+            let _ = on_event.send(PipeEvent::Error(msg.clone()));
             return Err(msg);
         }
     };
@@ -559,7 +279,6 @@ pub async fn agent_run(
         }
     };
     let mut lines = BufReader::new(stdout).lines();
-    let mut parser = Parser::new(spec.output);
 
     loop {
         if cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -572,17 +291,12 @@ pub async fn agent_run(
         match next {
             Err(_) => continue, // idle — no line yet
             Ok(Ok(Some(line))) => {
-                if parser.handle(&line, &on_event) {
-                    break;
-                }
+                // Dumb pipe: forward the raw stdout line; TS decodes it (transform.ts).
+                let _ = on_event.send(PipeEvent::Line(line));
             }
-            Ok(Ok(None)) => {
-                // stdout closed → process finishing; whole-document formats decode now.
-                parser.finish(&on_event);
-                break;
-            }
+            Ok(Ok(None)) => break, // stdout closed → process finishing
             Ok(Err(e)) => {
-                let _ = on_event.send(AgentEvent::Error(e.to_string()));
+                let _ = on_event.send(PipeEvent::Error(e.to_string()));
                 break;
             }
         }
@@ -607,7 +321,7 @@ pub async fn agent_run(
                         err = err.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
                     }
                 }
-                let _ = on_event.send(AgentEvent::Error(if err.trim().is_empty() {
+                let _ = on_event.send(PipeEvent::Error(if err.trim().is_empty() {
                     format!("{} exited with {}", spec.bin, status)
                 } else {
                     err.trim().to_string()
@@ -619,32 +333,16 @@ pub async fn agent_run(
     if let Some(g) = &gateway {
         g.shutdown();
     }
-    let _ = on_event.send(AgentEvent::Done);
+    let _ = on_event.send(PipeEvent::Done);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    // These targets are entangled with pub(crate) types (HarnessSpec/AgentEvent/Channel), so
-    // they're tested inline (matching gateway.rs) rather than from tests/, which would force a
-    // wide pub cascade. The channel parsers are driven through a real capturing Channel.
+    // build_argv reads the private HarnessSpec argv templates, so it's tested inline (matching
+    // gateway.rs) rather than from tests/, which would force a wide pub cascade.
     use super::*;
     use crate::harness::spec;
-    use std::sync::{Arc, Mutex};
-    use tauri::ipc::{Channel, InvokeResponseBody};
-
-    // A Channel whose every sent AgentEvent is captured (deserialized) for assertions.
-    fn sink() -> (Channel<AgentEvent>, Arc<Mutex<Vec<serde_json::Value>>>) {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let out = events.clone();
-        let ch = Channel::new(move |body: InvokeResponseBody| {
-            if let InvokeResponseBody::Json(s) = body {
-                out.lock().unwrap().push(serde_json::from_str(&s).unwrap());
-            }
-            Ok(())
-        });
-        (ch, events)
-    }
 
     #[test]
     fn build_argv_claude_carries_prompt_model_and_permission() {
@@ -693,92 +391,5 @@ mod tests {
         assert_eq!(argv[1], "resume");
         assert_eq!(argv[2], "thread-1");
         assert_eq!(argv.last().unwrap(), "hi"); // prompt stays the trailing positional
-    }
-
-    #[test]
-    fn claude_init_emits_the_session_id() {
-        let (ch, ev) = sink();
-        let line = r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#;
-        assert!(!handle_claude_line(line, &ch)); // not terminal
-        let e = ev.lock().unwrap();
-        assert_eq!(e[0]["type"], "session_id");
-        assert_eq!(e[0]["data"], "abc-123");
-    }
-
-    #[test]
-    fn codex_thread_started_emits_the_session_id() {
-        let (ch, ev) = sink();
-        let mut started = std::collections::HashSet::new();
-        let line = r#"{"type":"thread.started","thread_id":"th-9"}"#;
-        assert!(!handle_codex_line(line, &ch, &mut started));
-        let e = ev.lock().unwrap();
-        assert_eq!(e[0]["type"], "session_id");
-        assert_eq!(e[0]["data"], "th-9");
-    }
-
-    #[test]
-    fn claude_text_block_emits_a_text_event() {
-        let (ch, ev) = sink();
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi there"}]}}"#;
-        assert!(!handle_claude_line(line, &ch)); // not terminal
-        let e = ev.lock().unwrap();
-        assert_eq!(e.len(), 1);
-        assert_eq!(e[0]["type"], "text");
-        assert_eq!(e[0]["data"], "hi there");
-    }
-
-    #[test]
-    fn claude_result_is_terminal_and_sums_context_tokens() {
-        let (ch, ev) = sink();
-        let line = r#"{"type":"result","total_cost_usd":0.01,"usage":{"input_tokens":10,"cache_read_input_tokens":5}}"#;
-        assert!(handle_claude_line(line, &ch));
-        let e = ev.lock().unwrap();
-        assert_eq!(e[0]["type"], "result");
-        assert_eq!(e[0]["data"]["context_tokens"], 15);
-    }
-
-    #[test]
-    fn claude_edit_tool_use_carries_the_before_after_diff() {
-        let (ch, ev) = sink();
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"a.rs","old_string":"x","new_string":"y"}}]}}"#;
-        handle_claude_line(line, &ch);
-        let e = ev.lock().unwrap();
-        assert_eq!(e[0]["type"], "tool_use");
-        assert_eq!(e[0]["data"]["verb"], "Edit");
-        assert_eq!(e[0]["data"]["file"], "a.rs");
-        assert_eq!(e[0]["data"]["edit"]["old"], "x");
-        assert_eq!(e[0]["data"]["edit"]["new"], "y");
-    }
-
-    #[test]
-    fn codex_turn_completed_is_terminal_and_sums_context_tokens() {
-        let (ch, ev) = sink();
-        let mut started = std::collections::HashSet::new();
-        let line = r#"{"type":"turn.completed","usage":{"input_tokens":7,"cached_input_tokens":3}}"#;
-        assert!(handle_codex_line(line, &ch, &mut started));
-        let e = ev.lock().unwrap();
-        assert_eq!(e[0]["type"], "result");
-        assert_eq!(e[0]["data"]["context_tokens"], 10);
-    }
-
-    #[test]
-    fn a_non_json_line_is_ignored() {
-        let (ch, ev) = sink();
-        assert!(!handle_claude_line("not json", &ch));
-        assert!(ev.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn cap_leaves_short_text_and_clamps_long_text_to_8000_chars() {
-        assert_eq!(cap("abc"), "abc");
-        assert_eq!(cap(&"x".repeat(9000)).chars().count(), 8000);
-    }
-
-    #[test]
-    fn truncate_trims_and_marks_overlong_output() {
-        assert_eq!(truncate("hello  "), "hello"); // trailing whitespace trimmed, no marker
-        let out = truncate(&"x".repeat(5000));
-        assert!(out.ends_with("… (truncated)"));
-        assert!(out.starts_with("xxxx"));
     }
 }

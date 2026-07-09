@@ -4,7 +4,7 @@
 // timestamps, favorite model from each body's saved modelId. Bodies are loaded once and cached.
 import { useEffect, useState } from "react";
 import { getCodeChats, loadCodeBody } from "@/entities/agent/model/codeChats";
-import type { Step } from "@/features/run-agent/lib/agentChannel";
+import type { UIMessage } from "ai";
 import { estimateTokens } from "@/shared/lib/tokens";
 
 export interface UsageSession {
@@ -17,13 +17,16 @@ export interface UsageSession {
 export type RangeId = "All" | "30d" | "7d";
 
 // Concatenate the human-visible text of a transcript for a rough token estimate.
-function stepsText(steps: Step[]): string {
+function messagesText(messages: UIMessage[]): string {
   const out: string[] = [];
-  for (const s of steps) {
-    if (s.type === "user" || s.type === "text") out.push(s.text);
-    else if (s.type === "toolgroup") for (const it of s.items) { if (it.file) out.push(it.file); if (it.output) out.push(it.output); }
-    else if (s.type === "diff") for (const r of s.rows) out.push(r.c);
-  }
+  for (const m of messages)
+    for (const p of m.parts as any[]) {
+      if (p.type === "text" && typeof p.text === "string") out.push(p.text);
+      else if (p.type === "dynamic-tool") {
+        if (p.input) out.push(JSON.stringify(p.input));
+        if (typeof p.output === "string") out.push(p.output);
+      }
+    }
   return out.join("\n");
 }
 
@@ -39,12 +42,12 @@ async function loadUsage(): Promise<UsageSession[]> {
     const rows = await Promise.all(
       chats.map(async (c) => {
         const body = await loadCodeBody(c.id);
-        const steps = body?.steps ?? [];
+        const messages = body?.messages ?? [];
         return {
           createdAt: c.createdAt,
           modelId: body?.modelId ?? "",
-          msgs: steps.filter((s) => s.type === "user").length,
-          tokens: estimateTokens(stepsText(steps)),
+          msgs: messages.filter((m) => m.role === "user").length,
+          tokens: estimateTokens(messagesText(messages)),
         };
       })
     );

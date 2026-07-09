@@ -108,7 +108,7 @@ const MD_COMPONENTS: Components = {
 // GFM rendering for assistant messages; tolerant of partial markdown mid-stream.
 export function Markdown({ text }: { text: string }) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]} components={MD_COMPONENTS}>
+    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[[rehypeHighlight, { detect: false, ignoreMissing: true }]]} components={MD_COMPONENTS}>
       {text}
     </ReactMarkdown>
   );

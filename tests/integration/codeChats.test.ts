@@ -1,11 +1,13 @@
 import { describe, it, expect, beforeEach } from "vitest";
+import type { UIMessage } from "ai";
 import { saveCodeBody, loadCodeBody, type CodeChatBody } from "@/entities/agent/model/codeChats";
 
 // Off-Tauri the vault degrades to identity and bodies persist to localStorage (see chats.test.ts).
 beforeEach(() => localStorage.clear());
 
+const msgs: UIMessage[] = [{ id: "u1", role: "user", parts: [{ type: "text", text: "hi" }] }];
 const body = (over: Partial<CodeChatBody> = {}): CodeChatBody => ({
-  steps: [{ type: "user", text: "hi" }],
+  messages: msgs,
   cwd: "D:\\proj",
   harnessId: "claude-code",
   modelId: "claude-opus-4-8",
@@ -15,12 +17,18 @@ const body = (over: Partial<CodeChatBody> = {}): CodeChatBody => ({
 });
 
 describe("code chat body", () => {
-  it("roundtrips resumeId and last-run stats", async () => {
-    await saveCodeBody("c1", body({ resumeId: "sess-9", contextTokens: 1234, cost: 0.05 }));
+  it("roundtrips the message transcript and config", async () => {
+    await saveCodeBody("c1", body({ cwd: "D:\\x" }));
     const b = await loadCodeBody("c1");
-    expect(b?.resumeId).toBe("sess-9");
-    expect(b?.contextTokens).toBe(1234);
-    expect(b?.cost).toBe(0.05);
+    expect(b?.messages).toHaveLength(1);
+    expect(b?.messages[0].role).toBe("user");
+    expect(b?.cwd).toBe("D:\\x");
+  });
+
+  it("drops a legacy (pre-AI-SDK) `steps` body as unrecognized", async () => {
+    // Simulate an old body that stored `steps` instead of `messages`.
+    await saveCodeBody("c-legacy", { steps: [{ type: "user", text: "hi" }] } as unknown as CodeChatBody);
+    expect(await loadCodeBody("c-legacy")).toBeNull();
   });
 
   it("migrates the retired 'default' permission mode to acceptEdits", async () => {

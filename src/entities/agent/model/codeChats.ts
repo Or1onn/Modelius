@@ -3,7 +3,7 @@
 // but shares the `chats` SQLite table (UUID keys, opaque encrypted `data` — no row collision).
 // The store mechanics live in chats.ts's factories; this module is configuration + body shape.
 import { makeChatIndexStore, makeBodyStore, type ChatIndexEntry } from "@/entities/chat/model/chats";
-import type { Step } from "@/features/run-agent/lib/agentChannel";
+import type { UIMessage } from "ai";
 import { fromLegacyModelId, type CodeModelChoice } from "@/entities/agent/model/codeModel";
 
 // ---- Index (encrypted localStorage blob + in-RAM cache, reactive) ----
@@ -30,16 +30,15 @@ export function useCodeChatStore() {
 
 // ---- Body (SQLite under Tauri / localStorage fallback) ----
 
+// Body shape (AI SDK model). `messages` is the whole transcript; resume id + context/cost live in
+// the last assistant message's metadata, so they're not stored separately.
 export interface CodeChatBody {
-  steps: Step[];
+  messages: UIMessage[];
   cwd: string;
   harnessId: string;
   modelId: string; // kept alongside `model` so pre-routing builds can still open the chat
   model?: CodeModelChoice;
   permissionMode: string;
-  resumeId?: string; // the CLI's session id from the last run — next turn resumes it
-  contextTokens?: number; // last run's stats, restored into the header on reopen
-  cost?: number | null;
   title: string;
 }
 
@@ -52,31 +51,36 @@ export async function saveCodeBody(id: string, body: CodeChatBody): Promise<void
 
 export async function loadCodeBody(id: string): Promise<CodeChatBody | null> {
   const b = await bodyStore.load(id);
-  if (!Array.isArray(b?.steps)) return null;
+  // Pre-AI-SDK bodies stored `steps` (no `messages`) — treat as unrecognized (reset, per migration).
+  if (!Array.isArray(b?.messages)) return null;
   return {
-    steps: b.steps,
+    messages: b.messages,
     cwd: b.cwd ?? "",
     harnessId: b.harnessId ?? "",
     modelId: b.modelId ?? "",
     // Legacy bodies carry only modelId — those were always Anthropic picks.
     model: b.model ?? (b.modelId ? fromLegacyModelId(b.modelId) : undefined),
-    // Migrate old bodies: boolean acceptEdits, and the retired "default" (Ask each time) mode —
-    // headless CLIs can't prompt, so it silently denied; coerce to acceptEdits.
+    // Retired "default" (Ask each time) mode — headless CLIs can't prompt; coerce to acceptEdits.
     permissionMode: b.permissionMode && b.permissionMode !== "default" ? b.permissionMode : "acceptEdits",
-    resumeId: b.resumeId,
-    contextTokens: b.contextTokens,
-    cost: b.cost,
     title: b.title ?? "",
   };
 }
 
 export const deleteCodeBody = bodyStore.del;
 
-// Build an index entry from the transcript: title/preview from the first user step's prompt.
-export function codeIndexEntryFrom(id: string, steps: Step[], createdAt: number, title?: string, cwd?: string): ChatIndexEntry | null {
-  const firstUser = steps.find((s): s is Extract<Step, { type: "user" }> => s.type === "user");
+// Concatenate the text parts of a message (the user prompt is plain text).
+function messageText(m: UIMessage): string {
+  return (m.parts as { type: string; text?: string }[])
+    .filter((p) => p.type === "text" && typeof p.text === "string")
+    .map((p) => p.text)
+    .join("\n");
+}
+
+// Build an index entry from the transcript: title/preview from the first user message's prompt.
+export function codeIndexEntryFrom(id: string, messages: UIMessage[], createdAt: number, title?: string, cwd?: string): ChatIndexEntry | null {
+  const firstUser = messages.find((m) => m.role === "user");
   if (!firstUser) return null; // skip empty code chats
-  const snippet = firstUser.text.trim().replace(/\s+/g, " ");
+  const snippet = messageText(firstUser).trim().replace(/\s+/g, " ");
   return {
     id,
     title: title?.trim() || snippet.slice(0, 60) || "New session",
