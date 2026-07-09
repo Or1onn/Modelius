@@ -50,6 +50,9 @@ interface CodeSession {
   permissionMode: string;
   contextTokens: number;
   cost: number | null;
+  // The harness CLI's own session id from the last run — passed back as `resume` so the next
+  // turn continues the same CLI session (multi-turn memory). Belongs to the current harness.
+  resumeId: string | null;
   title: string;
   loading: boolean;
   createdAt: number;
@@ -96,6 +99,9 @@ function schedulePersist(s: CodeSession): void {
       modelId: s.model.id, // legacy field, kept for older builds
       model: s.model,
       permissionMode: s.permissionMode,
+      resumeId: s.resumeId ?? undefined,
+      contextTokens: s.contextTokens,
+      cost: s.cost,
       title: s.title,
     });
     upsertCodeChat(entry);
@@ -117,6 +123,7 @@ function ensure(chatId: string): CodeSession {
     permissionMode: "acceptEdits",
     contextTokens: 0,
     cost: null,
+    resumeId: null,
     title: "",
     loading: known,
     createdAt: Date.now(),
@@ -146,6 +153,9 @@ async function load(s: CodeSession): Promise<void> {
     // the harness CLI hard-errors on a foreign model id, so re-align here.
     if (!choiceFitsHarness(s.model, s.harnessId)) s.model = defaultModelForHarness(s.harnessId);
     s.permissionMode = body.permissionMode;
+    s.resumeId = body.resumeId ?? null;
+    if (typeof body.contextTokens === "number") s.contextTokens = body.contextTokens;
+    if (typeof body.cost === "number") s.cost = body.cost;
     s.title = body.title;
   }
   s.loading = false;
@@ -193,6 +203,7 @@ export function setCodeHarness(chatId: string, harnessId: string): void {
   s.harnessId = harnessId;
   // A model pick only makes sense for the harness family it belongs to (codex ↔ claude-code).
   if (!choiceFitsHarness(s.model, harnessId)) s.model = defaultModelForHarness(harnessId);
+  s.resumeId = null; // a session id belongs to the harness that minted it
   s.dirty = true;
   commit(s);
 }
@@ -290,21 +301,31 @@ export async function sendCodeMessage(chatId: string, prompt: string): Promise<v
   s.abort = controller;
   const runId = crypto.randomUUID();
   const permissionMode = s.permissionMode;
+  const resume = s.resumeId ?? undefined;
+  let sawError = false;
+  let gotSession = false;
   try {
     for await (const delta of runAgentToSteps(
-      { harness: s.harnessId, model: s.model.id, prompt: text, cwd: s.cwd, permissionMode, target, codexAuth, claudeToken },
+      { harness: s.harnessId, model: s.model.id, prompt: text, cwd: s.cwd, permissionMode, resume, target, codexAuth, claudeToken },
       runId,
       controller.signal
     )) {
       if (delta.op === "usage") {
         s.contextTokens = delta.contextTokens;
         s.cost = delta.cost;
+      } else if (delta.op === "session") {
+        s.resumeId = delta.id;
+        gotSession = true;
       } else {
+        if (delta.op === "error") sawError = true;
         s.steps = applyDelta(s.steps, delta);
       }
       commit(s);
     }
   } finally {
+    // A failed run that never opened a session likely means the resume id went stale (CLI
+    // session pruned, Codex auth-mode switch) — drop it so the next turn starts fresh.
+    if (sawError && !gotSession) s.resumeId = null;
     if (s.abort === controller) s.abort = null;
     s.phase = "idle";
     commit(s); // now idle → schedulePersist flushes the finished transcript

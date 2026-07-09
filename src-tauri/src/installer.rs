@@ -1,5 +1,5 @@
-// installer.rs — harness CLI detection + one-click install. All five harnesses ship as global
-// npm packages, so install is one data-driven path: `npm install -g <spec.npm_pkg>`. Detection
+// installer.rs — harness CLI detection + one-click install. Every harness ships as a global
+// npm package, so install is one data-driven path: `npm install -g <spec.npm_pkg>`. Detection
 // uses the same resolution agent_run spawns with, so "installed" here means "spawnable".
 // npm comes from the system when its Node is acceptable, otherwise from the managed portable
 // runtime (node_runtime.rs), installing into the isolated agents prefix.

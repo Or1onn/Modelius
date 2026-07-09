@@ -22,6 +22,8 @@ export type StepDelta =
   | { op: "append"; step: Step }                    // prose / user turn
   | { op: "tool"; item: ToolItem }                  // a tool call (grouped with adjacent calls)
   | { op: "result"; id: string; output: string }    // fills a prior tool call's output
+  | { op: "error"; message: string }                // terminal failure (rendered as a ⚠️ step)
+  | { op: "session"; id: string }                   // the CLI's session id (not a step; resume next turn)
   | { op: "usage"; contextTokens: number; cost: number | null }; // terminal totals (not a step)
 
 // Raw events from Rust (agent.rs AgentEvent), tagged like StreamEvent.
@@ -30,6 +32,7 @@ type AgentEvent =
   | { type: "thinking"; data: string }
   | { type: "tool_use"; data: { id: string; verb: string; file: string; edit: { old: string; new: string } | null } }
   | { type: "tool_result"; data: { id: string; output: string } }
+  | { type: "session_id"; data: string }
   | { type: "result"; data: { model: string; cost: number | null; context_tokens: number } }
   | { type: "error"; data: string }
   | { type: "done" };
@@ -49,6 +52,9 @@ export interface RunAgentParams {
   // Claude OAuth access token from the app's Providers login — injected as CLAUDE_CODE_OAUTH_TOKEN
   // (absent → the CLI's own `claude` login).
   claudeToken?: string;
+  // Session id captured from a prior run (op:"session") — continues that CLI session
+  // (claude --resume / codex exec resume) instead of starting fresh.
+  resume?: string;
 }
 
 // Map a single agent event to a transcript delta (null = no visible change, e.g. terminal result).
@@ -70,7 +76,8 @@ function toDelta(ev: AgentEvent): StepDelta | null {
     return { op: "tool", item };
   }
   if (ev.type === "tool_result") return { op: "result", id: ev.data.id, output: ev.data.output };
-  if (ev.type === "error") return { op: "append", step: { type: "text", text: `⚠️ ${ev.data}` } };
+  if (ev.type === "session_id") return { op: "session", id: ev.data };
+  if (ev.type === "error") return { op: "error", message: ev.data };
   if (ev.type === "result") return { op: "usage", contextTokens: ev.data.context_tokens, cost: ev.data.cost };
   return null; // done handled by the loop
 }
@@ -78,6 +85,7 @@ function toDelta(ev: AgentEvent): StepDelta | null {
 // Fold a delta into the transcript: prose appends; adjacent tool calls collapse into one group;
 // a result patches its matching tool item (by id) in place.
 export function applyDelta(steps: Step[], d: StepDelta): Step[] {
+  if (d.op === "error") return [...steps, { type: "text", text: `⚠️ ${d.message}` }];
   if (d.op === "append") {
     // Adjacent thinking segments merge into one collapsible block (like adjacent tool calls).
     const last = steps[steps.length - 1];
@@ -91,7 +99,7 @@ export function applyDelta(steps: Step[], d: StepDelta): Step[] {
       return [...steps.slice(0, -1), { ...last, items: [...last.items, d.item] }];
     return [...steps, { type: "toolgroup", items: [d.item] }];
   }
-  if (d.op !== "result") return steps; // usage: session-level, not a step
+  if (d.op !== "result") return steps; // usage/session: session-level, not a step
   return steps.map((s) =>
     s.type === "toolgroup" && s.items.some((it) => it.id === d.id)
       ? { ...s, items: s.items.map((it) => (it.id === d.id ? { ...it, output: d.output } : it)) }
@@ -138,6 +146,7 @@ export async function* runAgentToSteps(params: RunAgentParams, streamId: string,
     prompt: params.prompt,
     cwd: params.cwd,
     permissionMode: params.permissionMode,
+    resume: params.resume,
     target: params.target,
     codexAuth: params.codexAuth,
     claudeToken: params.claudeToken,

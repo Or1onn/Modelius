@@ -82,7 +82,7 @@ export async function installHarness(id: string): Promise<void> {
     statuses.set(id, {
       installed: onPath,
       installing: false,
-      error: onPath ? undefined : `Installed, but '${bin}' couldn't be resolved — restart Orchestro.`,
+      error: onPath ? undefined : `Installed, but '${bin}' couldn't be resolved — restart Modelius.`,
     });
   } catch (e) {
     statuses.set(id, { installed: prev?.installed, installing: false, error: String(e) });

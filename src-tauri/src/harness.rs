@@ -10,7 +10,6 @@ use crate::gateway::Proto;
 pub(crate) enum OutputFormat {
     ClaudeStreamJson,
     CodexJsonl,
-    PlainText,
 }
 
 // How the CLI gets onto the user's machine (installer.rs): a global npm package.
@@ -25,12 +24,15 @@ pub(crate) enum Arg {
     Prompt,
     // Emits [flag, model] only when a model id was picked.
     ModelFlag(&'static str),
-    // Maps the Orchestro permission-mode id (default/acceptEdits/plan/bypassPermissions)
+    // Maps the Modelius permission-mode id (default/acceptEdits/plan/bypassPermissions)
     // onto this CLI's own flags.
     Permission(fn(&str) -> Vec<String>),
     // Emits the harness's `EnvSpec.route_args` (with {url}/{model} substituted) only on a
     // routed run — used to configure a CLI that can't be re-pointed by env vars alone.
     RouteArgs,
+    // Emits the harness's `resume_args` (with {id} substituted) only when a prior session id
+    // was captured — continues that CLI session instead of starting a fresh one.
+    Resume,
 }
 
 // Env vars that re-point the CLI at the gateway. Every name in `base_url`/`api_key` is set (some
@@ -68,6 +70,9 @@ pub(crate) struct HarnessSpec {
     pub protocol: Proto, // gateway inbound side when the run is routed
     pub output: OutputFormat,
     pub argv: &'static [Arg],
+    // Args emitted by Arg::Resume when continuing a prior session; {id} → the session id the
+    // CLI reported on the previous run (Claude: stream-json init; Codex: thread.started).
+    pub resume_args: &'static [&'static str],
     pub env: EnvSpec,
 }
 
@@ -79,28 +84,16 @@ fn claude_permission(mode: &str) -> Vec<String> {
     }
 }
 
-// Claude Code permission modes map onto Codex sandbox flags; "plan" runs read-only
-// (Codex's default exec sandbox).
+// Claude Code permission modes map onto Codex sandbox settings; "plan" runs read-only
+// (Codex's default exec sandbox). The sandbox is set via `-c sandbox_mode=…`, not `--sandbox`:
+// the `exec resume` subcommand accepts `-c` but not `--sandbox`, and both spellings are
+// equivalent for a fresh `exec`.
 fn codex_permission(mode: &str) -> Vec<String> {
     match mode {
         "bypassPermissions" => vec!["--dangerously-bypass-approvals-and-sandbox".into()],
         "plan" => vec![],
-        _ => vec!["--sandbox".into(), "workspace-write".into()],
+        _ => vec!["-c".into(), "sandbox_mode=\"workspace-write\"".into()],
     }
-}
-
-fn qwen_permission(mode: &str) -> Vec<String> {
-    match mode {
-        "plan" => vec!["--approval-mode".into(), "plan".into()],
-        "bypassPermissions" => vec!["--yolo".into()],
-        // Headless runs can't answer prompts — auto-approve edits for the interactive-ish modes.
-        _ => vec!["--approval-mode".into(), "auto-edit".into()],
-    }
-}
-
-// `kimi --prompt` rejects --yolo/--auto/--plan and already runs with auto permissions.
-fn kimi_permission(_mode: &str) -> Vec<String> {
-    vec![]
 }
 
 static HARNESSES: &[HarnessSpec] = &[
@@ -120,9 +113,11 @@ static HARNESSES: &[HarnessSpec] = &[
             Arg::Lit("--output-format"),
             Arg::Lit("stream-json"),
             Arg::Lit("--verbose"), // required for stream-json under -p
+            Arg::Resume,
             Arg::ModelFlag("--model"),
             Arg::Permission(claude_permission),
         ],
+        resume_args: &["--resume", "{id}"],
         env: EnvSpec {
             base_url: &["ANTHROPIC_BASE_URL"],
             base_url_suffix: "",
@@ -136,7 +131,7 @@ static HARNESSES: &[HarnessSpec] = &[
         },
     },
     // OpenAI Codex CLI (headless): JSONL events on stdout. Native ChatGPT login by default; a
-    // routed run injects a custom `orchestro` model provider (via -c overrides) pointed at the
+    // routed run injects a custom `modelius` model provider (via -c overrides) pointed at the
     // local gateway. Codex only speaks the Responses API (wire_api = "responses"); the gateway's
     // /responses handler translates it to/from chat/completions for the picked bound model.
     HarnessSpec {
@@ -151,6 +146,7 @@ static HARNESSES: &[HarnessSpec] = &[
         output: OutputFormat::CodexJsonl,
         argv: &[
             Arg::Lit("exec"),
+            Arg::Resume, // `resume <id>` is a subcommand — must directly follow `exec`
             Arg::Lit("--json"),
             Arg::Lit("--skip-git-repo-check"),
             // `codex exec` suppresses reasoning items by default — surface them so the
@@ -164,82 +160,25 @@ static HARNESSES: &[HarnessSpec] = &[
             Arg::Permission(codex_permission),
             Arg::Prompt, // trailing positional — route flags must precede it
         ],
+        resume_args: &["resume", "{id}"],
         env: EnvSpec {
             base_url: &[], // provider base is carried in route_args (-c …base_url), not an env var
             base_url_suffix: "",
-            api_key: &["ORCHESTRO_GATEWAY_KEY"], // the provider's env_key ← gateway token
+            api_key: &["MODELIUS_GATEWAY_KEY"], // the provider's env_key ← gateway token
             model_pins: &[],
             remove: &["OPENAI_API_KEY"], // don't leak an inherited key into the routed provider
             route_args: &[
                 "-c",
-                "model_provider=orchestro",
+                "model_provider=modelius",
                 "-c",
-                "model_providers.orchestro.name=Orchestro",
+                "model_providers.modelius.name=Modelius",
                 "-c",
-                "model_providers.orchestro.base_url={url}/v1",
+                "model_providers.modelius.base_url={url}/v1",
                 "-c",
-                "model_providers.orchestro.wire_api=responses",
+                "model_providers.modelius.wire_api=responses",
                 "-c",
-                "model_providers.orchestro.env_key=ORCHESTRO_GATEWAY_KEY",
+                "model_providers.modelius.env_key=MODELIUS_GATEWAY_KEY",
             ],
-        },
-    },
-    // Moonshot Kimi Code CLI. Speaks OpenAI-compatible wire (Moonshot's extended chat/completions);
-    // KIMI_* vars re-point its default provider, OPENAI_* cover configs whose default provider is
-    // an openai type. Its stream-json schema is undocumented, so headless output stays plain text.
-    HarnessSpec {
-        id: "kimi",
-        bin: "kimi",
-        install: Install::Npm("@moonshot-ai/kimi-code"),
-        login_marker: &[],
-        login_probe: &[],
-        extra_env: &[],
-        bin_hint: &[],
-        protocol: Proto::OpenAi,
-        output: OutputFormat::PlainText,
-        argv: &[
-            Arg::Lit("-p"),
-            Arg::Prompt,
-            Arg::Lit("--output-format"),
-            Arg::Lit("text"),
-            Arg::Permission(kimi_permission),
-        ],
-        env: EnvSpec {
-            base_url: &["KIMI_BASE_URL", "OPENAI_BASE_URL"],
-            base_url_suffix: "",
-            api_key: &["KIMI_API_KEY", "OPENAI_API_KEY"],
-            model_pins: &["KIMI_MODEL_NAME"],
-            remove: &[],
-            route_args: &[],
-        },
-    },
-    // Qwen Code (Gemini CLI fork): OpenAI-compatible via OPENAI_* env; its stream-json events are
-    // Claude Code-shaped (type: system/assistant/result), so the Claude parser decodes them.
-    HarnessSpec {
-        id: "qwen-code",
-        bin: "qwen",
-        install: Install::Npm("@qwen-code/qwen-code"),
-        login_marker: &[],
-        login_probe: &[],
-        extra_env: &[],
-        bin_hint: &[],
-        protocol: Proto::OpenAi,
-        output: OutputFormat::ClaudeStreamJson,
-        argv: &[
-            Arg::Lit("-p"),
-            Arg::Prompt,
-            Arg::Lit("--output-format"),
-            Arg::Lit("stream-json"),
-            Arg::ModelFlag("--model"),
-            Arg::Permission(qwen_permission),
-        ],
-        env: EnvSpec {
-            base_url: &["OPENAI_BASE_URL"],
-            base_url_suffix: "",
-            api_key: &["OPENAI_API_KEY"],
-            model_pins: &["OPENAI_MODEL"],
-            remove: &[],
-            route_args: &[],
         },
     },
 ];
@@ -250,4 +189,40 @@ pub(crate) fn spec(id: &str) -> Option<&'static HarnessSpec> {
 
 pub(crate) fn all() -> &'static [HarnessSpec] {
     HARNESSES
+}
+
+#[cfg(test)]
+mod tests {
+    // spec/all read the private HARNESSES static, so they're tested inline (no pub cascade over
+    // the HarnessSpec type graph), as is the permission mapping.
+    use super::*;
+
+    #[test]
+    fn spec_finds_known_harnesses_and_rejects_unknown() {
+        assert_eq!(spec("claude-code").unwrap().bin, "claude");
+        assert_eq!(spec("codex").unwrap().bin, "codex");
+        assert!(spec("nope").is_none());
+    }
+
+    #[test]
+    fn all_lists_every_harness_with_a_nonempty_argv() {
+        assert_eq!(all().len(), 2);
+        assert!(all().iter().all(|h| !h.id.is_empty() && !h.argv.is_empty()));
+    }
+
+    #[test]
+    fn claude_permission_passes_the_mode_through() {
+        assert_eq!(claude_permission(""), Vec::<String>::new());
+        assert_eq!(claude_permission("plan"), vec!["--permission-mode", "plan"]);
+        assert_eq!(claude_permission("acceptEdits"), vec!["--permission-mode", "acceptEdits"]);
+    }
+
+    #[test]
+    fn codex_permission_maps_onto_sandbox_flags() {
+        assert_eq!(codex_permission("bypassPermissions"), vec!["--dangerously-bypass-approvals-and-sandbox"]);
+        assert_eq!(codex_permission("plan"), Vec::<String>::new()); // read-only default
+        // -c form, not --sandbox: `exec resume` rejects --sandbox (see codex_permission).
+        assert_eq!(codex_permission("default"), vec!["-c", "sandbox_mode=\"workspace-write\""]);
+        assert_eq!(codex_permission("acceptEdits"), vec!["-c", "sandbox_mode=\"workspace-write\""]);
+    }
 }

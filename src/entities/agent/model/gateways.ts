@@ -1,7 +1,7 @@
 // gateways.ts — user-configured model endpoints for Code mode (LiteLLM proxy, DeepSeek, Z.ai,
 // Moonshot, …). Each gateway declares which protocol its endpoint speaks — the Anthropic Messages
 // API or OpenAI chat/completions — so the local proxy knows whether to translate or pass through.
-// Non-secret config lives in localStorage under an orchestro.* key; the API key goes to the OS
+// Non-secret config lives in localStorage under a modelius.* key; the API key goes to the OS
 // keychain (secret_*) and is only read at send time.
 import { useEffect, useReducer } from "react";
 import { secretSet, secretDelete } from "@/shared/api/secrets";
@@ -16,8 +16,8 @@ export interface CodeGateway {
   protocol?: GatewayProtocol; // absent in configs saved before the field existed → anthropic
 }
 
-const STORE_KEY = "orchestro.code.gateways";
-const EVT = "orchestro-gateways-changed";
+const STORE_KEY = "modelius.code.gateways";
+const EVT = "modelius-gateways-changed";
 
 export const gatewaySecretKey = (id: string): string => `code.gateway.${id}`;
 

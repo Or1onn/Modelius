@@ -119,3 +119,14 @@ pub async fn compat_chat_stream(
     let _ = on_event.send(StreamEvent::Done);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_url_normalizes_the_base_slash() {
+        assert_eq!(join_url("http://x/", "/models"), "http://x/models");
+        assert_eq!(join_url("http://x", "/models"), "http://x/models");
+    }
+}

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Fast gate on every commit: typecheck + unit tests (FE + Rust). E2E is excluded (too slow/flaky).
+# Enabled via `git config core.hooksPath .githooks` — the root package.json `prepare` script sets
+# this automatically on `npm install`. Git for Windows runs this through sh (Git Bash).
+set -e
+
+echo "pre-commit ▸ typecheck (tsc --noEmit)"
+npx tsc --noEmit
+
+echo "pre-commit ▸ frontend unit tests (vitest)"
+npx vitest run
+
+echo "pre-commit ▸ rust tests (cargo test)"
+cargo test --manifest-path src-tauri/Cargo.toml
+
+echo "pre-commit ▸ all checks passed"

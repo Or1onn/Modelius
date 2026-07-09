@@ -1,0 +1,20 @@
+{
+  "name": "modelius-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Smoke E2E for the Modelius desktop app (WebDriverIO + tauri-driver). Self-contained so the root install stays lean; run npm install here first.",
+  "scripts": {
+    "test": "wdio run ./wdio.conf.ts"
+  },
+  "devDependencies": {
+    "@wdio/cli": "^9.0.0",
+    "@wdio/local-runner": "^9.0.0",
+    "@wdio/mocha-framework": "^9.0.0",
+    "@wdio/spec-reporter": "^9.0.0",
+    "@types/mocha": "^10.0.0",
+    "@types/node": "^26.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "~5.8.3"
+  }
+}

@@ -37,6 +37,9 @@ export interface CodeChatBody {
   modelId: string; // kept alongside `model` so pre-routing builds can still open the chat
   model?: CodeModelChoice;
   permissionMode: string;
+  resumeId?: string; // the CLI's session id from the last run — next turn resumes it
+  contextTokens?: number; // last run's stats, restored into the header on reopen
+  cost?: number | null;
   title: string;
 }
 
@@ -57,8 +60,12 @@ export async function loadCodeBody(id: string): Promise<CodeChatBody | null> {
     modelId: b.modelId ?? "",
     // Legacy bodies carry only modelId — those were always Anthropic picks.
     model: b.model ?? (b.modelId ? fromLegacyModelId(b.modelId) : undefined),
-    // Migrate old bodies that stored a boolean acceptEdits.
-    permissionMode: b.permissionMode ?? (b.acceptEdits === false ? "default" : "acceptEdits"),
+    // Migrate old bodies: boolean acceptEdits, and the retired "default" (Ask each time) mode —
+    // headless CLIs can't prompt, so it silently denied; coerce to acceptEdits.
+    permissionMode: b.permissionMode && b.permissionMode !== "default" ? b.permissionMode : "acceptEdits",
+    resumeId: b.resumeId,
+    contextTokens: b.contextTokens,
+    cost: b.cost,
     title: b.title ?? "",
   };
 }

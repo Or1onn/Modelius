@@ -44,3 +44,30 @@ pub fn artifact_read(app: tauri::AppHandle, id: String) -> Result<Option<String>
     let blob = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     vault::decrypt_str(&blob).map(Some)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_id_accepts_a_well_formed_id() {
+        assert!(valid_id("code-0a1b2c3d"));
+        assert!(valid_id("code-DEADBEEF")); // is_ascii_hexdigit accepts upper case
+    }
+
+    #[test]
+    fn valid_id_rejects_bad_prefix_length_and_non_hex() {
+        assert!(!valid_id("art-0a1b2c3d"));
+        assert!(!valid_id("code-0a1b2c")); // too short
+        assert!(!valid_id("code-0a1b2c3d4")); // too long
+        assert!(!valid_id("code-0a1b2c3g")); // 'g' not hex
+        assert!(!valid_id("0a1b2c3d")); // no prefix
+    }
+
+    #[test]
+    fn valid_id_blocks_path_traversal() {
+        assert!(!valid_id("code-../secret"));
+        assert!(!valid_id("code-..\\win"));
+        assert!(!valid_id("code-%2e%2e"));
+    }
+}

@@ -78,8 +78,8 @@ pub(crate) fn system_node_version() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-// Whether a "vX.Y.Z" is safe for the harness CLIs: kimi needs >= 22.19, and 24.17.x ships the
-// CVE-2026-48931 change that breaks node-fetch (qwen hangs on every request).
+// Whether a "vX.Y.Z" is safe for the harness CLIs: require >= 22.19, and reject 24.17.x, which
+// ships the CVE-2026-48931 change that breaks node-fetch (some CLIs hang on every request).
 pub(crate) fn version_acceptable(v: &str) -> bool {
     let mut it = v.trim().trim_start_matches('v').split('.');
     let major: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -148,4 +148,19 @@ pub(crate) fn managed_npm(app: &tauri::AppHandle) -> Option<PathBuf> {
     let dir = managed_node_dir(app)?;
     let npm = dir.join(if cfg!(windows) { "npm.cmd" } else { "npm" });
     npm.is_file().then_some(npm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_acceptable_enforces_the_harness_node_floor() {
+        assert!(version_acceptable("v22.19.0"));
+        assert!(version_acceptable("v24.16.0"));
+        assert!(version_acceptable("v24.18.0"));
+        assert!(!version_acceptable("v22.18.0")); // below 22.19
+        assert!(!version_acceptable("v20.0.0")); // major too low
+        assert!(!version_acceptable("v24.17.1")); // the blocked CVE build
+    }
 }

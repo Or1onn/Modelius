@@ -1,6 +1,6 @@
 // recentFolders.ts — the Code header's folder Picker offers recently-opened workspaces.
 // Persisted as a small localStorage list (most-recent first, capped), fed by the native dialog.
-const KEY = "orchestro.code.recentFolders";
+const KEY = "modelius.code.recentFolders";
 const MAX = 6;
 
 export function getRecentFolders(): string[] {

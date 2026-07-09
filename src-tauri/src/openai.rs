@@ -196,3 +196,24 @@ pub async fn openai_responses_stream(
     let _ = on_event.send(StreamEvent::Done);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_handles_escapes_and_plus() {
+        assert_eq!(percent_decode("hello"), "hello");
+        assert_eq!(percent_decode("%2Ffoo"), "/foo");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("%2"), "%2"); // incomplete escape left literal
+    }
+
+    #[test]
+    fn query_param_extracts_and_decodes() {
+        assert_eq!(query_param("/cb?code=abc&state=xy", "code").as_deref(), Some("abc"));
+        assert_eq!(query_param("/cb?code=hello%20world", "code").as_deref(), Some("hello world"));
+        assert_eq!(query_param("/cb?state=x", "code"), None);
+        assert_eq!(query_param("/nopath", "code"), None);
+    }
+}

@@ -81,3 +81,24 @@ pub fn vault_encrypt(plaintext: String) -> Result<String, String> {
 pub fn vault_decrypt(blob: String) -> Result<String, String> {
     decrypt_str(&blob)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decrypt_str_passes_legacy_plaintext_through_unchanged() {
+        // No `v1:` prefix → returns before dek(), so no keychain needed.
+        assert_eq!(decrypt_str("plain legacy body").unwrap(), "plain legacy body");
+        assert_eq!(decrypt_str("").unwrap(), "");
+    }
+
+    #[test]
+    #[ignore = "needs the OS keychain DEK"]
+    fn roundtrip_encrypts_and_decrypts() {
+        let secret = "chat body with 🔑 unicode";
+        let blob = encrypt_str(secret).unwrap();
+        assert!(blob.starts_with("v1:"));
+        assert_eq!(decrypt_str(&blob).unwrap(), secret);
+    }
+}

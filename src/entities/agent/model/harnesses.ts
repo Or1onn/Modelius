@@ -47,20 +47,6 @@ export const HARNESSES: AgentHarness[] = [
       models: () => LIVE_CODEX.map((m) => ({ id: m.id, name: m.name })),
     },
   },
-  {
-    id: "kimi",
-    name: "Kimi Code",
-    bin: "kimi",
-    protocol: "openai",
-    routable: true, // KIMI_BASE_URL / KIMI_API_KEY / KIMI_MODEL_NAME
-  },
-  {
-    id: "qwen-code",
-    name: "Qwen Code",
-    bin: "qwen",
-    protocol: "openai",
-    routable: true, // OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL
-  },
 ];
 
 export const HARNESS_BY_ID = Object.fromEntries(HARNESSES.map((h) => [h.id, h]));
@@ -72,8 +58,10 @@ export interface PermissionMode {
   label: string;
 }
 
+// No "ask each time": the CLIs run headless (-p / exec), so they can't prompt — permission
+// requests would be silently denied. Saved bodies with the old "default" mode are migrated
+// to acceptEdits on load (codeChats.ts).
 export const PERMISSION_MODES: PermissionMode[] = [
-  { id: "default", label: "Ask each time" },
   { id: "acceptEdits", label: "Accept edits" },
   { id: "plan", label: "Plan mode" },
   { id: "bypassPermissions", label: "Full auto" },

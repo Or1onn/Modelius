@@ -1268,6 +1268,23 @@ async fn stream_responses(sock: &mut TcpStream, upstream: reqwest::Response, mod
 mod tests {
     use super::*;
 
+    #[test]
+    fn tool_result_text_flattens_string_and_array_content() {
+        assert_eq!(tool_result_text(Some(&json!("plain"))), "plain");
+        let arr = json!([{ "type": "text", "text": "a" }, { "type": "text", "text": "b" }]);
+        assert_eq!(tool_result_text(Some(&arr)), "ab");
+        assert_eq!(tool_result_text(None), "");
+        assert_eq!(tool_result_text(Some(&json!(42))), ""); // non-text → empty
+    }
+
+    #[test]
+    fn map_stop_maps_finish_reasons() {
+        assert_eq!(map_stop(Some("tool_calls")), "tool_use");
+        assert_eq!(map_stop(Some("length")), "max_tokens");
+        assert_eq!(map_stop(Some("stop")), "end_turn");
+        assert_eq!(map_stop(None), "end_turn");
+    }
+
     // Minimal one-shot mock upstream: accepts one connection, reads the request head + body,
     // answers with the given raw HTTP response, closes.
     async fn mock_upstream(response: &'static str) -> u16 {

@@ -1,0 +1,12 @@
+{
+  // Isolated typecheck for test files — the app build (root tsconfig, include:["src"])
+  // never sees these. Relaxes the unused-symbol lint that test scaffolding trips.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "types": ["vitest/globals", "node"]
+  },
+  "include": ["."],
+  "references": []
+}

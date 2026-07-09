@@ -3,7 +3,7 @@
 // PKCE verifier, and the vault DEK — anything that must never touch plaintext disk.
 use keyring::{Entry, Error};
 
-pub(crate) const SERVICE: &str = "com.gracious-determined-curie.orchestro";
+pub(crate) const SERVICE: &str = "com.gracious-determined-curie.modelius";
 
 fn entry(key: &str) -> Result<Entry, String> {
     Entry::new(SERVICE, key).map_err(|e| e.to_string())

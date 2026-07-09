@@ -24,6 +24,9 @@ pub(crate) enum AgentEvent {
     ToolUse { id: String, verb: String, file: String, edit: Option<EditDiff> },
     // The result of a prior tool call, matched to the ToolUse by id. `output` is truncated.
     ToolResult { id: String, output: String },
+    // The CLI's own session/thread id (Claude: stream-json init; Codex: thread.started) — the
+    // front end persists it and passes it back as `resume` so the next turn continues the session.
+    SessionId(String),
     // Terminal success: the model that answered, optional total cost (USD), and the prompt-token
     // count of the final turn (input + cache tokens) — how full the model's context window is.
     Result { model: String, cost: Option<f64>, context_tokens: u64 },
@@ -50,13 +53,15 @@ pub(crate) struct RouteTarget {
 
 // Build argv from the harness's declarative template. The prompt is passed as a distinct argv
 // entry (never shell-interpolated). `gateway_url` (Some on a routed run) fills the {url} slot in
-// Arg::RouteArgs; the gateway token is never placed in argv (env-only).
+// Arg::RouteArgs; the gateway token is never placed in argv (env-only). `resume` (a session id
+// captured from a prior run) fills the {id} slot in Arg::Resume.
 fn build_argv(
     spec: &HarnessSpec,
     prompt: &str,
     model: &str,
     permission_mode: &str,
     gateway_url: Option<&str>,
+    resume: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     for a in spec.argv {
@@ -74,6 +79,13 @@ fn build_argv(
                 if let Some(url) = gateway_url {
                     for r in spec.env.route_args {
                         args.push(r.replace("{url}", url).replace("{model}", model));
+                    }
+                }
+            }
+            Arg::Resume => {
+                if let Some(id) = resume.filter(|id| !id.is_empty()) {
+                    for r in spec.resume_args {
+                        args.push(r.replace("{id}", id));
                     }
                 }
             }
@@ -141,7 +153,7 @@ fn spawn(
 }
 
 // ChatGPT (Codex) OAuth tokens forwarded from the app's Providers login, used to run the codex
-// CLI on the account connected in Orchestro instead of requiring a separate `codex login`.
+// CLI on the account connected in Modelius instead of requiring a separate `codex login`.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexAuth {
@@ -213,7 +225,6 @@ fn truncate(s: &str) -> String {
 enum Parser {
     Claude,
     Codex { started: std::collections::HashSet<String> },
-    Plain,
 }
 
 impl Parser {
@@ -221,7 +232,6 @@ impl Parser {
         match format {
             OutputFormat::ClaudeStreamJson => Parser::Claude,
             OutputFormat::CodexJsonl => Parser::Codex { started: std::collections::HashSet::new() },
-            OutputFormat::PlainText => Parser::Plain,
         }
     }
 
@@ -229,12 +239,6 @@ impl Parser {
         match self {
             Parser::Claude => handle_claude_line(line, on_event),
             Parser::Codex { started } => handle_codex_line(line, on_event, started),
-            Parser::Plain => {
-                if !line.trim().is_empty() {
-                    let _ = on_event.send(AgentEvent::Text(line.to_string()));
-                }
-                false
-            }
         }
     }
 
@@ -246,6 +250,15 @@ impl Parser {
 fn handle_claude_line(line: &str, on_event: &tauri::ipc::Channel<AgentEvent>) -> bool {
     let Ok(j) = serde_json::from_str::<serde_json::Value>(line) else { return false };
     match j.get("type").and_then(|v| v.as_str()) {
+        // First line of every run: carries the session id the next turn can --resume.
+        Some("system") => {
+            if j.get("subtype").and_then(|v| v.as_str()) == Some("init") {
+                if let Some(id) = j.get("session_id").and_then(|v| v.as_str()) {
+                    let _ = on_event.send(AgentEvent::SessionId(id.to_string()));
+                }
+            }
+            false
+        }
         Some("assistant") => {
             if let Some(content) = j.pointer("/message/content").and_then(|v| v.as_array()) {
                 for block in content {
@@ -333,6 +346,13 @@ fn handle_codex_line(
     let Ok(j) = serde_json::from_str::<serde_json::Value>(line) else { return false };
     let ev = j.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match ev {
+        // Carries the thread id the next turn can `exec resume`.
+        "thread.started" => {
+            if let Some(id) = j.get("thread_id").and_then(|v| v.as_str()) {
+                let _ = on_event.send(AgentEvent::SessionId(id.to_string()));
+            }
+            false
+        }
         "turn.completed" => {
             let u = |k: &str| j.pointer(&format!("/usage/{}", k)).and_then(|v| v.as_u64()).unwrap_or(0);
             let _ = on_event.send(AgentEvent::Result {
@@ -439,7 +459,7 @@ fn handle_codex_line(
             }
             false
         }
-        _ => false, // thread.started / turn.started
+        _ => false, // turn.started
     }
 }
 
@@ -453,6 +473,7 @@ pub async fn agent_run(
     prompt: String,
     cwd: String,
     permission_mode: String,
+    resume: Option<String>,
     target: Option<RouteTarget>,
     codex_auth: Option<CodexAuth>,
     claude_token: Option<String>,
@@ -514,7 +535,7 @@ pub async fn agent_run(
         .map(|(g, url)| (&spec.env, url, g.token.as_str(), model.as_str()));
 
     // Built here (not before the gateway) so Arg::RouteArgs can embed the gateway origin.
-    let args = build_argv(spec, &prompt, &model, &permission_mode, gateway_url.as_deref());
+    let args = build_argv(spec, &prompt, &model, &permission_mode, gateway_url.as_deref(), resume.as_deref());
 
     let mut child = match spawn(&program, &args, &cwd, spec.extra_env, routed, codex_home.as_deref(), claude_token.as_deref(), path_env.as_deref()) {
         Ok(c) => c,
@@ -600,4 +621,164 @@ pub async fn agent_run(
     }
     let _ = on_event.send(AgentEvent::Done);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // These targets are entangled with pub(crate) types (HarnessSpec/AgentEvent/Channel), so
+    // they're tested inline (matching gateway.rs) rather than from tests/, which would force a
+    // wide pub cascade. The channel parsers are driven through a real capturing Channel.
+    use super::*;
+    use crate::harness::spec;
+    use std::sync::{Arc, Mutex};
+    use tauri::ipc::{Channel, InvokeResponseBody};
+
+    // A Channel whose every sent AgentEvent is captured (deserialized) for assertions.
+    fn sink() -> (Channel<AgentEvent>, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        let ch = Channel::new(move |body: InvokeResponseBody| {
+            if let InvokeResponseBody::Json(s) = body {
+                out.lock().unwrap().push(serde_json::from_str(&s).unwrap());
+            }
+            Ok(())
+        });
+        (ch, events)
+    }
+
+    #[test]
+    fn build_argv_claude_carries_prompt_model_and_permission() {
+        let s = spec("claude-code").unwrap();
+        let argv = build_argv(s, "do it", "claude-x", "plan", None, None);
+        assert!(argv.contains(&"-p".to_string()));
+        assert!(argv.contains(&"do it".to_string())); // prompt is its own argv entry
+        let mi = argv.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(argv[mi + 1], "claude-x");
+        assert!(argv.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "plan"));
+    }
+
+    #[test]
+    fn build_argv_omits_model_flag_when_no_model_picked() {
+        let s = spec("claude-code").unwrap();
+        assert!(!build_argv(s, "hi", "", "", None, None).contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn build_argv_codex_emits_route_args_only_on_a_routed_run() {
+        let s = spec("codex").unwrap();
+        let native = build_argv(s, "hi", "gpt", "", None, None);
+        assert!(!native.iter().any(|a| a == "model_provider=modelius"));
+        let routed = build_argv(s, "hi", "gpt", "", Some("http://127.0.0.1:9000"), None);
+        assert!(routed.iter().any(|a| a == "model_provider=modelius"));
+        assert!(routed
+            .iter()
+            .any(|a| a == "model_providers.modelius.base_url=http://127.0.0.1:9000/v1")); // {url} substituted
+    }
+
+    #[test]
+    fn build_argv_claude_emits_resume_flag_only_with_an_id() {
+        let s = spec("claude-code").unwrap();
+        assert!(!build_argv(s, "hi", "", "", None, Some("")).contains(&"--resume".to_string()));
+        let argv = build_argv(s, "hi", "", "", None, Some("sess-1"));
+        let ri = argv.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(argv[ri + 1], "sess-1");
+    }
+
+    #[test]
+    fn build_argv_codex_resume_subcommand_directly_follows_exec() {
+        let s = spec("codex").unwrap();
+        assert!(!build_argv(s, "hi", "", "", None, None).contains(&"resume".to_string()));
+        let argv = build_argv(s, "hi", "", "", None, Some("thread-1"));
+        assert_eq!(argv[0], "exec");
+        assert_eq!(argv[1], "resume");
+        assert_eq!(argv[2], "thread-1");
+        assert_eq!(argv.last().unwrap(), "hi"); // prompt stays the trailing positional
+    }
+
+    #[test]
+    fn claude_init_emits_the_session_id() {
+        let (ch, ev) = sink();
+        let line = r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#;
+        assert!(!handle_claude_line(line, &ch)); // not terminal
+        let e = ev.lock().unwrap();
+        assert_eq!(e[0]["type"], "session_id");
+        assert_eq!(e[0]["data"], "abc-123");
+    }
+
+    #[test]
+    fn codex_thread_started_emits_the_session_id() {
+        let (ch, ev) = sink();
+        let mut started = std::collections::HashSet::new();
+        let line = r#"{"type":"thread.started","thread_id":"th-9"}"#;
+        assert!(!handle_codex_line(line, &ch, &mut started));
+        let e = ev.lock().unwrap();
+        assert_eq!(e[0]["type"], "session_id");
+        assert_eq!(e[0]["data"], "th-9");
+    }
+
+    #[test]
+    fn claude_text_block_emits_a_text_event() {
+        let (ch, ev) = sink();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi there"}]}}"#;
+        assert!(!handle_claude_line(line, &ch)); // not terminal
+        let e = ev.lock().unwrap();
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0]["type"], "text");
+        assert_eq!(e[0]["data"], "hi there");
+    }
+
+    #[test]
+    fn claude_result_is_terminal_and_sums_context_tokens() {
+        let (ch, ev) = sink();
+        let line = r#"{"type":"result","total_cost_usd":0.01,"usage":{"input_tokens":10,"cache_read_input_tokens":5}}"#;
+        assert!(handle_claude_line(line, &ch));
+        let e = ev.lock().unwrap();
+        assert_eq!(e[0]["type"], "result");
+        assert_eq!(e[0]["data"]["context_tokens"], 15);
+    }
+
+    #[test]
+    fn claude_edit_tool_use_carries_the_before_after_diff() {
+        let (ch, ev) = sink();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"a.rs","old_string":"x","new_string":"y"}}]}}"#;
+        handle_claude_line(line, &ch);
+        let e = ev.lock().unwrap();
+        assert_eq!(e[0]["type"], "tool_use");
+        assert_eq!(e[0]["data"]["verb"], "Edit");
+        assert_eq!(e[0]["data"]["file"], "a.rs");
+        assert_eq!(e[0]["data"]["edit"]["old"], "x");
+        assert_eq!(e[0]["data"]["edit"]["new"], "y");
+    }
+
+    #[test]
+    fn codex_turn_completed_is_terminal_and_sums_context_tokens() {
+        let (ch, ev) = sink();
+        let mut started = std::collections::HashSet::new();
+        let line = r#"{"type":"turn.completed","usage":{"input_tokens":7,"cached_input_tokens":3}}"#;
+        assert!(handle_codex_line(line, &ch, &mut started));
+        let e = ev.lock().unwrap();
+        assert_eq!(e[0]["type"], "result");
+        assert_eq!(e[0]["data"]["context_tokens"], 10);
+    }
+
+    #[test]
+    fn a_non_json_line_is_ignored() {
+        let (ch, ev) = sink();
+        assert!(!handle_claude_line("not json", &ch));
+        assert!(ev.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cap_leaves_short_text_and_clamps_long_text_to_8000_chars() {
+        assert_eq!(cap("abc"), "abc");
+        assert_eq!(cap(&"x".repeat(9000)).chars().count(), 8000);
+    }
+
+    #[test]
+    fn truncate_trims_and_marks_overlong_output() {
+        assert_eq!(truncate("hello  "), "hello"); // trailing whitespace trimmed, no marker
+        let out = truncate(&"x".repeat(5000));
+        assert!(out.ends_with("… (truncated)"));
+        assert!(out.starts_with("xxxx"));
+    }
 }

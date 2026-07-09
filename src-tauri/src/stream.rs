@@ -138,3 +138,19 @@ pub(crate) async fn json_or_err(res: Response, label: &str) -> Result<serde_json
     }
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::HeaderMap;
+
+    #[test]
+    fn err_prefix_appends_only_a_numeric_retry_after() {
+        let mut h = HeaderMap::new();
+        assert_eq!(err_prefix("OpenAI", 500, &h), "OpenAI 500");
+        h.insert("retry-after", "30".parse().unwrap());
+        assert_eq!(err_prefix("Anthropic", 429, &h), "Anthropic 429 (retry-after: 30s)");
+        h.insert("retry-after", "soon".parse().unwrap()); // non-numeric → ignored
+        assert_eq!(err_prefix("OpenAI", 429, &h), "OpenAI 429");
+    }
+}
