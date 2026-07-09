@@ -148,8 +148,25 @@ async function load(chatId: string): Promise<void> {
   e.listeners.forEach((fn) => fn());
 }
 
+// Per-chat write queue: serialize persistence so overlapping writes can't race. `saveCodeBody`
+// encrypts + writes SQLite asynchronously, so two fire-and-forget persists (e.g. a turn's onFinish
+// racing a config change) could otherwise land out of order and clobber the newer transcript with
+// an older one. Each persist chains after the prior; the last-enqueued state always wins.
+const persistChain = new Map<string, Promise<void>>();
+
+function persist(chatId: string): Promise<void> {
+  const prev = persistChain.get(chatId) ?? Promise.resolve();
+  const next = prev.catch(() => {}).then(() => persistNow(chatId));
+  persistChain.set(chatId, next);
+  void next.finally(() => {
+    if (persistChain.get(chatId) === next) persistChain.delete(chatId); // drop the settled tail
+  });
+  return next;
+}
+
 // Persist the transcript + config and index it for the sidebar. No-op until a user message exists.
-async function persist(chatId: string): Promise<void> {
+// Reads the live state at run time, so a queued write always flushes the latest transcript.
+async function persistNow(chatId: string): Promise<void> {
   const e = entries.get(chatId);
   if (!e) return;
   const messages = e.chat.messages;
