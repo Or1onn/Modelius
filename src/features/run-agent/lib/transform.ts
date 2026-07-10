@@ -255,6 +255,12 @@ export function createTransformer() {
     // ===== ASSISTANT MESSAGE (complete, often with tool_use) =====
     // When streaming is enabled, text arrives via stream_event, not here
     if (msg.type === "assistant" && msg.message?.content) {
+      // Sidechain (subagent) assistant lines arrive COMPLETE and interleave with the MAIN
+      // thread's stream_events. They must never flush the main thread's in-flight text/tool-input
+      // accumulation — that force-parses a half-streamed input ("Failed to parse tool input
+      // JSON… partial:") and corrupts the chunk sequence, which kills the client-side stream
+      // while the CLI keeps running (turn looks finished in the UI mid-work).
+      const sidechain = msg.parent_tool_use_id != null
       for (const block of msg.message.content) {
         // Handle thinking blocks from Extended Thinking
         // Skip if already emitted via streaming (thinking_delta)
@@ -282,7 +288,7 @@ export function createTransformer() {
         }
 
         if (block.type === "text") {
-          yield* endToolInput()
+          if (!sidechain) yield* endToolInput()
 
           // Only emit text if we're NOT already streaming (textStarted = false)
           // When includePartialMessages is true, text comes via stream_event
@@ -297,8 +303,10 @@ export function createTransformer() {
         }
 
         if (block.type === "tool_use") {
-          yield* endTextBlock()
-          yield* endToolInput()
+          if (!sidechain) {
+            yield* endTextBlock()
+            yield* endToolInput()
+          }
 
           // Skip if already emitted via streaming
           if (emittedToolIds.has(block.id)) {
@@ -423,7 +431,9 @@ export function createTransformer() {
     }
 
     // ===== RESULT (final) =====
-    if (msg.type === "result") {
+    // Only the TOP-LEVEL result ends the stream — the SDK message types allow sidechain results
+    // (parent_tool_use_id set), and a finish emitted mid-turn ends the UI turn while the CLI runs.
+    if (msg.type === "result" && msg.parent_tool_use_id == null) {
       currentParentToolUseId = null
       yield* endTextBlock()
       yield* endToolInput()

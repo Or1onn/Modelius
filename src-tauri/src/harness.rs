@@ -9,6 +9,15 @@ pub(crate) enum Install {
     Npm(&'static str),
 }
 
+// Official native-binary distribution (a standalone executable — no Node/npm involved).
+// Layout: {base}/{version}/manifest.json lists per-platform {binary, checksum(sha256), size};
+// the executable lives at {base}/{version}/{platform-dir}/{binary}. Preferred over the npm
+// install when present: faster to spawn (no node shim) and immune to a broken system Node.
+pub(crate) struct NativeDist {
+    pub base: &'static str,
+    pub version: &'static str,
+}
+
 // Declarative argv: literals + slots, in order. The prompt is always its own argv entry
 // (never shell-interpolated — see the BatBadBut note on spawn() in agent.rs).
 pub(crate) enum Arg {
@@ -16,6 +25,8 @@ pub(crate) enum Arg {
     Prompt,
     // Emits [flag, model] only when a model id was picked.
     ModelFlag(&'static str),
+    // Emits [flag, level] only when an effort level was picked (reasoning depth).
+    EffortFlag(&'static str),
     // Maps the Modelius permission-mode id (default/acceptEdits/plan/bypassPermissions)
     // onto this CLI's own flags.
     Permission(fn(&str) -> Vec<String>),
@@ -47,6 +58,9 @@ pub(crate) struct HarnessSpec {
     pub id: &'static str,
     pub bin: &'static str,
     pub install: Install,
+    // Native-binary dist tried before the npm install when set (installer.rs install_native);
+    // version-pinned so a release regression can't silently land on users.
+    pub native_dist: Option<NativeDist>,
     // Home-relative credential files the CLI's own login writes — best-effort "already signed in"
     // detection (installer.rs harness_logged_in). Empty = no native login modeled.
     pub login_marker: &'static [&'static str],
@@ -60,6 +74,10 @@ pub(crate) struct HarnessSpec {
     // installs (resolved via the agents prefix / PATH).
     pub bin_hint: &'static [&'static str],
     pub protocol: Proto, // gateway inbound side when the run is routed
+    // The prompt is written to the CLI's stdin as a stream-json user message instead of argv
+    // (Arg::Prompt absent). Enables the stdio control protocol: permission requests arrive as
+    // `control_request` stdout lines and the webview answers via `agent_respond` (agent.rs).
+    pub stdin_prompt: bool,
     pub argv: &'static [Arg],
     // Args emitted by Arg::Resume when continuing a prior session; {id} → the session id the
     // CLI reported on the previous run (Claude: stream-json init; Codex: thread.started).
@@ -92,22 +110,39 @@ static HARNESSES: &[HarnessSpec] = &[
         id: "claude-code",
         bin: "claude",
         install: Install::Npm("@anthropic-ai/claude-code"),
+        // Same GCS origin the official install script uses. 2.1.206 = the version the warm-session
+        // stdio protocol (multi-turn stdin / can_use_tool / interrupt / set_permission_mode) was
+        // probe-verified against.
+        native_dist: Some(NativeDist {
+            base: "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases",
+            version: "2.1.206",
+        }),
         login_marker: &[".claude/.credentials.json"],
         login_probe: &[],
         extra_env: &[],
         bin_hint: &[],
         protocol: Proto::Anthropic,
+        stdin_prompt: true,
         argv: &[
             Arg::Lit("-p"),
-            Arg::Prompt,
             Arg::Lit("--output-format"),
             Arg::Lit("stream-json"),
             Arg::Lit("--verbose"), // required for stream-json under -p
             // Token-level streaming: emits `stream_event` deltas (text + tool-input) the TS
             // transform turns into AI SDK chunks (features/run-agent/lib/transform.ts).
             Arg::Lit("--include-partial-messages"),
+            // The prompt goes over stdin (stdin_prompt) so the run can hold a live control
+            // channel: permission prompts surface as can_use_tool control_requests instead of
+            // being silently auto-denied (the headless default).
+            Arg::Lit("--input-format"),
+            Arg::Lit("stream-json"),
+            Arg::Lit("--permission-prompt-tool"),
+            Arg::Lit("stdio"),
             Arg::Resume,
             Arg::ModelFlag("--model"),
+            // Reasoning depth (low/medium/high/xhigh/max) — emitted only when the webview
+            // resolved a concrete level for the picked model (codeChatRegistry resolvedEffort).
+            Arg::EffortFlag("--effort"),
             Arg::Permission(claude_permission),
         ],
         resume_args: &["--resume", "{id}"],
@@ -131,11 +166,13 @@ static HARNESSES: &[HarnessSpec] = &[
         id: "codex",
         bin: "codex",
         install: Install::Npm("@openai/codex"),
+        native_dist: None,
         login_marker: &[".codex/auth.json"],
         login_probe: &[],
         extra_env: &[],
         bin_hint: &[],
         protocol: Proto::OpenAi,
+        stdin_prompt: false, // codex exec takes the prompt as a positional; no control protocol
         argv: &[
             Arg::Lit("exec"),
             Arg::Resume, // `resume <id>` is a subcommand — must directly follow `exec`

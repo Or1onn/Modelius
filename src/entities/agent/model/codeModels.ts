@@ -20,10 +20,14 @@ export interface CodeModelGroup {
 // Providers the gateway can serve (OpenAI-compatible): OpenAI by key + every keyed compat provider.
 const CONNECTED_IDS = ["openai", ...KEY_PROVIDER_IDS];
 
+// Non-native picks run the CLI through the local gateway proxy (protocol translation) — mark
+// their group headers so the picker distinguishes them from the CLI's own well-trodden login.
+const VIA_GATEWAY = " · via gateway";
+
 function connectedGroup(pid: string, models: RemoteModel[] | null): CodeModelGroup | null {
   if (!models?.length) return null;
   return {
-    label: PROVIDERS[pid]?.name ?? pid,
+    label: (PROVIDERS[pid]?.name ?? pid) + VIA_GATEWAY,
     models: models.map((m) => ({ kind: "connected", id: m.id, label: m.name || m.id, providerId: pid })),
   };
 }
@@ -49,13 +53,13 @@ function buildGroups(
   }
   if (ollama?.length)
     groups.push({
-      label: "Ollama (local)",
+      label: "Ollama (local)" + VIA_GATEWAY,
       models: ollama.map((m) => ({ kind: "ollama", id: m.id, label: m.name || m.id })),
     });
   const gateways = getGateways().filter((g) => protocolPairSupported(harness.protocol, g.protocol ?? "anthropic"));
   if (gateways.length)
     groups.push({
-      label: "Gateways",
+      label: "Gateways" + VIA_GATEWAY,
       models: gateways.map((g) => ({ kind: "gateway", id: g.model, label: g.name, gatewayId: g.id })),
     });
   return groups;

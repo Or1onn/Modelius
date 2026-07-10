@@ -7,17 +7,70 @@
 // cancellation via the shared cancel registry.
 use crate::harness::{Arg, EnvSpec, HarnessSpec};
 use crate::stream::cancel_guard;
+use std::collections::HashMap;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+// Live stdin handles for runs on the stdio control protocol (harness.stdin_prompt), keyed by
+// stream id. `agent_respond` writes control_responses (permission allow/deny) into them while the
+// pump loop reads stdout. tokio Mutex on the handle: writes are async; the outer std Mutex only
+// guards map access (never held across await).
+pub(crate) type StdinHandle = Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>;
+
+pub(crate) fn agent_stdins() -> &'static Mutex<HashMap<String, StdinHandle>> {
+    static R: OnceLock<Mutex<HashMap<String, StdinHandle>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// RAII: drop the stdin handle on every agent_run exit path. Removing the map entry drops the
+// last Arc (agent_respond only holds a transient clone), which closes the pipe — the CLI sees
+// stdin EOF and exits instead of waiting for more stream-json input.
+struct StdinGuard {
+    id: String,
+}
+
+impl Drop for StdinGuard {
+    fn drop(&mut self) {
+        agent_stdins().lock().unwrap().remove(&self.id);
+    }
+}
+
+// Answer a pending control_request (e.g. a can_use_tool permission prompt) by writing one JSON
+// line to the live run's stdin. The payload is validated as JSON so a malformed string can't
+// corrupt the stream-json channel.
+#[tauri::command]
+pub async fn agent_respond(stream_id: String, payload: String) -> Result<(), String> {
+    serde_json::from_str::<serde_json::Value>(&payload)
+        .map_err(|e| format!("payload must be JSON: {}", e))?;
+    let handle = agent_stdins()
+        .lock()
+        .unwrap()
+        .get(&stream_id)
+        .cloned()
+        .ok_or_else(|| "no live agent run for this stream".to_string())?;
+    let mut stdin = handle.lock().await;
+    let write = async {
+        stdin.write_all(payload.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await
+    };
+    write
+        .await
+        .map_err(|e: std::io::Error| format!("failed to write control response: {}", e))
+}
+
 // Events sent back to the webview. `Line` carries one raw stdout line from the CLI (decoded in TS);
-// `Error` is a spawn/exit failure; `Done` marks stdout EOF.
+// `Error` is a spawn/exit failure; `Stderr` is one live stderr line from a warm run (retry/backoff
+// notices the webview shows as transient turn status — otherwise invisible until process death);
+// `Done` marks the turn's end.
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub(crate) enum PipeEvent {
     Line(String),
     Error(String),
+    Stderr(String),
     Done,
 }
 
@@ -40,6 +93,7 @@ fn build_argv(
     prompt: &str,
     model: &str,
     permission_mode: &str,
+    effort: &str,
     gateway_url: Option<&str>,
     resume: Option<&str>,
 ) -> Vec<String> {
@@ -52,6 +106,12 @@ fn build_argv(
                 if !model.is_empty() {
                     args.push((*flag).to_string());
                     args.push(model.to_string());
+                }
+            }
+            Arg::EffortFlag(flag) => {
+                if !effort.is_empty() {
+                    args.push((*flag).to_string());
+                    args.push(effort.to_string());
                 }
             }
             Arg::Permission(map) => args.extend(map(permission_mode)),
@@ -93,6 +153,7 @@ fn spawn(
     codex_home: Option<&std::path::Path>,
     claude_token: Option<&str>,
     path_env: Option<&std::ffi::OsStr>,
+    stdin_piped: bool,
 ) -> std::io::Result<tokio::process::Child> {
     let mut cmd = Command::new(program);
     for (k, v) in extra_env {
@@ -102,7 +163,10 @@ fn spawn(
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::null());
+        .stdin(if stdin_piped { Stdio::piped() } else { Stdio::null() })
+        // Backstop: if a Child is ever dropped while running (warm session evicted from the
+        // registry mid-race, per-turn reap timeout), the OS process dies with it.
+        .kill_on_drop(true);
     if let Some((env, gateway_url, token, model)) = routed {
         for k in env.base_url {
             cmd.env(k, format!("{}{}", gateway_url, env.base_url_suffix));
@@ -183,8 +247,10 @@ fn write_codex_home(app: &tauri::AppHandle, auth: &CodexAuth) -> Result<std::pat
     Ok(dir)
 }
 
-// Run a harness turn: spawn the CLI in `cwd`, stream its stdout as agent events, honor cancellation.
-// `target` (absent for native-login runs) starts the per-run gateway and re-points the CLI at it.
+// Run a harness turn: stream the CLI's stdout as agent events, honor cancellation. `target`
+// (absent for native-login runs) routes the CLI through the local gateway. With a `session_key`
+// (the code chat id) a stdin_prompt harness runs WARM: one long-lived process per chat, follow-up
+// turns written to its stdin (see session.rs); otherwise each turn spawns a fresh process.
 #[tauri::command]
 pub async fn agent_run(
     app: tauri::AppHandle,
@@ -193,19 +259,17 @@ pub async fn agent_run(
     prompt: String,
     cwd: String,
     permission_mode: String,
+    effort: String,
     resume: Option<String>,
     target: Option<RouteTarget>,
     codex_auth: Option<CodexAuth>,
     claude_token: Option<String>,
+    session_key: Option<String>,
     stream_id: String,
     on_event: tauri::ipc::Channel<PipeEvent>,
 ) -> Result<(), String> {
     let cancel = cancel_guard(&stream_id);
     let spec = crate::harness::spec(&harness).ok_or_else(|| format!("unknown harness: {}", harness))?;
-    let codex_home = match &codex_auth {
-        Some(a) => Some(write_codex_home(&app, a)?),
-        None => None,
-    };
     let program = match crate::installer::resolve_bin(&app, spec.bin) {
         Some(p) => p,
         None => {
@@ -216,8 +280,9 @@ pub async fn agent_run(
     };
     // npm-shipped CLIs are Node programs. If the system Node is missing or broken, silently
     // provision the app's portable runtime (one-time download) so the CLI's `node` shim never
-    // picks a bad install. Script-shipped CLIs (Go binaries) don't need Node at all.
+    // picks a bad install. A managed native binary needs no Node at all — skip the probe.
     if matches!(spec.install, crate::harness::Install::Npm(_))
+        && !crate::installer::is_native_install(&app, &program)
         && !crate::node_runtime::system_node_acceptable()
     {
         if let Err(e) = crate::node_runtime::ensure(&app).await {
@@ -227,6 +292,33 @@ pub async fn agent_run(
     }
     let path_env = crate::node_runtime::child_path_env(&app);
 
+    // Warm path (claude): reuse/spawn the chat's live process and feed it this turn over stdin.
+    // Only stdin_prompt harnesses can run warm — the others take the prompt as argv and exit.
+    if spec.stdin_prompt {
+        if let Some(key) = session_key.filter(|k| !k.is_empty()) {
+            let run = WarmRun {
+                fingerprint: crate::session::Fingerprint {
+                    harness,
+                    model,
+                    cwd,
+                    // argv-only knob: an effort change respawns the session (--resume keeps context)
+                    effort,
+                    target: target.map(|t| (t.protocol, t.base_url, t.api_key)),
+                    claude_token,
+                },
+                permission_mode,
+                resume,
+                prompt,
+                path_env,
+            };
+            return run_warm(&key, spec, &program, run, &cancel, &stream_id, &on_event).await;
+        }
+    }
+
+    let codex_home = match &codex_auth {
+        Some(a) => Some(write_codex_home(&app, a)?),
+        None => None,
+    };
     let gateway = match &target {
         Some(t) => {
             let outbound = match t.protocol.as_str() {
@@ -255,9 +347,9 @@ pub async fn agent_run(
         .map(|(g, url)| (&spec.env, url, g.token.as_str(), model.as_str()));
 
     // Built here (not before the gateway) so Arg::RouteArgs can embed the gateway origin.
-    let args = build_argv(spec, &prompt, &model, &permission_mode, gateway_url.as_deref(), resume.as_deref());
+    let args = build_argv(spec, &prompt, &model, &permission_mode, &effort, gateway_url.as_deref(), resume.as_deref());
 
-    let mut child = match spawn(&program, &args, &cwd, spec.extra_env, routed, codex_home.as_deref(), claude_token.as_deref(), path_env.as_deref()) {
+    let mut child = match spawn(&program, &args, &cwd, spec.extra_env, routed, codex_home.as_deref(), claude_token.as_deref(), path_env.as_deref(), spec.stdin_prompt) {
         Ok(c) => c,
         Err(e) => {
             if let Some(g) = &gateway {
@@ -268,6 +360,47 @@ pub async fn agent_run(
             return Err(msg);
         }
     };
+
+    // stdin_prompt harness: deliver the prompt as a stream-json user message on stdin and keep
+    // the pipe open for control_responses (permission answers via agent_respond). The guard
+    // closes it on every exit path; the pump loop closes it early at the result line.
+    let _stdin_guard = StdinGuard { id: stream_id.clone() };
+    if spec.stdin_prompt {
+        let mut si = match child.stdin.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.start_kill();
+                if let Some(g) = &gateway {
+                    g.shutdown();
+                }
+                return Err("no stdin".to_string());
+            }
+        };
+        let initial = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": prompt }] }
+        })
+        .to_string();
+        let wrote = async {
+            si.write_all(initial.as_bytes()).await?;
+            si.write_all(b"\n").await?;
+            si.flush().await
+        }
+        .await;
+        if let Err(e) = wrote {
+            let _ = child.start_kill();
+            if let Some(g) = &gateway {
+                g.shutdown();
+            }
+            let msg = format!("failed to send prompt to '{}': {}", spec.bin, e);
+            let _ = on_event.send(PipeEvent::Error(msg.clone()));
+            return Err(msg);
+        }
+        agent_stdins()
+            .lock()
+            .unwrap()
+            .insert(stream_id.clone(), Arc::new(tokio::sync::Mutex::new(si)));
+    }
 
     let stdout = match child.stdout.take() {
         Some(s) => s,
@@ -291,8 +424,15 @@ pub async fn agent_run(
         match next {
             Err(_) => continue, // idle — no line yet
             Ok(Ok(Some(line))) => {
+                // With stream-json input the CLI idles for a next message after `result` — close
+                // stdin (drop the handle) so it exits and stdout reaches EOF. Top-level results
+                // only (a subagent's sidechain result must not end the turn) — see session.rs.
+                let done = spec.stdin_prompt && crate::session::is_result_line(&line);
                 // Dumb pipe: forward the raw stdout line; TS decodes it (transform.ts).
                 let _ = on_event.send(PipeEvent::Line(line));
+                if done {
+                    agent_stdins().lock().unwrap().remove(&stream_id);
+                }
             }
             Ok(Ok(None)) => break, // stdout closed → process finishing
             Ok(Err(e)) => {
@@ -337,6 +477,195 @@ pub async fn agent_run(
     Ok(())
 }
 
+// Everything a warm turn needs beyond the shared prelude. The fingerprint doubles as the spawn
+// config (model/cwd/target/auth); permission mode and resume are spawn/turn-time knobs kept out
+// of it (see session::Fingerprint).
+struct WarmRun {
+    fingerprint: crate::session::Fingerprint,
+    permission_mode: String,
+    resume: Option<String>,
+    prompt: String,
+    path_env: Option<std::ffi::OsString>,
+}
+
+// One turn against the chat's warm session: reuse the live process when the run identity matches,
+// else (re)spawn with --resume; write the user message to stdin; wait for the pump to see the
+// turn's `result`. Cancel interrupts in-place (process stays warm) and only kills a deaf CLI.
+async fn run_warm(
+    key: &str,
+    spec: &'static HarnessSpec,
+    program: &std::path::Path,
+    run: WarmRun,
+    cancel: &crate::stream::CancelGuard,
+    stream_id: &str,
+    on_event: &tauri::ipc::Channel<PipeEvent>,
+) -> Result<(), String> {
+    let initial = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": [{ "type": "text", "text": run.prompt }] }
+    })
+    .to_string();
+
+    // Permission answers route by stream id (agent_respond) — the guard drops this turn's
+    // stdin registration on every exit path, mirroring the per-turn flow.
+    let _stdin_guard = StdinGuard { id: stream_id.to_string() };
+
+    // A process that died silently between turns only surfaces as a write failure — retry once
+    // against a fresh spawn. abandon_turn (not detach) keeps the webview stream open for take two.
+    let mut attempt = 0;
+    let (session, mut done_rx) = loop {
+        attempt += 1;
+        let session = match crate::session::get(key).filter(|s| s.matches(&run.fingerprint)) {
+            Some(s) => s,
+            None => {
+                // Stale session under this key (config changed / process dead): drop it first.
+                if let Some(old) = crate::session::remove(key) {
+                    old.close().await;
+                }
+                match spawn_warm(key, spec, program, &run).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = on_event.send(PipeEvent::Error(e.clone()));
+                        return Err(e);
+                    }
+                }
+            }
+        };
+        if let Some(stdin) = session.stdin() {
+            agent_stdins().lock().unwrap().insert(stream_id.to_string(), stdin);
+        }
+        let done_rx = session.attach_turn(on_event.clone());
+        let wrote = async {
+            session.reconcile_permission_mode(&run.permission_mode).await?;
+            session.write_line(&initial).await
+        }
+        .await;
+        match wrote {
+            Ok(()) => break (session, done_rx),
+            Err(e) => {
+                session.abandon_turn();
+                crate::session::close_session(key).await;
+                if attempt >= 2 {
+                    let msg = format!("failed to send prompt to '{}': {}", spec.bin, e);
+                    let _ = on_event.send(PipeEvent::Error(msg.clone()));
+                    return Err(msg);
+                }
+            }
+        }
+    };
+
+    // Wait for the turn, polling the shared cancel flag like every pump loop (bounded 300ms).
+    loop {
+        if cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
+            // Stop the turn but keep the process warm; the CLI acks and closes the turn with an
+            // error_during_execution result. A CLI that stays silent for 5s gets killed.
+            let interrupted = session.interrupt().await.is_ok();
+            let ended = interrupted
+                && tokio::time::timeout(std::time::Duration::from_secs(5), &mut done_rx)
+                    .await
+                    .is_ok();
+            if !ended {
+                session.detach_turn();
+                session.kill().await;
+                if let Some(current) = crate::session::get(key) {
+                    if Arc::ptr_eq(&current, &session) {
+                        crate::session::remove(key);
+                    }
+                }
+            }
+            break;
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(300), &mut done_rx).await {
+            Ok(_) => break, // turn finished (or the session was torn down) — pump sent Done
+            Err(_) => continue,
+        }
+    }
+    session.touch();
+    Ok(())
+}
+
+// Spawn a fresh warm CLI for this chat: session-lifetime gateway on routed runs, argv with
+// --resume when a prior session id exists, registry insert (evicting over the LRU cap).
+async fn spawn_warm(
+    key: &str,
+    spec: &'static HarnessSpec,
+    program: &std::path::Path,
+    run: &WarmRun,
+) -> Result<Arc<crate::session::AgentSession>, String> {
+    let gateway = match &run.fingerprint.target {
+        Some((protocol, base_url, api_key)) => {
+            let outbound = match protocol.as_str() {
+                "anthropic" => crate::gateway::Proto::Anthropic,
+                "openai" => crate::gateway::Proto::OpenAi,
+                other => return Err(format!("unknown target protocol: {}", other)),
+            };
+            Some(
+                crate::gateway::start(crate::gateway::GatewayConfig {
+                    inbound: spec.protocol,
+                    outbound,
+                    target_base: base_url.clone(),
+                    api_key: api_key.clone(),
+                })
+                .await
+                .map_err(|e| format!("failed to start gateway: {}", e))?,
+            )
+        }
+        None => None,
+    };
+    let gateway_url = gateway.as_ref().map(|g| format!("http://127.0.0.1:{}", g.port));
+    let routed = gateway
+        .as_ref()
+        .zip(gateway_url.as_deref())
+        .map(|(g, url)| (&spec.env, url, g.token.as_str(), run.fingerprint.model.as_str()));
+    // stdin_prompt harness: Arg::Prompt is absent from the argv template — the prompt goes over stdin.
+    let args = build_argv(
+        spec,
+        "",
+        &run.fingerprint.model,
+        &run.permission_mode,
+        &run.fingerprint.effort,
+        gateway_url.as_deref(),
+        run.resume.as_deref(),
+    );
+    let child = match spawn(
+        program,
+        &args,
+        &run.fingerprint.cwd,
+        spec.extra_env,
+        routed,
+        None, // codex_home — warm sessions are claude-only
+        run.fingerprint.claude_token.as_deref(),
+        run.path_env.as_deref(),
+        true,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(g) = &gateway {
+                g.shutdown();
+            }
+            return Err(format!("failed to start '{}': {} (is it installed and on PATH?)", spec.bin, e));
+        }
+    };
+    let (session, evicted) = crate::session::spawn_session(
+        key,
+        run.fingerprint.clone(),
+        run.permission_mode.clone(),
+        child,
+        gateway,
+    )?;
+    // Over the warm cap (or a same-key replacement): gracefully drop the losers.
+    for old in evicted {
+        old.close().await;
+    }
+    Ok(session)
+}
+
+// Drop a chat's warm CLI session (chat deleted in the sidebar, or an explicit reset).
+#[tauri::command]
+pub async fn agent_session_close(session_key: String) {
+    crate::session::close_session(&session_key).await;
+}
+
 #[cfg(test)]
 mod tests {
     // build_argv reads the private HarnessSpec argv templates, so it's tested inline (matching
@@ -345,11 +674,15 @@ mod tests {
     use crate::harness::spec;
 
     #[test]
-    fn build_argv_claude_carries_prompt_model_and_permission() {
+    fn build_argv_claude_carries_model_permission_and_control_protocol() {
         let s = spec("claude-code").unwrap();
-        let argv = build_argv(s, "do it", "claude-x", "plan", None, None);
+        let argv = build_argv(s, "do it", "claude-x", "plan", "", None, None);
         assert!(argv.contains(&"-p".to_string()));
-        assert!(argv.contains(&"do it".to_string())); // prompt is its own argv entry
+        // Prompt goes over stdin (stdin_prompt), not argv — the control-protocol flags do instead.
+        assert!(s.stdin_prompt);
+        assert!(!argv.contains(&"do it".to_string()));
+        assert!(argv.windows(2).any(|w| w[0] == "--input-format" && w[1] == "stream-json"));
+        assert!(argv.windows(2).any(|w| w[0] == "--permission-prompt-tool" && w[1] == "stdio"));
         let mi = argv.iter().position(|a| a == "--model").unwrap();
         assert_eq!(argv[mi + 1], "claude-x");
         assert!(argv.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "plan"));
@@ -358,15 +691,24 @@ mod tests {
     #[test]
     fn build_argv_omits_model_flag_when_no_model_picked() {
         let s = spec("claude-code").unwrap();
-        assert!(!build_argv(s, "hi", "", "", None, None).contains(&"--model".to_string()));
+        assert!(!build_argv(s, "hi", "", "", "", None, None).contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn build_argv_claude_emits_effort_only_when_resolved() {
+        let s = spec("claude-code").unwrap();
+        assert!(!build_argv(s, "hi", "", "", "", None, None).contains(&"--effort".to_string()));
+        let argv = build_argv(s, "hi", "", "", "high", None, None);
+        let ei = argv.iter().position(|a| a == "--effort").unwrap();
+        assert_eq!(argv[ei + 1], "high");
     }
 
     #[test]
     fn build_argv_codex_emits_route_args_only_on_a_routed_run() {
         let s = spec("codex").unwrap();
-        let native = build_argv(s, "hi", "gpt", "", None, None);
+        let native = build_argv(s, "hi", "gpt", "", "", None, None);
         assert!(!native.iter().any(|a| a == "model_provider=modelius"));
-        let routed = build_argv(s, "hi", "gpt", "", Some("http://127.0.0.1:9000"), None);
+        let routed = build_argv(s, "hi", "gpt", "", "", Some("http://127.0.0.1:9000"), None);
         assert!(routed.iter().any(|a| a == "model_provider=modelius"));
         assert!(routed
             .iter()
@@ -376,8 +718,8 @@ mod tests {
     #[test]
     fn build_argv_claude_emits_resume_flag_only_with_an_id() {
         let s = spec("claude-code").unwrap();
-        assert!(!build_argv(s, "hi", "", "", None, Some("")).contains(&"--resume".to_string()));
-        let argv = build_argv(s, "hi", "", "", None, Some("sess-1"));
+        assert!(!build_argv(s, "hi", "", "", "", None, Some("")).contains(&"--resume".to_string()));
+        let argv = build_argv(s, "hi", "", "", "", None, Some("sess-1"));
         let ri = argv.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(argv[ri + 1], "sess-1");
     }
@@ -385,8 +727,8 @@ mod tests {
     #[test]
     fn build_argv_codex_resume_subcommand_directly_follows_exec() {
         let s = spec("codex").unwrap();
-        assert!(!build_argv(s, "hi", "", "", None, None).contains(&"resume".to_string()));
-        let argv = build_argv(s, "hi", "", "", None, Some("thread-1"));
+        assert!(!build_argv(s, "hi", "", "", "", None, None).contains(&"resume".to_string()));
+        let argv = build_argv(s, "hi", "", "", "", None, Some("thread-1"));
         assert_eq!(argv[0], "exec");
         assert_eq!(argv[1], "resume");
         assert_eq!(argv[2], "thread-1");

@@ -11,6 +11,7 @@ import { ctxTokens } from "@/shared/lib/tokens";
 import { useOutsideClick } from "@/shared/lib/useOutsideClick";
 import { useAutosize } from "@/shared/lib/useAutosize";
 import { MODEL_BY_ID } from "@/entities/model/model/registry";
+import { anthropicEffortTier, EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
 import { HARNESSES, HARNESS_BY_ID, PERMISSION_MODES, PERMISSION_LABEL, type NativeKind } from "@/entities/agent/model/harnesses";
 import { useHarnessStatuses, refreshHarnessStatuses, installHarness, cliLoggedIn } from "@/entities/agent/model/harnessStatus";
 import { hasAnthropicOAuth } from "@/entities/session/model/anthropicSession";
@@ -23,11 +24,14 @@ import { useGateways } from "@/entities/agent/model/gateways";
 import { GatewayModal } from "@/pages/code/ui/GatewayModal";
 import { listBranches, checkoutBranch } from "@/entities/agent/model/git";
 import { getCodeChat, getCodeConfig, setCodeConfig, subscribeCodeConfig } from "@/features/run-agent/lib/codeChatRegistry";
+import { getTurnStatus, subscribeTurnStatus } from "@/features/run-agent/lib/turnStatus";
 import { AssistantMessage } from "@/pages/code/ui/messageParts";
 import { CodeStats, PLogo } from "@/pages/code/ui/CodeStats";
 import { getRecentFolders, pushRecentFolder } from "@/pages/code/model/recentFolders";
 
 const basename = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
+
+const EFFORT_LABEL: Record<EffortLevel, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "X-high", max: "Max" };
 
 // ---- small model badge (provider logo + name) ----
 function badgePid(model: CodeModelChoice): string {
@@ -40,10 +44,18 @@ function badgePid(model: CodeModelChoice): string {
 
 function ModelBadge({ model }: { model: CodeModelChoice }) {
   const pid = badgePid(model);
+  // Non-native picks run the CLI through the local gateway proxy — flag them wherever the badge
+  // shows, so tool-calling quirks are traceable to the routing at a glance.
+  const routed = model.kind !== "anthropic" && model.kind !== "codex";
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
       {pid && <PLogo pid={pid} />}
       <span style={{ fontWeight: 520 }}>{model.label}</span>
+      {routed && (
+        <span style={{ fontSize: 11, color: "var(--text-3)", border: "1px solid var(--border)", borderRadius: 4, padding: "0 4px", whiteSpace: "nowrap" }}>
+          via gateway
+        </span>
+      )}
     </span>
   );
 }
@@ -154,7 +166,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const subscribe = useCallback((cb: () => void) => subscribeCodeConfig(chatId, cb), [chatId]);
   const getSnapshot = useCallback(() => getCodeConfig(chatId), [chatId]);
   const config = useSyncExternalStore(subscribe, getSnapshot);
-  const { harness: harnessId, model, cwd, permissionMode } = config;
+  const { harness: harnessId, model, cwd, permissionMode, effort } = config;
 
   const [input, setInput] = useState("");
   const [recents, setRecents] = useState<string[]>(() => getRecentFolders());
@@ -167,11 +179,30 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const harnessStatuses = useHarnessStatuses();
   const harness = HARNESS_BY_ID[harnessId];
   const registryModel = model.kind === "anthropic" ? MODEL_BY_ID[model.id] : undefined;
+  // Effort picker only for native Anthropic picks whose model gates it (mirrors resolvedEffort in
+  // the registry — other picks send no --effort flag at all).
+  const effortTier = model.kind === "anthropic" ? anthropicEffortTier(model.id) : null;
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const hintRef = useRef<HTMLDivElement>(null);
   const [showHint, setShowHint] = useState(false);
   const busy = status === "streaming" || status === "submitted";
+
+  // Live turn status: the CLI's latest stderr line (retry/backoff), plus a silence detector —
+  // long gaps between output lines (rate-limited / slow model start) would otherwise look like a
+  // dead stall. A coarse ticker re-renders while busy so the silence hint can appear eventless.
+  const turnStatus = useSyncExternalStore(
+    useCallback((cb: () => void) => subscribeTurnStatus(chatId, cb), [chatId]),
+    useCallback(() => getTurnStatus(chatId), [chatId])
+  );
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!busy) return;
+    const t = setInterval(() => setTick((x) => x + 1), 5000);
+    return () => clearInterval(t);
+  }, [busy]);
+  const silentMs = turnStatus.activityAt ? Date.now() - turnStatus.activityAt : 0;
+  const workNote = busy ? (turnStatus.note ?? (silentMs > 15_000 ? "waiting for the model…" : null)) : null;
 
   // Prompt-token fill + cost from the last assistant turn's metadata.
   const lastMeta = [...messages].reverse().find((m) => m.role === "assistant")?.metadata as RunMeta | undefined;
@@ -263,6 +294,14 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     void stopChat();
   }
 
+  // Plan-mode handoff: the user approved the agent's plan — flip this chat to acceptEdits (the CLI
+  // can't prompt mid-run) and resume the session so the agent executes what it just planned.
+  function approvePlan() {
+    if (busy) return;
+    setCodeConfig(chatId, { permissionMode: "acceptEdits" });
+    void sendMessage({ text: "Plan approved — proceed with the implementation." });
+  }
+
   return (
     <div className="cd-wrap">
       {/* Header: workspace folder selector */}
@@ -298,13 +337,20 @@ export function CodeScreen({ chatId }: { chatId: string }) {
             m.role === "user" ? (
               <div key={m.id} className="cd-user"><div className="cd-user-bubble">{userText(m)}</div></div>
             ) : (
-              <AssistantMessage key={m.id} message={m} streaming={busy && i === messages.length - 1} />
+              <AssistantMessage
+                key={m.id}
+                message={m}
+                streaming={busy && i === messages.length - 1}
+                onApprovePlan={!busy && i === messages.length - 1 ? approvePlan : undefined}
+                chatId={chatId}
+              />
             )
           )}
           {busy && (
             <div className="cd-working">
               <span className="cd-work-dot" />
-              <span>Working — <ModelBadge model={model} /></span>
+              <span className="cd-work-label">Working — <ModelBadge model={model} /></span>
+              {workNote && <span className="cd-work-note mono">{workNote}</span>}
             </div>
           )}
         </div>
@@ -384,13 +430,23 @@ export function CodeScreen({ chatId }: { chatId: string }) {
           </div>
         </div>
 
-        {/* Controls row under the input: permission left, branch + context ring right */}
+        {/* Controls row under the input: permission + effort left, branch + context ring right */}
         <div className="cd-underbar">
           <Picker
             label={PERMISSION_LABEL[permissionMode] ?? permissionMode}
             items={PERMISSION_MODES.map((m) => ({ id: m.id, label: m.label }))}
             onSelect={(id) => setCodeConfig(chatId, { permissionMode: id })}
           />
+          {effortTier && (
+            <Picker
+              label={`Effort: ${effort === "auto" ? "auto" : resolveEffort(effortTier, effort)}`}
+              items={[
+                { id: "auto", label: "Auto", sub: `→ ${resolveEffort(effortTier, "auto")}`, check: effort === "auto" },
+                ...EFFORT_LEVELS[effortTier].map((l) => ({ id: l, label: EFFORT_LABEL[l], check: effort === l })),
+              ]}
+              onSelect={(id) => setCodeConfig(chatId, { effort: id as EffortLevel | "auto" })}
+            />
+          )}
           <span style={{ flex: 1 }} />
           {branches.length > 0 && (
             <Picker

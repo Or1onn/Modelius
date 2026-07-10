@@ -54,4 +54,37 @@ describe("claude transform", () => {
     expect(meta.messageMetadata.sessionId).toBe("sess-9");
     expect(meta.messageMetadata.totalCostUsd).toBe(0.02);
   });
+
+  // Regression: subagent (sidechain) lines interleave with the MAIN thread's stream_events
+  // (captured live from claude 2.1.206 with background Task agents). They must not flush the
+  // main thread's half-streamed tool input or end the turn.
+  it("keeps a streaming tool input intact across an interleaved sidechain assistant line", () => {
+    const cs = run([
+      { type: "stream_event", event: { type: "content_block_start", content_block: { type: "tool_use", id: "t1", name: "Read" } }, parent_tool_use_id: null },
+      { type: "stream_event", event: { type: "content_block_delta", delta: { type: "input_json_delta", partial_json: '{"file_path": "a' } }, parent_tool_use_id: null },
+      // subagent narration + tool call land mid-stream, complete, parent-tagged
+      { type: "assistant", message: { content: [{ type: "text", text: "I'll run the sleep command now." }] }, parent_tool_use_id: "toolu_parent" },
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "sub1", name: "Bash", input: { command: "sleep 8" } }] }, parent_tool_use_id: "toolu_parent" },
+      { type: "stream_event", event: { type: "content_block_delta", delta: { type: "input_json_delta", partial_json: '.ts"}' } }, parent_tool_use_id: null },
+      { type: "stream_event", event: { type: "content_block_stop" }, parent_tool_use_id: null },
+    ]);
+    const read = cs.find(
+      (c) => c.type === "tool-input-available" && (c as { toolName?: string }).toolName === "Read"
+    ) as Extract<UIMessageChunk, { type: "tool-input-available" }>;
+    expect(read.input).toEqual({ file_path: "a.ts" }); // whole input survived the interleave
+    const sub = cs.find(
+      (c) => c.type === "tool-input-available" && (c as { toolName?: string }).toolName === "Bash"
+    ) as Extract<UIMessageChunk, { type: "tool-input-available" }>;
+    expect(sub.toolCallId).toBe("toolu_parent:sub1"); // sidechain tool still renders, nested
+  });
+
+  it("ignores a sidechain result and finishes only on the top-level one", () => {
+    const cs = run([
+      { type: "result", subtype: "success", parent_tool_use_id: "toolu_parent", session_id: "sub" },
+      { type: "result", subtype: "success", parent_tool_use_id: null, session_id: "sess-9" },
+    ]);
+    expect(cs.filter((c) => c.type === "finish")).toHaveLength(1);
+    const meta = cs.find((c) => c.type === "message-metadata") as Extract<UIMessageChunk, { type: "message-metadata" }>;
+    expect(meta.messageMetadata.sessionId).toBe("sess-9");
+  });
 });

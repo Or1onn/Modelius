@@ -1383,6 +1383,39 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 [data-theme="light"] .cd-tool-chev,
 [data-theme="light"] .cd-tool-caret { color: rgba(0,0,0,0.60); }
 
+/* plan card (ExitPlanMode): the agent's plan rendered as the turn's outcome + Approve action */
+.cd-plan { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-1); overflow: hidden; }
+.cd-plan-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 12.5px; font-weight: 560; color: var(--text-2); border-bottom: 1px solid var(--border); }
+.cd-plan-body { padding: 12px 14px; font-size: 13.5px; line-height: 1.6; color: var(--text-2); max-height: 480px; overflow: auto; }
+.cd-plan-actions { display: flex; justify-content: flex-end; padding: 10px 14px; border-top: 1px solid var(--border); }
+.cd-plan-approve { padding: 6px 14px; font-size: 12.5px; font-weight: 600; color: #04201C; background: var(--accent); border-radius: var(--radius); cursor: pointer; transition: opacity .12s; }
+.cd-plan-approve:hover { opacity: 0.88; }
+.cd-plan-reject { padding: 6px 14px; font-size: 12.5px; font-weight: 560; color: var(--text-2); border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-1); cursor: pointer; transition: background .12s; }
+.cd-plan-reject:hover { background: color-mix(in oklab, var(--surface-2) 55%, transparent); }
+.cd-plan-actions { gap: 8px; }
+
+/* permission prompt card (live can_use_tool request — the CLI is blocked until answered) */
+.cd-perm { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-1); overflow: hidden; }
+.cd-perm-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 12.5px; font-weight: 560; color: var(--text-2); }
+.cd-perm-verdict { margin-left: auto; font-size: 11px; color: var(--text-4); text-transform: capitalize; }
+.cd-perm-cmd { padding: 8px 14px; border-top: 1px solid var(--border); background: color-mix(in oklab, var(--surface-2) 40%, transparent); font-size: 12px; color: var(--text-3); white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow: auto; }
+.cd-perm-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
+.cd-perm-btn { padding: 6px 14px; font-size: 12.5px; font-weight: 560; border-radius: var(--radius); cursor: pointer; transition: opacity .12s, background .12s; }
+.cd-perm-btn.allow { font-weight: 600; color: #04201C; background: var(--accent); }
+.cd-perm-btn.allow:hover { opacity: 0.88; }
+.cd-perm-btn.deny { color: var(--text-2); border: 1px solid var(--border); background: var(--surface-1); }
+.cd-perm-btn.deny:hover { background: color-mix(in oklab, var(--surface-2) 55%, transparent); }
+.cd-perm-btn:disabled { opacity: 0.45; cursor: default; }
+/* AskUserQuestion card: question text + selectable option rows inside the cd-perm frame. */
+.cd-q { padding: 10px 14px 4px; border-top: 1px solid var(--border); }
+.cd-q-text { font-size: 13px; font-weight: 560; color: var(--text-1); margin-bottom: 8px; }
+.cd-q-opt { display: block; width: 100%; text-align: left; margin-bottom: 6px; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-1); cursor: pointer; transition: border-color .12s, background .12s; }
+.cd-q-opt:hover { background: color-mix(in oklab, var(--surface-2) 55%, transparent); }
+.cd-q-opt.on { border-color: var(--accent); background: color-mix(in oklab, var(--accent) 8%, transparent); }
+.cd-q-opt:disabled { cursor: default; opacity: 0.7; }
+.cd-q-opt-label { display: block; font-size: 12.5px; font-weight: 560; color: var(--text-2); }
+.cd-q-opt-desc { display: block; font-size: 11.5px; color: var(--text-4); margin-top: 2px; }
+
 /* edit summary line (precedes a diff) */
 .cd-editline { display: flex; align-items: center; gap: 9px; padding: 2px 2px; font-size: 13px; }
 .cd-edit-verb { color: var(--text-2); font-weight: 520; }
@@ -1406,8 +1439,10 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 /* live status */
 .cd-routing { display: inline-flex; align-items: center; gap: 9px; font-size: 12.5px; color: var(--text-3); padding: 4px 0; }
 .cd-working { display: inline-flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-3); padding: 4px 0; }
-.cd-working > span:last-child { display: inline-flex; align-items: center; gap: 8px; }
+.cd-working .cd-work-label { display: inline-flex; align-items: center; gap: 8px; }
 .cd-work-dot { width: 7px; height: 7px; border-radius: 99px; background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+/* Transient turn status: CLI retry/backoff line or the silence hint ("waiting for the model…"). */
+.cd-work-note { font-size: 11px; color: var(--text-4); max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* composer */
 .cd-composer-wrap { flex-shrink: 0; padding: 8px 26px 20px; }

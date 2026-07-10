@@ -11,6 +11,7 @@ mod installer;
 mod node_runtime;
 mod openai;
 mod secrets;
+mod session;
 mod stream;
 mod vault;
 
@@ -46,6 +47,8 @@ pub fn run() {
             compat::ollama_show,
             stream::cancel_stream,
             agent::agent_run,
+            agent::agent_respond,
+            agent::agent_session_close,
             installer::harness_status,
             installer::harness_install,
             installer::harness_logged_in,
@@ -59,6 +62,13 @@ pub fn run() {
             vault::vault_encrypt,
             vault::vault_decrypt
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, event| {
+            // Warm agent CLIs (session.rs) outlive any webview call — reap them with the app so
+            // a quit never strands claude processes (kill_on_drop only covers dropped handles).
+            if let tauri::RunEvent::Exit = event {
+                session::close_all();
+            }
+        });
 }

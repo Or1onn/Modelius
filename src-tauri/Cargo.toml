@@ -36,6 +36,7 @@ rand = "0.8"
 base64 = "0.22"
 which = "6"
 humantime = "2"
+sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"

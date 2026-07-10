@@ -39,6 +39,7 @@ export interface CodeChatBody {
   modelId: string; // kept alongside `model` so pre-routing builds can still open the chat
   model?: CodeModelChoice;
   permissionMode: string;
+  effort?: string; // "auto" or an Anthropic effort level; absent on pre-effort bodies
   title: string;
 }
 
@@ -62,6 +63,7 @@ export async function loadCodeBody(id: string): Promise<CodeChatBody | null> {
     model: b.model ?? (b.modelId ? fromLegacyModelId(b.modelId) : undefined),
     // Retired "default" (Ask each time) mode — headless CLIs can't prompt; coerce to acceptEdits.
     permissionMode: b.permissionMode && b.permissionMode !== "default" ? b.permissionMode : "acceptEdits",
+    effort: b.effort ?? "auto",
     title: b.title ?? "",
   };
 }

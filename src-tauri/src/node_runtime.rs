@@ -90,8 +90,27 @@ pub(crate) fn version_acceptable(v: &str) -> bool {
     major != 24 || minor != 17
 }
 
+// How long a probe result stays valid. Long enough that a turn never pays the subprocess twice,
+// short enough that a user who installs/fixes Node mid-session is picked up without a restart.
+const NODE_CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn cache_fresh(at: std::time::Instant, now: std::time::Instant) -> bool {
+    now.duration_since(at) < NODE_CHECK_TTL
+}
+
 pub(crate) fn system_node_acceptable() -> bool {
-    system_node_version().as_deref().is_some_and(version_acceptable)
+    // Cached: this spawns `node --version`, and agent_run consults it on every npm-harness turn.
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+    let now = std::time::Instant::now();
+    let mut slot = CACHE.lock().unwrap();
+    if let Some((at, ok)) = *slot {
+        if cache_fresh(at, now) {
+            return ok;
+        }
+    }
+    let ok = system_node_version().as_deref().is_some_and(version_acceptable);
+    *slot = Some((now, ok));
+    ok
 }
 
 // Download + extract the pinned portable Node (idempotent; serialized against concurrent calls).
@@ -162,5 +181,13 @@ mod tests {
         assert!(!version_acceptable("v22.18.0")); // below 22.19
         assert!(!version_acceptable("v20.0.0")); // major too low
         assert!(!version_acceptable("v24.17.1")); // the blocked CVE build
+    }
+
+    #[test]
+    fn node_check_cache_expires_on_ttl() {
+        let now = std::time::Instant::now();
+        assert!(cache_fresh(now, now));
+        assert!(cache_fresh(now, now + NODE_CHECK_TTL - std::time::Duration::from_secs(1)));
+        assert!(!cache_fresh(now, now + NODE_CHECK_TTL));
     }
 }

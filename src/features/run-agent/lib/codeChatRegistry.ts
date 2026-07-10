@@ -5,6 +5,7 @@
 // into a concrete `agent_run` invocation. Persistence + the UI subscription layer wrap this.
 import type { UIMessage } from "ai";
 import { Chat } from "@ai-sdk/react";
+import { invoke } from "@tauri-apps/api/core";
 import { HARNESSES, HARNESS_BY_ID } from "@/entities/agent/model/harnesses";
 import {
   DEFAULT_CODE_MODEL,
@@ -12,6 +13,7 @@ import {
   defaultModelForHarness,
   type CodeModelChoice,
 } from "@/entities/agent/model/codeModel";
+import { anthropicEffortTier, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
 import { getGateways, gatewaySecretKey } from "@/entities/agent/model/gateways";
 import { OLLAMA_HOST } from "@/entities/session/model/ollamaSession";
 import { getCodexAuth } from "@/entities/session/model/openaiSession";
@@ -30,6 +32,7 @@ export interface CodeConfig {
   model: CodeModelChoice;
   cwd: string;
   permissionMode: string;
+  effort: EffortLevel | "auto"; // reasoning depth for Anthropic picks; "auto" → the tier default
 }
 
 interface Entry {
@@ -55,7 +58,7 @@ if (import.meta.hot) {
 }
 
 function defaultConfig(): CodeConfig {
-  return { harness: DEFAULT_HARNESS, model: DEFAULT_CODE_MODEL, cwd: "", permissionMode: "acceptEdits" };
+  return { harness: DEFAULT_HARNESS, model: DEFAULT_CODE_MODEL, cwd: "", permissionMode: "acceptEdits", effort: "auto" };
 }
 
 // Concatenate the text parts of a UIMessage (the CLI prompt is plain text).
@@ -93,6 +96,14 @@ async function resolveRouting(model: CodeModelChoice, harnessId: string): Promis
   return { protocol: "openai", baseUrl: base, apiKey: key };
 }
 
+// Concrete --effort level for the CLI: only native Anthropic picks whose model gates effort get
+// one (auto → the tier default, matching what the UI shows). Everything else → "" (no flag).
+function resolvedEffort(config: CodeConfig): string {
+  if (config.model.kind !== "anthropic") return "";
+  const tier = anthropicEffortTier(config.model.id);
+  return tier ? resolveEffort(tier, config.effort) : "";
+}
+
 // Turn the current message list + config into a concrete run (called by the transport per send).
 async function resolveSend(chatId: string, messages: UIMessage[]): Promise<ResolvedSend> {
   const { config } = ensure(chatId);
@@ -113,7 +124,7 @@ async function resolveSend(chatId: string, messages: UIMessage[]): Promise<Resol
   return {
     prompt,
     resume,
-    run: { harness: config.harness, model: config.model.id, cwd: config.cwd, permissionMode: config.permissionMode, target, codexAuth, claudeToken },
+    run: { harness: config.harness, model: config.model.id, cwd: config.cwd, permissionMode: config.permissionMode, effort: resolvedEffort(config), target, codexAuth, claudeToken },
   };
 }
 
@@ -122,7 +133,7 @@ function ensure(chatId: string): Entry {
   if (e) return e;
   const chat = new Chat<UIMessage>({
     id: chatId,
-    transport: new CodeChatTransport((messages) => resolveSend(chatId, messages)),
+    transport: new CodeChatTransport(chatId, (messages) => resolveSend(chatId, messages)),
     onFinish: () => void persist(chatId), // save the finished transcript + index it for the sidebar
   });
   e = { chat, config: defaultConfig(), listeners: new Set(), createdAt: Date.now() };
@@ -143,7 +154,7 @@ async function load(chatId: string): Promise<void> {
   let model = body.model ?? e.config.model;
   const harness = body.harnessId && HARNESS_BY_ID[body.harnessId] ? body.harnessId : e.config.harness;
   if (!choiceFitsHarness(model, harness)) model = defaultModelForHarness(harness);
-  e.config = { harness, model, cwd: body.cwd, permissionMode: body.permissionMode };
+  e.config = { harness, model, cwd: body.cwd, permissionMode: body.permissionMode, effort: (body.effort as EffortLevel | "auto") ?? "auto" };
   e.chat.messages = body.messages;
   e.listeners.forEach((fn) => fn());
 }
@@ -179,6 +190,7 @@ async function persistNow(chatId: string): Promise<void> {
     modelId: e.config.model.id,
     model: e.config.model,
     permissionMode: e.config.permissionMode,
+    effort: e.config.effort,
     title: "",
   });
   upsertCodeChat(entry);
@@ -221,4 +233,6 @@ export function dropCodeChat(chatId: string): void {
   const e = entries.get(chatId);
   void e?.chat.stop();
   entries.delete(chatId);
+  // Reap the chat's warm CLI process (no-op when none is live).
+  void invoke("agent_session_close", { sessionKey: chatId }).catch(() => {});
 }
