@@ -1,7 +1,11 @@
 // SettingsScreen.tsx — app preferences: routing policy + global custom instructions.
 // Both persist via the reactive settings store and apply to every chat.
 import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { save, open } from "@tauri-apps/plugin-dialog";
+import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import { Icon } from "@/shared/ui/Icon";
+import { isTauri } from "@/shared/api/tauri";
 import { POLICIES, type PolicyId } from "@/entities/model/model/registry";
 import { useSettings, setPolicy, setCustomInstructions, setZoom, setTheme, type ThemeId } from "@/entities/settings/model/settings";
 
@@ -108,6 +112,83 @@ export function SettingsScreen() {
             onBlur={() => setCustomInstructions(draft.trim())}
           />
         </div>
+
+        {isTauri() && <EncryptionBackup />}
+      </div>
+    </div>
+  );
+}
+
+// Passphrase-protected backup/restore of the encryption key (DEK). Chats, memory, artifacts, and
+// settings are encrypted with a random key kept only in the OS keychain — if that key is lost
+// (OS reset, machine move) the data is unrecoverable without a backup.
+function EncryptionBackup() {
+  const [pass, setPass] = useState("");
+  const [msg, setMsg] = useState<{ err: boolean; text: string } | null>(null);
+
+  async function backup() {
+    const p = pass.trim();
+    if (p.length < 8) return setMsg({ err: true, text: "Use a passphrase of at least 8 characters." });
+    try {
+      const blob = await invoke<string>("vault_export_key", { passphrase: p });
+      const path = await save({ defaultPath: "modelius-key-backup.txt", filters: [{ name: "Backup", extensions: ["txt"] }] });
+      if (!path) return; // cancelled
+      await writeTextFile(path, blob);
+      setMsg({ err: false, text: "Backup saved. Keep the file and passphrase somewhere safe." });
+    } catch (e) {
+      setMsg({ err: true, text: e instanceof Error ? e.message : "Backup failed." });
+    }
+  }
+
+  async function restore() {
+    const p = pass.trim();
+    if (!p) return setMsg({ err: true, text: "Enter the passphrase used for the backup." });
+    try {
+      const picked = await open({ multiple: false, filters: [{ name: "Backup", extensions: ["txt"] }] });
+      if (typeof picked !== "string") return; // cancelled
+      const blob = await readTextFile(picked);
+      await invoke("vault_import_key", { blob, passphrase: p });
+      setMsg({ err: false, text: "Key restored. Restart the app to finish decrypting your data." });
+    } catch (e) {
+      setMsg({ err: true, text: e instanceof Error ? e.message : "Restore failed — wrong passphrase or file?" });
+    }
+  }
+
+  return (
+    <div className="set-section">
+      <h2 className="set-section-title">Encryption backup</h2>
+      <p className="set-section-sub">
+        Your chats, memory, and artifacts are encrypted with a key stored only in this device's
+        keychain. If the keychain is reset or you move to a new machine, that data is
+        <strong> unrecoverable without a backup.</strong> Export the key under a passphrase and keep
+        it somewhere safe.
+      </p>
+      <div style={{ maxWidth: 420 }}>
+        <div className="field-label">
+          <Icon name="key" size={13} />
+          Backup passphrase
+        </div>
+        <div className="key-input">
+          <input
+            type="password"
+            spellCheck={false}
+            placeholder="Passphrase (needed to restore)"
+            value={pass}
+            onChange={(e) => { setPass(e.target.value); if (msg) setMsg(null); }}
+          />
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+          <button className="btn-run" onClick={backup}>
+            <Icon name="download" size={14} />
+            Create backup
+          </button>
+          <button className="btn-ghost" onClick={restore}>Restore from file</button>
+        </div>
+        {msg && (
+          <p className="set-section-sub" style={{ marginTop: 12, marginBottom: 0, color: msg.err ? "var(--danger)" : "var(--text-2)" }}>
+            {msg.text}
+          </p>
+        )}
       </div>
     </div>
   );

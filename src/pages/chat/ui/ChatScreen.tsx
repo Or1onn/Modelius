@@ -1,9 +1,9 @@
 // ChatScreen.tsx — chat page view: composer, model picker, artifact-panel host. Thread via widget.
-import { Fragment, useEffect, useMemo, useRef, useState, type UIEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChatThread } from "@/widgets/chat-thread/ui/ChatThread";
 import { ArtifactPanel } from "@/widgets/artifact-panel/ui/ArtifactPanel";
 import { Icon } from "@/shared/ui/Icon";
-import { ProviderLogo } from "@/entities/model/ui/ProviderLogo";
+import { ModelMenu, type ModelMenuItem } from "@/entities/model/ui/ModelMenu";
 import { codeSegs } from "@/shared/lib/markdown";
 import { PROVIDERS, type Message, type PolicyId, type ImageRef } from "@/entities/model/model/registry";
 import type { ModelOption } from "@/entities/model/model/backend";
@@ -33,16 +33,6 @@ function resolveBlock(msg: Message | undefined, blockIndex: number): Artifact | 
   const body = msg.streaming ? msg.shown || "" : msg.text;
   const c = codeSegs(body)[blockIndex];
   return c ? makeArtifact(c.lang, c.code) : null;
-}
-
-// ProviderLogo props for a model option: OpenRouter rows resolve the icon to the id's vendor
-// brand (e.g. "anthropic/claude-…" → Claude); everything else uses the provider's own logo.
-function vendorOf(o: ModelOption): { pid: string; short: string; modelId?: string } {
-  if (o.provider === "openrouter" && o.backend.model.includes("/")) {
-    const vendor = o.backend.model.replace(/^~/, "").split("/")[0];
-    return { pid: o.provider, short: vendor.slice(0, 2).toUpperCase(), modelId: o.backend.model };
-  }
-  return { pid: o.provider, short: PROVIDERS[o.provider]?.short ?? "?" };
 }
 
 // Greeting for the new-chat hero.
@@ -141,8 +131,7 @@ export function ChatScreen({
     persistModelSel(chatId, sel);
     setModelSelState(sel);
   };
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const [modelQuery, setModelQuery] = useState(""); // search filter in the picker
+  const [modelMenuOpen, setModelMenuOpen] = useState(false); // mirrors ModelMenu's open state (drives the refetch below)
   const [thinking, setThinking] = useState(false); // request the reasoning trace
   const [web, setWeb] = useState(true); // server-side web search — on by default
   const [addMenuOpen, setAddMenuOpen] = useState(false); // composer "+" menu (files + web search)
@@ -151,11 +140,8 @@ export function ChatScreen({
   const [effortOpen, setEffortOpen] = useState(false); // effort flyout
   const effortTimer = useRef<number | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
-  const modelPickRef = useRef<HTMLDivElement>(null);
   const [options, setOptions] = useState<ModelOption[]>(peekAvailableModels);
   const [modelsLoading, setModelsLoading] = useState(false);
-  const PICKER_PAGE = 40; // reveal the list in pages (large providers like OpenRouter have 300+)
-  const [pickerShown, setPickerShown] = useState(PICKER_PAGE);
   const [openRef, setOpenRef] = useState<OpenRef | null>(null); // artifact the right panel shows
   const [attachments, setAttachments] = useState<Artifact[]>([]); // pending pasted/dropped text → artifact chips
   const [images, setImages] = useState<ImageRef[]>([]); // pending image attachments (vision)
@@ -181,17 +167,8 @@ export function ChatScreen({
     };
   }, [modelMenuOpen]);
 
-  // Close the model menu / composer "+" menu on an outside click.
-  useOutsideClick(modelPickRef, modelMenuOpen, () => setModelMenuOpen(false));
+  // Close the composer "+" menu on an outside click (ModelMenu handles its own).
   useOutsideClick(addMenuRef, addMenuOpen, () => setAddMenuOpen(false));
-
-  // Collapse the effort flyout and clear the search whenever the model menu closes.
-  useEffect(() => {
-    if (!modelMenuOpen) {
-      setEffortOpen(false);
-      setModelQuery("");
-    }
-  }, [modelMenuOpen]);
 
   // Default a reopened chat to its last manually-used model: the in-memory pick is lost on restart,
   // but assistant turns record the model on the message. Restore once, only if nothing is picked.
@@ -212,41 +189,23 @@ export function ChatScreen({
 
   // Group the list by connection: a Codex (ChatGPT) account, else the provider's display name.
   // Options arrive already blocked per provider, so a header is shown wherever the group changes.
-  const groupKey = (o: ModelOption) => (o.backend.kind === "chatgpt" ? "codex" : o.provider);
   const groupName = (o: ModelOption) =>
     o.backend.kind === "chatgpt" ? "Codex" : PROVIDERS[o.provider]?.name ?? o.provider;
 
-  // Filter the live model list by the search query (matches model name, provider id, and group name).
-  // Memoized — large lists (OpenRouter: 300+) would otherwise re-filter on every unrelated render.
-  const q = modelQuery.trim().toLowerCase();
-  const filteredOptions = useMemo(
-    () => (q ? options.filter((o) => (o.label + " " + o.provider + " " + groupName(o)).toLowerCase().includes(q)) : options),
+  // Map live backend options to the shared ModelMenu item shape (search/paging/scroll live there).
+  // Memoized — large lists (OpenRouter: 300+) would otherwise remap on every unrelated render.
+  const modelItems = useMemo<ModelMenuItem[]>(
+    () =>
+      options.map((o) => ({
+        key: o.key,
+        label: o.label,
+        group: groupName(o),
+        pid: o.provider,
+        modelId: o.provider === "openrouter" ? o.backend.model : undefined,
+      })),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [options, q]
+    [options]
   );
-  const autoMatches = !q || "auto routed by policy".includes(q);
-
-  // On open with no search, page far enough to include the selected model and flag it for scroll-into-view;
-  // while searching (or with no pick) restart paging from the top.
-  const pickerScrollPending = useRef(false);
-  useEffect(() => {
-    if (modelMenuOpen && !q && modelSel) {
-      const idx = options.findIndex((o) => o.key === modelSel.key);
-      if (idx >= 0) {
-        setPickerShown(Math.max(PICKER_PAGE, idx + PICKER_PAGE));
-        pickerScrollPending.current = true;
-        return;
-      }
-    }
-    setPickerShown(PICKER_PAGE);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modelMenuOpen, q]);
-  const onPickerScroll = (e: UIEvent<HTMLDivElement>) => {
-    const el = e.currentTarget;
-    if (el.scrollHeight - el.scrollTop - el.clientHeight < 32) {
-      setPickerShown((n) => (n < filteredOptions.length ? n + PICKER_PAGE : n));
-    }
-  };
 
   const autosize = useAutosize(taRef, 260);
 
@@ -487,154 +446,96 @@ export function ChatScreen({
           )}
         </div>
         <span className="comp-div" />
-        <div className="model-pick-wrap" ref={modelPickRef}>
-          <button
-            className={"model-pick" + (modelSel ? " on" : "")}
-            onClick={() => setModelMenuOpen((v) => !v)}
-            title="Choose which model answers"
-          >
-            {modelSel ? (
-              <span
-                className="model-pick-logo"
-                style={{ color: PROVIDERS[modelSel.provider]?.color }}
+        <ModelMenu
+          items={modelItems}
+          selectedKey={modelSel?.key ?? null}
+          onSelect={(key) => setModelSel(options.find((o) => o.key === key) ?? null)}
+          triggerLabel={modelSel ? modelSel.label : "Auto"}
+          triggerPid={modelSel?.provider}
+          triggerModelId={modelSel?.provider === "openrouter" ? modelSel.backend.model : undefined}
+          closeOnSelect={false}
+          loading={modelsLoading}
+          onOpenChange={(o) => {
+            setModelMenuOpen(o);
+            if (!o) setEffortOpen(false);
+          }}
+          renderLeading={(mq) =>
+            !mq || "auto routed by policy".includes(mq) ? (
+              <button
+                className={"model-menu-item" + (!modelSel ? " on" : "")}
+                onClick={() => setModelSel(null)}
               >
-                <ProviderLogo {...vendorOf(modelSel)} />
-              </span>
-            ) : (
-              <Icon name="providers" size={13} />
-            )}
-            <span className="model-pick-label">{modelSel ? modelSel.label : "Auto"}</span>
-            <Icon name="chevron" size={10} style={{ transform: "rotate(90deg)", opacity: 0.6 }} />
-          </button>
-          {modelMenuOpen && (
-            <div className="model-menu">
-              <div className="model-menu-search">
-                <Icon name="search" size={13} />
-                <input
-                  autoFocus
-                  value={modelQuery}
-                  onChange={(e) => setModelQuery(e.target.value)}
-                  placeholder="Search models…"
-                  spellCheck={false}
-                />
-              </div>
-              <div className="model-menu-scroll" onScroll={onPickerScroll}>
-                {autoMatches && (
-                  <button
-                    className={"model-menu-item" + (!modelSel ? " on" : "")}
-                    onClick={() => setModelSel(null)}
-                  >
-                    <span className="model-menu-logo">
-                      <span className="model-menu-dot" style={{ background: "var(--accent)" }} />
-                    </span>
-                    <span style={{ flex: 1 }}>
-                      Auto <span className="model-menu-sub">routed by policy</span>
-                    </span>
-                    <span className="model-menu-check">{!modelSel && <Icon name="check" size={12} />}</span>
-                  </button>
-                )}
-                {modelsLoading && <div className="model-menu-empty">Loading models…</div>}
-                {!modelsLoading && options.length === 0 && (
-                  <div className="model-menu-empty">Connect a provider to pick a model.</div>
-                )}
-                {!modelsLoading && options.length > 0 && filteredOptions.length === 0 && !autoMatches && (
-                  <div className="model-menu-empty">No models found.</div>
-                )}
-                {filteredOptions.slice(0, pickerShown).map((o, i, arr) => (
-                  <Fragment key={o.key}>
-                    {(i === 0 || groupKey(arr[i - 1]) !== groupKey(o)) && (
-                      <div className="model-menu-group">{groupName(o)}</div>
-                    )}
+                <span className="model-menu-logo">
+                  <span className="model-menu-dot" style={{ background: "var(--accent)" }} />
+                </span>
+                <span style={{ flex: 1 }}>
+                  Auto <span className="model-menu-sub">routed by policy</span>
+                </span>
+                <span className="model-menu-check">{!modelSel && <Icon name="check" size={12} />}</span>
+              </button>
+            ) : null
+          }
+          extras={
+            <div className={"model-menu-extras" + (hasExtras ? " open" : "")}>
+              <div className="model-menu-extras-inner">
+                <div className="model-menu-sep" />
+                <div className={"menu-collapse" + (reasoningOk ? " open" : "")}>
+                  <div className="menu-collapse-inner">
                     <button
-                      ref={
-                        modelSel?.key === o.key
-                          ? (el) => {
-                              if (el && pickerScrollPending.current) {
-                                pickerScrollPending.current = false;
-                                el.scrollIntoView({ block: "center" });
-                              }
-                            }
-                          : undefined
-                      }
-                      className={"model-menu-item" + (modelSel?.key === o.key ? " on" : "")}
-                      onClick={() => setModelSel(o)}
+                      className="model-menu-item split-row"
+                      role="switch"
+                      aria-checked={thinking}
+                      onClick={() => setThinking((v) => !v)}
                     >
-                      <span
-                        className="model-menu-logo"
-                        style={{ color: PROVIDERS[o.provider]?.color }}
-                      >
-                        <ProviderLogo {...vendorOf(o)} />
+                      <span>Thinking</span>
+                      <span className={"toggle" + (thinking ? " on" : "")}>
+                        <span className="toggle-knob" />
                       </span>
-                      <span style={{ flex: 1 }}>{o.label}</span>
-                      <span className="model-menu-check">{modelSel?.key === o.key && <Icon name="check" size={12} />}</span>
                     </button>
-                  </Fragment>
-                ))}
-                {pickerShown < filteredOptions.length && (
-                  <div className="model-menu-empty">Showing {pickerShown} of {filteredOptions.length} · scroll for more</div>
-                )}
-              </div>
-              <div className={"model-menu-extras" + (hasExtras ? " open" : "")}>
-                <div className="model-menu-extras-inner">
-                  <div className="model-menu-sep" />
-                  <div className={"menu-collapse" + (reasoningOk ? " open" : "")}>
-                    <div className="menu-collapse-inner">
+                  </div>
+                </div>
+                <div className={"menu-collapse" + (showEffort ? " open" : "")}>
+                  <div className="menu-collapse-inner">
+                    <div
+                      className="effort-item"
+                      onMouseEnter={openEffortFly}
+                      onMouseLeave={closeEffortFly}
+                    >
                       <button
                         className="model-menu-item split-row"
-                        role="switch"
-                        aria-checked={thinking}
-                        onClick={() => setThinking((v) => !v)}
+                        onClick={() => (effortOpen ? setEffortOpen(false) : openEffortFly())}
                       >
-                        <span>Thinking</span>
-                        <span className={"toggle" + (thinking ? " on" : "")}>
-                          <span className="toggle-knob" />
+                        <span>Effort</span>
+                        <span className="effort-val">
+                          <span className="effort-current">{activeEffort}</span>
+                          <Icon name="chevron" size={10} style={{ opacity: 0.6 }} />
                         </span>
                       </button>
-                    </div>
-                  </div>
-                  <div className={"menu-collapse" + (showEffort ? " open" : "")}>
-                    <div className="menu-collapse-inner">
-                      <div
-                        className="effort-item"
-                        onMouseEnter={openEffortFly}
-                        onMouseLeave={closeEffortFly}
-                      >
-                        <button
-                          className="model-menu-item split-row"
-                          onClick={() => (effortOpen ? setEffortOpen(false) : openEffortFly())}
+                      {effortOpen && (
+                        <div
+                          className="effort-flyout"
+                          onMouseEnter={openEffortFly}
+                          onMouseLeave={closeEffortFly}
                         >
-                          <span>Effort</span>
-                          <span className="effort-val">
-                            <span className="effort-current">{activeEffort}</span>
-                            <Icon name="chevron" size={10} style={{ opacity: 0.6 }} />
-                          </span>
-                        </button>
-                        {effortOpen && (
-                          <div
-                            className="effort-flyout"
-                            onMouseEnter={openEffortFly}
-                            onMouseLeave={closeEffortFly}
-                          >
-                            {effortLevels.map((lvl) => (
-                              <button
-                                key={lvl}
-                                className={"model-menu-item" + (activeEffort === lvl ? " on" : "")}
-                                onClick={() => setEffort(lvl)}
-                              >
-                                <span style={{ textTransform: "capitalize" }}>{lvl}</span>
-                                <span className="effort-check">{activeEffort === lvl && <Icon name="check" size={12} />}</span>
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </div>
+                          {effortLevels.map((lvl) => (
+                            <button
+                              key={lvl}
+                              className={"model-menu-item" + (activeEffort === lvl ? " on" : "")}
+                              onClick={() => setEffort(lvl)}
+                            >
+                              <span style={{ textTransform: "capitalize" }}>{lvl}</span>
+                              <span className="effort-check">{activeEffort === lvl && <Icon name="check" size={12} />}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
               </div>
             </div>
-          )}
-        </div>
+          }
+        />
         <span style={{ flex: 1 }} />
         <button
           className={"send-btn" + (busy ? " stop" : canSend ? " on" : "")}

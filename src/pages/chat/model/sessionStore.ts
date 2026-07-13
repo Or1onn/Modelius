@@ -28,6 +28,7 @@ import {
   wrapFence,
 } from "@/entities/artifact/model/artifacts";
 import { getChats, loadChatBody, saveChatBody, upsertChat, indexEntryFrom } from "@/entities/chat/model/chats";
+import { isVaultUnavailable } from "@/shared/api/secrets";
 
 type Phase = "idle" | "routing" | "streaming";
 
@@ -75,6 +76,7 @@ interface Session {
   customPrompt: string;
   createdAt: number;
   dirty: boolean; // set on first user action; gates persistence (skip the demo)
+  loadFailed: boolean; // saved body couldn't be decrypted (vault down) — block persist so a new turn can't clobber it
   memoryTurns: number; // finished assistant turns, for throttling memory extraction
   titleTried: boolean;
   saveTimer: number | null;
@@ -106,16 +108,37 @@ function commit(s: Session): void {
   schedulePersist(s);
 }
 
+// Persist body + index entry now. Returns the body write so callers (flush-on-exit) can await it.
+function persistNow(s: Session): Promise<void> {
+  const entry = indexEntryFrom(s.chatId, s.messages, s.createdAt, s.title, s.titleSettled);
+  if (!entry) return Promise.resolve();
+  const p = saveChatBody(s.chatId, { messages: s.messages, summary: s.summary, covered: s.covered, title: s.title, customPrompt: s.customPrompt, siblings: s.siblings });
+  upsertChat(entry);
+  return p;
+}
+
 function schedulePersist(s: Session): void {
-  if (!s.dirty || s.phase !== "idle") return; // don't persist mid-stream/seed-only
+  if (!s.dirty || s.phase !== "idle" || s.loadFailed) return; // don't persist mid-stream/seed-only, or over an unloaded body
   if (s.saveTimer) clearTimeout(s.saveTimer);
   s.saveTimer = setTimeout(() => {
     s.saveTimer = null;
-    const entry = indexEntryFrom(s.chatId, s.messages, s.createdAt, s.title, s.titleSettled);
-    if (!entry) return;
-    void saveChatBody(s.chatId, { messages: s.messages, summary: s.summary, covered: s.covered, title: s.title, customPrompt: s.customPrompt, siblings: s.siblings });
-    upsertChat(entry);
+    void persistNow(s);
   }, 400) as unknown as number;
+}
+
+// Flush every pending debounced persist immediately (awaits the body writes). Called on app
+// close/hide so the last finished turn isn't lost inside the 400ms debounce window.
+export async function flushAll(): Promise<void> {
+  const writes: Promise<void>[] = [];
+  for (const s of sessions.values()) {
+    if (s.saveTimer) {
+      clearTimeout(s.saveTimer);
+      s.saveTimer = null;
+    }
+    if (!s.dirty || s.phase !== "idle" || s.loadFailed) continue;
+    writes.push(persistNow(s));
+  }
+  await Promise.allSettled(writes);
 }
 
 function ensure(chatId: string, demo: boolean): Session {
@@ -138,6 +161,7 @@ function ensure(chatId: string, demo: boolean): Session {
     customPrompt: "",
     createdAt: Date.now(),
     dirty: false,
+    loadFailed: false,
     memoryTurns: 0,
     titleTried: false,
     saveTimer: null,
@@ -156,7 +180,20 @@ async function load(s: Session, demo: boolean): Promise<void> {
   const existing = getChats().find((c) => c.id === s.chatId);
   if (existing) s.createdAt = existing.createdAt; // keep original creation time
   if (!demo) {
-    const body = await loadChatBody(s.chatId);
+    let body: Awaited<ReturnType<typeof loadChatBody>> = null;
+    try {
+      body = await loadChatBody(s.chatId);
+    } catch (e) {
+      // Vault temporarily unavailable — don't treat this known chat as empty (a new turn would
+      // then persist over the real body). Keep it loading, block persist, and retry shortly.
+      if (isVaultUnavailable(e)) {
+        s.loadFailed = true;
+        setTimeout(() => { if (sessions.get(s.chatId) === s) void load(s, demo); }, 800); // retry while this session is still live
+        return;
+      }
+      throw e;
+    }
+    s.loadFailed = false;
     if (body && !s.dirty && s.phase === "idle" && s.messages.length === 0) {
       s.messages = body.messages;
       s.siblings = body.siblings ?? [];

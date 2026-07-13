@@ -18,11 +18,10 @@ pub(crate) struct NativeDist {
     pub version: &'static str,
 }
 
-// Declarative argv: literals + slots, in order. The prompt is always its own argv entry
-// (never shell-interpolated — see the BatBadBut note on spawn() in agent.rs).
+// Declarative argv: literals + slots, in order. Both harnesses now take the prompt over their
+// stdio protocol (PromptChannel), never argv.
 pub(crate) enum Arg {
     Lit(&'static str),
-    Prompt,
     // Emits [flag, model] only when a model id was picked.
     ModelFlag(&'static str),
     // Emits [flag, level] only when an effort level was picked (reasoning depth).
@@ -36,6 +35,19 @@ pub(crate) enum Arg {
     // Emits the harness's `resume_args` (with {id} substituted) only when a prior session id
     // was captured — continues that CLI session instead of starting a fresh one.
     Resume,
+}
+
+// How a harness receives prompts. Both channels hold a live stdio protocol, so every harness
+// runs WARM (one process per chat, follow-up turns without respawn — session.rs):
+// - ClaudeStream: stream-json user messages on stdin; permissions/interrupt/mode-switch ride the
+//   `control_request` stdio protocol (probe-verified claude 2.1.206).
+// - CodexRpc: `codex app-server` JSON-RPC over JSONL; Rust writes the lifecycle requests
+//   (codex_proto.rs), approvals arrive as server requests answered via agent_respond
+//   (probe-verified codex-cli 0.142.5).
+#[derive(PartialEq)]
+pub(crate) enum PromptChannel {
+    ClaudeStream,
+    CodexRpc,
 }
 
 // Env vars that re-point the CLI at the gateway. Every name in `base_url`/`api_key` is set (some
@@ -74,10 +86,8 @@ pub(crate) struct HarnessSpec {
     // installs (resolved via the agents prefix / PATH).
     pub bin_hint: &'static [&'static str],
     pub protocol: Proto, // gateway inbound side when the run is routed
-    // The prompt is written to the CLI's stdin as a stream-json user message instead of argv
-    // (Arg::Prompt absent). Enables the stdio control protocol: permission requests arrive as
-    // `control_request` stdout lines and the webview answers via `agent_respond` (agent.rs).
-    pub stdin_prompt: bool,
+    // How the prompt reaches the CLI (and whether it can run warm — see PromptChannel).
+    pub channel: PromptChannel,
     pub argv: &'static [Arg],
     // Args emitted by Arg::Resume when continuing a prior session; {id} → the session id the
     // CLI reported on the previous run (Claude: stream-json init; Codex: thread.started).
@@ -90,18 +100,6 @@ fn claude_permission(mode: &str) -> Vec<String> {
         vec![]
     } else {
         vec!["--permission-mode".into(), mode.into()]
-    }
-}
-
-// Claude Code permission modes map onto Codex sandbox settings; "plan" runs read-only
-// (Codex's default exec sandbox). The sandbox is set via `-c sandbox_mode=…`, not `--sandbox`:
-// the `exec resume` subcommand accepts `-c` but not `--sandbox`, and both spellings are
-// equivalent for a fresh `exec`.
-fn codex_permission(mode: &str) -> Vec<String> {
-    match mode {
-        "bypassPermissions" => vec!["--dangerously-bypass-approvals-and-sandbox".into()],
-        "plan" => vec![],
-        _ => vec!["-c".into(), "sandbox_mode=\"workspace-write\"".into()],
     }
 }
 
@@ -122,7 +120,7 @@ static HARNESSES: &[HarnessSpec] = &[
         extra_env: &[],
         bin_hint: &[],
         protocol: Proto::Anthropic,
-        stdin_prompt: true,
+        channel: PromptChannel::ClaudeStream,
         argv: &[
             Arg::Lit("-p"),
             Arg::Lit("--output-format"),
@@ -158,10 +156,13 @@ static HARNESSES: &[HarnessSpec] = &[
             route_args: &[],
         },
     },
-    // OpenAI Codex CLI (headless): JSONL events on stdout. Native ChatGPT login by default; a
-    // routed run injects a custom `modelius` model provider (via -c overrides) pointed at the
-    // local gateway. Codex only speaks the Responses API (wire_api = "responses"); the gateway's
-    // /responses handler translates it to/from chat/completions for the picked bound model.
+    // OpenAI Codex CLI via `codex app-server` (JSON-RPC over JSONL, probe-verified 0.142.5):
+    // one warm process per chat, lifecycle requests built in codex_proto.rs (thread/start,
+    // turn/start with per-turn model/effort/permission overrides, turn/interrupt), approvals as
+    // server requests answered via agent_respond. Native ChatGPT login by default; a routed run
+    // injects a custom `modelius` model provider (via -c overrides) pointed at the local gateway.
+    // Codex only speaks the Responses API (wire_api = "responses", plain HTTP for custom
+    // providers); the gateway's /responses handler translates to/from chat/completions.
     HarnessSpec {
         id: "codex",
         bin: "codex",
@@ -172,24 +173,17 @@ static HARNESSES: &[HarnessSpec] = &[
         extra_env: &[],
         bin_hint: &[],
         protocol: Proto::OpenAi,
-        stdin_prompt: false, // codex exec takes the prompt as a positional; no control protocol
+        channel: PromptChannel::CodexRpc,
         argv: &[
-            Arg::Lit("exec"),
-            Arg::Resume, // `resume <id>` is a subcommand — must directly follow `exec`
-            Arg::Lit("--json"),
-            Arg::Lit("--skip-git-repo-check"),
-            // `codex exec` suppresses reasoning items by default — surface them so the
-            // transcript can render Thinking blocks (ignored by non-reasoning models).
-            Arg::Lit("-c"),
-            Arg::Lit("hide_agent_reasoning=false"),
+            Arg::Lit("app-server"),
+            // Keep detailed reasoning summaries (same knob the exec path used) — the transform
+            // renders them as streaming thinking. Process-level -c is accepted by app-server.
             Arg::Lit("-c"),
             Arg::Lit("model_reasoning_summary=detailed"),
             Arg::RouteArgs, // -c provider config on a routed run; nothing on a native run
-            Arg::ModelFlag("--model"),
-            Arg::Permission(codex_permission),
-            Arg::Prompt, // trailing positional — route flags must precede it
         ],
-        resume_args: &["resume", "{id}"],
+        // Resume is a JSON-RPC method (thread/resume), not argv.
+        resume_args: &[],
         env: EnvSpec {
             base_url: &[], // provider base is carried in route_args (-c …base_url), not an env var
             base_url_suffix: "",
@@ -240,18 +234,15 @@ mod tests {
     }
 
     #[test]
+    fn harness_channels_match_their_protocols() {
+        assert!(spec("claude-code").unwrap().channel == PromptChannel::ClaudeStream);
+        assert!(spec("codex").unwrap().channel == PromptChannel::CodexRpc);
+    }
+
+    #[test]
     fn claude_permission_passes_the_mode_through() {
         assert_eq!(claude_permission(""), Vec::<String>::new());
         assert_eq!(claude_permission("plan"), vec!["--permission-mode", "plan"]);
         assert_eq!(claude_permission("acceptEdits"), vec!["--permission-mode", "acceptEdits"]);
-    }
-
-    #[test]
-    fn codex_permission_maps_onto_sandbox_flags() {
-        assert_eq!(codex_permission("bypassPermissions"), vec!["--dangerously-bypass-approvals-and-sandbox"]);
-        assert_eq!(codex_permission("plan"), Vec::<String>::new()); // read-only default
-        // -c form, not --sandbox: `exec resume` rejects --sandbox (see codex_permission).
-        assert_eq!(codex_permission("default"), vec!["-c", "sandbox_mode=\"workspace-write\""]);
-        assert_eq!(codex_permission("acceptEdits"), vec!["-c", "sandbox_mode=\"workspace-write\""]);
     }
 }

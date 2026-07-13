@@ -1316,16 +1316,22 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 
 /* ============ Code mode ============ */
 .cd-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+/* Slim top bar once a session is running: chat title + the folder chip. */
 .cd-top {
-  position: relative;
-  display: flex; align-items: center; justify-content: space-between; gap: 14px;
-  padding: 0 22px; height: 52px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+  display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+  padding: 0 16px; height: 44px; border-bottom: 1px solid var(--border);
 }
-.cd-top-title { display: flex; align-items: center; gap: 11px; min-width: 0; }
-.cd-top-acts { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
-.cd-top-btn { width: 30px; height: 30px; display: grid; place-items: center; border-radius: var(--r-sm, 8px); color: var(--text-3); transition: all .14s; }
-.cd-top-btn:hover { background: var(--surface-2); color: var(--text-1); }
-.cd-top-div { width: 1px; height: 18px; background: var(--border-2); margin: 0 4px; }
+.cd-top-title {
+  font-size: 13px; font-weight: 600; letter-spacing: -.01em; color: var(--text-1);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cd-top-folder {
+  flex-shrink: 0; margin-left: auto;
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 13px; font-weight: 560; letter-spacing: -.01em; color: var(--text-2);
+}
+.cd-top-folder svg { color: var(--text-3); flex-shrink: 0; }
 
 .cd-thread { flex: 1; min-height: 0; overflow-y: auto; }
 .cd-thread-inner { max-width: 820px; margin: 0 auto; padding: 26px 26px 12px; display: flex; flex-direction: column; gap: 15px; }
@@ -1447,11 +1453,28 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 /* composer */
 .cd-composer-wrap { flex-shrink: 0; padding: 8px 26px 20px; }
 .cd-composer-wrap > * { max-width: 820px; margin-left: auto; margin-right: auto; }
-.cd-composer {
-  border: 1px solid var(--border-2); border-radius: 16px; background: var(--surface-1);
-  padding: 13px 13px 11px; box-shadow: var(--shadow); transition: border-color .18s, box-shadow .18s;
+
+/* Enveloping plate: the folder chip sits on top and the plate wraps the prompt input,
+   which nests inside with its own lighter card — an "обволакивание" layered look. */
+.cd-plate {
+  position: relative;
+  border: 1px solid var(--border-2); border-radius: 16px;
+  background: color-mix(in oklab, var(--surface-1) 88%, #000);
+  box-shadow: var(--shadow); transition: border-color .18s, box-shadow .18s;
 }
-.cd-composer:focus-within { border-color: color-mix(in oklab, var(--accent) 45%, transparent); box-shadow: var(--shadow), 0 0 0 3px color-mix(in oklab, var(--accent) 9%, transparent); }
+.cd-plate-head { display: flex; align-items: center; padding: 9px 11px; }
+
+/* Input box: distinct lighter bg, rounded top, divided from the folder strip by a top border.
+   Own transparent border (top = divider) that brightens on focus — only the input, not the strip. */
+.cd-composer {
+  padding: 11px 13px 11px; background: var(--surface-1);
+  border: 1px solid transparent; border-top-color: var(--border);
+  border-radius: 14px 14px 15px 15px; transition: border-color .18s;
+}
+.cd-composer:focus-within { border-color: rgba(var(--fg-rgb), 0.24); }
+/* Active session: no folder strip above, so the input is the plate's only child — square-off the
+   divider and round the top fully. */
+.cd-composer:first-child { border-top-color: transparent; border-radius: 15px; }
 .cd-composer.busy { border-color: color-mix(in oklab, var(--accent) 30%, transparent); }
 .cd-composer textarea { display: block; width: 100%; resize: none; border: none; outline: none; background: transparent; color: var(--text-1); font-size: 14px; line-height: 1.55; padding: 2px 4px; min-height: 42px; max-height: 200px; }
 .cd-composer textarea::placeholder { color: var(--text-4); }
@@ -1517,6 +1540,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 .cd-pick-get:hover { background: var(--surface-3); }
 .cd-pick-get:hover svg { color: var(--text-1); }
 .cd-pick-spin { width: 13px; height: 13px; border-radius: 99px; border: 2px solid var(--border-2); border-top-color: var(--text-2); animation: spin .7s linear infinite; }
+.cd-plate-head .cd-pick-menu { bottom: calc(100% + 10px); }
 .cd-pick-menu.down { top: calc(100% + 6px); bottom: auto; min-width: 208px; padding: 5px; }
 .cd-pick-menu.down .cd-pick-item { font-size: 14px; padding: 8px 12px; }
 .cd-pick-menu.down .cd-pick-head { font-size: 12.5px; padding: 7px 12px 5px; }
@@ -1570,22 +1594,23 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 .am-skip { align-self: center; margin-top: 2px; font-size: 12px; color: var(--text-4); background: none; border: none; cursor: pointer; transition: color .12s; }
 .am-skip:hover { color: var(--text-2); text-decoration: underline; }
 
-/* Codex-style workspace folder selector in the header */
+/* Workspace folder selector: a tab-like chip sitting on the enveloping plate */
 .cd-folder-btn {
   display: inline-flex; align-items: center; gap: 8px; min-width: 0;
-  padding: 6px 10px 6px 9px; border-radius: 8px;
+  padding: 5px 9px 5px 8px; border-radius: 9px;
   font-size: 14px; font-weight: 560; letter-spacing: -0.01em; color: var(--text-1);
-  border: 1px solid var(--border); background: var(--surface-1); cursor: pointer;
+  border: 1px solid transparent; background: transparent; cursor: pointer;
   transition: background .12s, border-color .12s;
 }
-.cd-folder-btn:hover { background: var(--surface-2); border-color: var(--border-2); }
+.cd-folder-btn:hover { background: var(--surface-1); border-color: var(--border); }
 .cd-folder-btn svg { color: var(--text-3); flex-shrink: 0; }
 .cd-folder-btn.empty { color: var(--accent); border-color: color-mix(in oklab, var(--accent) 40%, transparent); background: color-mix(in oklab, var(--accent) 8%, transparent); }
 .cd-folder-btn.empty svg { color: var(--accent); }
 
-/* folder coach-mark: surfaced when a send is attempted before a workspace is chosen */
+/* folder coach-mark: surfaced when a send is attempted before a workspace is chosen.
+   Floats above the plate, pointing down at the folder chip. */
 .cd-folder-hint {
-  position: absolute; top: calc(100% + 8px); left: 20px; z-index: 20;
+  position: absolute; bottom: calc(100% + 10px); left: 6px; z-index: 20;
   display: flex; align-items: flex-start;
   max-width: 340px; padding: 10px 13px 11px;
   background: var(--panel-2, #1a1a1c);
@@ -1595,10 +1620,10 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
   animation: cd-hint-in .24s cubic-bezier(.2,.7,.3,1) both;
 }
 .cd-folder-hint-arrow {
-  position: absolute; top: -5px; left: 24px; width: 9px; height: 9px;
+  position: absolute; bottom: -5px; left: 24px; width: 9px; height: 9px;
   background: var(--panel-2, #1a1a1c);
-  border-left: 1px solid var(--border-2);
-  border-top: 1px solid var(--border-2);
+  border-right: 1px solid var(--border-2);
+  border-bottom: 1px solid var(--border-2);
   transform: rotate(45deg);
 }
 .cd-folder-hint-txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; }

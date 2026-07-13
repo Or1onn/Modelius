@@ -51,7 +51,12 @@ export async function saveCodeBody(id: string, body: CodeChatBody): Promise<void
 }
 
 export async function loadCodeBody(id: string): Promise<CodeChatBody | null> {
-  const b = await bodyStore.load(id);
+  let b: Awaited<ReturnType<typeof bodyStore.load>>;
+  try {
+    b = await bodyStore.load(id);
+  } catch {
+    return null; // vault temporarily unavailable — behave as "unrecognized" (Code mode's prior behavior)
+  }
   // Pre-AI-SDK bodies stored `steps` (no `messages`) — treat as unrecognized (reset, per migration).
   if (!Array.isArray(b?.messages)) return null;
   return {

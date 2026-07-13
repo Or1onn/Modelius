@@ -2,7 +2,7 @@
 // menu with a search filter, provider group headers, brand logos, and a paged scroll list (large
 // catalogs like OpenRouter are 300+). Presentational: the caller supplies flat items and reacts
 // to onSelect. Reuses the .model-pick / .model-menu styles ChatScreen introduced.
-import { Fragment, useEffect, useRef, useState, type UIEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactNode, type UIEvent } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { useOutsideClick } from "@/shared/lib/useOutsideClick";
 import { PROVIDERS } from "@/entities/model/model/registry";
@@ -36,6 +36,11 @@ export function ModelMenu({
   triggerPid,
   triggerModelId,
   footer,
+  loading = false,
+  renderLeading,
+  extras,
+  onOpenChange,
+  closeOnSelect = true,
 }: {
   items: ModelMenuItem[];
   selectedKey: string | null;
@@ -44,6 +49,11 @@ export function ModelMenu({
   triggerPid?: string;
   triggerModelId?: string;
   footer?: { label: string; onSelect: () => void };
+  loading?: boolean; // show a "Loading models…" placeholder while the async list resolves
+  renderLeading?: (q: string) => ReactNode; // rows above the list (e.g. chat's "Auto"), filtered by the live query
+  extras?: ReactNode; // region rendered below the list, above the footer (e.g. chat's thinking/effort controls)
+  onOpenChange?: (open: boolean) => void; // notify the caller so it can refetch on open / reset on close
+  closeOnSelect?: boolean; // false keeps the menu open after a pick (chat tweaks effort/thinking after selecting)
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -53,10 +63,18 @@ export function ModelMenu({
 
   useOutsideClick(wrapRef, open, () => setOpen(false));
 
+  // Notify the caller of open/close and clear the search on close.
+  useEffect(() => {
+    onOpenChange?.(open);
+    if (!open) setQuery("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
   const q = query.trim().toLowerCase();
   const filtered = q
     ? items.filter((it) => (it.label + " " + it.pid + " " + it.group).toLowerCase().includes(q))
     : items;
+  const lead = renderLeading?.(q) ?? null; // leading rows (e.g. "Auto") — also suppresses the "no models" message
 
   // On open with no search, page far enough to include the selection and scroll it into view;
   // while searching, restart paging from the top.
@@ -82,13 +100,15 @@ export function ModelMenu({
 
   function pick(key: string) {
     onSelect(key);
-    setOpen(false);
-    setQuery("");
+    if (closeOnSelect) {
+      setOpen(false);
+      setQuery("");
+    }
   }
 
   return (
     <div className="model-pick-wrap" ref={wrapRef}>
-      <button className="model-pick on" onClick={() => setOpen((v) => !v)} title="Choose which model answers">
+      <button className={"model-pick" + (triggerPid ? " on" : "")} onClick={() => setOpen((v) => !v)} title="Choose which model answers">
         {triggerPid ? (
           <span className="model-pick-logo" style={{ color: PROVIDERS[triggerPid]?.color }}>
             <ProviderLogo {...logoProps(triggerPid, triggerModelId)} />
@@ -112,8 +132,14 @@ export function ModelMenu({
             />
           </div>
           <div className="model-menu-scroll" onScroll={onScroll}>
-            {items.length === 0 && <div className="model-menu-empty">Connect a provider to pick a model.</div>}
-            {items.length > 0 && filtered.length === 0 && <div className="model-menu-empty">No models found.</div>}
+            {lead}
+            {loading && <div className="model-menu-empty">Loading models…</div>}
+            {!loading && items.length === 0 && (
+              <div className="model-menu-empty">Connect a provider to pick a model.</div>
+            )}
+            {!loading && items.length > 0 && filtered.length === 0 && !lead && (
+              <div className="model-menu-empty">No models found.</div>
+            )}
             {filtered.slice(0, shown).map((it, i, arr) => (
               <Fragment key={it.key}>
                 {(i === 0 || arr[i - 1].group !== it.group) && <div className="model-menu-group">{it.group}</div>}
@@ -143,6 +169,7 @@ export function ModelMenu({
               <div className="model-menu-empty">Showing {shown} of {filtered.length} · scroll for more</div>
             )}
           </div>
+          {extras}
           {footer && (
             <>
               <div className="model-menu-sep" />

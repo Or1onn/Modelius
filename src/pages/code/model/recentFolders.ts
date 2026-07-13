@@ -21,3 +21,29 @@ export function pushRecentFolder(dir: string): void {
     /* quota — ignore */
   }
 }
+
+// Last-used git branch per folder — so reopening a workspace restores the branch it was left on.
+const BRANCH_KEY = "modelius.code.folderBranch";
+
+function branchMap(): Record<string, string> {
+  try {
+    const m = JSON.parse(localStorage.getItem(BRANCH_KEY) || "{}");
+    return m && typeof m === "object" ? m : {};
+  } catch {
+    return {};
+  }
+}
+
+export function getFolderBranch(dir: string): string {
+  return (dir && branchMap()[dir]) || "";
+}
+
+export function setFolderBranch(dir: string, branch: string): void {
+  if (!dir || !branch) return;
+  const next = { ...branchMap(), [dir]: branch };
+  try {
+    localStorage.setItem(BRANCH_KEY, JSON.stringify(next));
+  } catch {
+    /* quota — ignore */
+  }
+}

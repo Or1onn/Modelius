@@ -39,14 +39,23 @@ export function hydrateMemory(): Promise<void> {
   if (hydrated) return Promise.resolve();
   if (!hydrating)
     hydrating = (async () => {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          const arr = JSON.parse(await vaultDecrypt(raw));
-          if (Array.isArray(arr)) cache = arr.filter(isMemory);
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        let plain: string;
+        try {
+          plain = await vaultDecrypt(raw);
+        } catch {
+          // Vault unavailable — DON'T latch hydrated, or save() would clobber real memory with an
+          // empty list. Allow a retry.
+          hydrating = null;
+          return;
         }
-      } catch {
-        /* keep empty */
+        try {
+          const arr = JSON.parse(plain);
+          if (Array.isArray(arr)) cache = arr.filter(isMemory);
+        } catch {
+          /* decrypt succeeded but content is corrupt — keep empty, latch below */
+        }
       }
       hydrated = true;
       window.dispatchEvent(new Event(EVT));
@@ -61,6 +70,10 @@ export function getMemories(): Memory[] {
 function save(list: Memory[]): void {
   cache = list;
   window.dispatchEvent(new Event(EVT));
+  if (!hydrated) {
+    void hydrateMemory(); // load failed earlier — retry rather than persist an empty list over real data
+    return;
+  }
   void (async () => {
     try {
       localStorage.setItem(STORAGE_KEY, await vaultEncrypt(JSON.stringify(list)));

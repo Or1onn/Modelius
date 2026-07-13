@@ -13,7 +13,7 @@ import {
   defaultModelForHarness,
   type CodeModelChoice,
 } from "@/entities/agent/model/codeModel";
-import { anthropicEffortTier, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
+import { anthropicEffortTier, resolveEffort, CODEX_EFFORT_LEVELS, type EffortLevel } from "@/entities/model/model/apiIds";
 import { getGateways, gatewaySecretKey } from "@/entities/agent/model/gateways";
 import { OLLAMA_HOST } from "@/entities/session/model/ollamaSession";
 import { getCodexAuth } from "@/entities/session/model/openaiSession";
@@ -96,9 +96,14 @@ async function resolveRouting(model: CodeModelChoice, harnessId: string): Promis
   return { protocol: "openai", baseUrl: base, apiKey: key };
 }
 
-// Concrete --effort level for the CLI: only native Anthropic picks whose model gates effort get
-// one (auto → the tier default, matching what the UI shows). Everything else → "" (no flag).
+// Concrete effort level for the CLI. Anthropic picks whose model gates it get a resolved level
+// (auto → the tier default, matching what the UI shows; rides --effort). Codex picks pass an
+// explicit pick through (rides turn/start), but "auto" stays "" — the CLI's own default, exactly
+// as if the user never touched the knob. Everything else → "" (no effort).
 function resolvedEffort(config: CodeConfig): string {
+  if (config.model.kind === "codex") {
+    return config.effort !== "auto" && CODEX_EFFORT_LEVELS.includes(config.effort) ? config.effort : "";
+  }
   if (config.model.kind !== "anthropic") return "";
   const tier = anthropicEffortTier(config.model.id);
   return tier ? resolveEffort(tier, config.effort) : "";

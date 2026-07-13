@@ -126,7 +126,10 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
       fail();
       return;
     }
-    await setKey(pid, v);
+    if (!(await setKey(pid, v))) {
+      fail(); // couldn't store the key securely — don't claim connected
+      return;
+    }
     setState("success");
     setTimeout(onConnected, 520);
   }

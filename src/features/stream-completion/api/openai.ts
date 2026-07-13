@@ -1,7 +1,7 @@
 // openai.ts — OpenAI Responses API streaming: key path (direct fetch) + ChatGPT subscription path (via Rust).
 import { invoke } from "@tauri-apps/api/core";
 import { getKey } from "@/entities/session/model/keys";
-import { getOpenAIAuth, disconnectOpenAIOAuth } from "@/entities/session/model/openaiSession";
+import { getOpenAIAuth, handleOpenAIUnauthorized } from "@/entities/session/model/openaiSession";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
 import { systemInstructions } from "@/features/stream-completion/lib/instructions";
 import { sseJson } from "@/features/stream-completion/lib/sse";
@@ -60,8 +60,9 @@ export async function* streamChatGPT(
   yield* channelToDeltas(
     (onEvent) => invoke("openai_responses_stream", { body, accessToken: auth.token, accountId: auth.accountId, streamId, onEvent }),
     (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, reasoningTokens: u.reasoning_tokens, metered: false }),
-    // 401 = subscription session revoked/dead; drop the token so Providers shows disconnected.
-    (msg) => { if (/^ChatGPT 401\b/.test(msg)) disconnectOpenAIOAuth(); },
+    // 401 may be transient (rotation race / briefly-expired access token), not a revoked session —
+    // try a refresh and only disconnect if it's definitively rejected.
+    (msg) => { if (/^ChatGPT 401\b/.test(msg)) void handleOpenAIUnauthorized(); },
     signal,
     streamId
   );

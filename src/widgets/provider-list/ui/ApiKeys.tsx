@@ -24,7 +24,10 @@ function AddKeyForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => 
       setErr("Unrecognized key — supported: OpenAI, Anthropic, Google, Groq, OpenRouter.");
       return;
     }
-    await setKey(pid, k);
+    if (!(await setKey(pid, k))) {
+      setErr("Couldn't store the key securely — try again.");
+      return;
+    }
     if (isKeyProvider(pid)) void listKeyProviderModels(pid).catch(() => {}); // warm the live list
     onDone();
   }

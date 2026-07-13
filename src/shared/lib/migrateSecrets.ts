@@ -7,7 +7,7 @@ import { isTauri } from "@/shared/api/tauri";
 import { secretGet, secretSet } from "@/shared/api/secrets";
 
 const MIGRATED = "modelius.migrated.v1";
-const PROVIDERS = ["openai", "anthropic", "google", "groq"];
+const PROVIDERS = ["openai", "anthropic", "google", "groq", "openrouter"];
 
 export async function migrateToSecureStorage(): Promise<void> {
   // Browser/dev keeps secrets in the localStorage fallback already — nothing to move.
@@ -19,7 +19,9 @@ export async function migrateToSecureStorage(): Promise<void> {
     for (const p of PROVIDERS) {
       const old = localStorage.getItem("modelius.key." + p);
       if (old && !(await secretGet("modelius.key." + p))) {
-        await secretSet("modelius.key." + p, old);
+        // Only remove the plaintext original once it's confirmed stored — a failed move must
+        // not delete the key.
+        if (!(await secretSet("modelius.key." + p, old))) continue;
         localStorage.setItem("modelius.keymeta." + p, JSON.stringify({ last6: old.slice(-6) }));
       }
       localStorage.removeItem("modelius.key." + p);

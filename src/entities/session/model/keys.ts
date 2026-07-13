@@ -56,12 +56,15 @@ export function keyLast6(provider: string): string | null {
   return env ? env.slice(-6) : null;
 }
 
-export async function setKey(provider: string, key: string): Promise<void> {
+// Returns false if the key couldn't be stored durably — callers should surface that rather than
+// showing a connected state, since the presence meta is only written on success.
+export async function setKey(provider: string, key: string): Promise<boolean> {
   const k = key.trim();
-  await secretSet(KEY + provider, k);
+  if (!(await secretSet(KEY + provider, k))) return false;
   writeMeta(provider, { last6: k.slice(-6) });
   clearModelCache();
   window.dispatchEvent(new Event(EVT));
+  return true;
 }
 
 export async function clearKey(provider: string): Promise<void> {

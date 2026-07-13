@@ -5,7 +5,8 @@ import "@/app/styles/styles.css";
 import { hydrateSettings, useSettings } from "@/entities/settings/model/settings";
 import { deleteChat, pinChat, renameChat, hydrateChatIndex } from "@/entities/chat/model/chats";
 import { deleteCodeChat, pinCodeChat, renameCodeChat, hydrateCodeIndex } from "@/entities/agent/model/codeChats";
-import { dropSession, isEmptySession } from "@/pages/chat/model/sessionStore";
+import { dropSession, isEmptySession, flushAll } from "@/pages/chat/model/sessionStore";
+import { isTauri } from "@/shared/api/tauri";
 import { dropCodeChat, isEmptyCodeChat } from "@/features/run-agent/lib/codeChatRegistry";
 import { listOllamaModels } from "@/entities/session/model/ollamaSession";
 import { hasKey } from "@/entities/session/model/keys";
@@ -174,6 +175,35 @@ export default function App() {
       void listOllamaModels().catch(() => {});
       for (const pid of KEY_PROVIDER_IDS) if (hasKey(pid)) void listKeyProviderModels(pid).catch(() => {});
     })();
+  }, []);
+
+  // Flush the chat store's debounced persist before the app closes/hides, so a turn that finished
+  // within the 400ms debounce window isn't lost. Tauri: intercept the close so the flush completes
+  // before the process exits; web: best-effort on hide/unload.
+  useEffect(() => {
+    const onHide = () => { if (document.visibilityState === "hidden") void flushAll(); };
+    const onUnload = () => { void flushAll(); };
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("beforeunload", onUnload);
+    let unlisten: (() => void) | undefined;
+    if (isTauri()) {
+      void (async () => {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const w = getCurrentWindow();
+        unlisten = await w.onCloseRequested((event) => {
+          event.preventDefault(); // synchronously hold the close, then flush and destroy
+          void (async () => {
+            await flushAll();
+            await w.destroy();
+          })();
+        });
+      })();
+    }
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("beforeunload", onUnload);
+      unlisten?.();
+    };
   }, []);
 
   // Global shortcuts. Mod (Cmd/Ctrl): K search, N new chat, / shortcuts. Bare "?" also opens

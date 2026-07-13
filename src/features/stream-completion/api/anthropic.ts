@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ChatMsg, Delta } from "@/entities/model/model/backend";
 import { anthropicEffortTier, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
 import { getKey } from "@/entities/session/model/keys";
-import { getAnthropicAccessToken, disconnectAnthropicOAuth } from "@/entities/session/model/anthropicSession";
+import { getAnthropicAccessToken, handleAnthropicUnauthorized } from "@/entities/session/model/anthropicSession";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
 import { systemBase, systemInstructions } from "@/features/stream-completion/lib/instructions";
 
@@ -102,9 +102,10 @@ export async function* streamClaude(
       cacheWrite: u.cache_write,
       metered: !oauth,
     }),
-    // OAuth-path 401 = session revoked/dead; drop the token so Providers shows disconnected.
+    // OAuth-path 401 may be transient (rotation race / briefly-expired access token), not a
+    // revoked session — try a refresh and only disconnect if it's definitively rejected.
     // (Key-path 401s aren't our token to clear.)
-    (msg) => { if (oauth && /^Anthropic 401\b/.test(msg)) disconnectAnthropicOAuth(); },
+    (msg) => { if (oauth && /^Anthropic 401\b/.test(msg)) void handleAnthropicUnauthorized(); },
     signal,
     streamId
   );

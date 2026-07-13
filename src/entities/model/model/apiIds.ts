@@ -80,6 +80,12 @@ export function resolveEffort(tier: EffortTier, v: EffortLevel | "auto"): Effort
   return v !== "auto" && EFFORT_LEVELS[tier].includes(v) ? v : EFFORT_DEFAULT[tier];
 }
 
+// Codex reasoning effort (app-server model/list, probe-verified codex-cli 0.142.5): every current
+// codex model advertises the same four levels with a "medium" default. Rides each turn/start —
+// a change never respawns the warm process (unlike claude's argv-only --effort).
+export const CODEX_EFFORT_LEVELS: EffortLevel[] = ["low", "medium", "high", "xhigh"];
+export const CODEX_EFFORT_DEFAULT: EffortLevel = "medium";
+
 // Auto effort from the routed difficulty score (0–100); resolveEffort still clamps per tier.
 export function effortForDifficulty(score: number): EffortLevel {
   return score >= 70 ? "high" : score >= 30 ? "medium" : "low";

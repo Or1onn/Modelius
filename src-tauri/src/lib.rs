@@ -3,6 +3,7 @@
 mod agent;
 mod anthropic;
 mod artifacts;
+mod codex_proto;
 mod compat;
 mod gateway;
 mod git;
@@ -35,6 +36,10 @@ pub fn run() {
                 .add_migrations("sqlite:modelius.db", migrations)
                 .build(),
         )
+        .setup(|app| {
+            vault::init(app.handle()); // capture the app-data dir for the vault-initialized sentinel
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             anthropic::anthropic_oauth_token,
             anthropic::anthropic_list_models,
@@ -60,7 +65,9 @@ pub fn run() {
             secrets::secret_get,
             secrets::secret_delete,
             vault::vault_encrypt,
-            vault::vault_decrypt
+            vault::vault_decrypt,
+            vault::vault_export_key,
+            vault::vault_import_key
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

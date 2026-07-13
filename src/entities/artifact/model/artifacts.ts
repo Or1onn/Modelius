@@ -26,14 +26,22 @@ export function hydrateTitles(): Promise<void> {
   if (titlesHydrated) return Promise.resolve();
   if (!titlesHydrating)
     titlesHydrating = (async () => {
-      try {
-        const raw = localStorage.getItem(TITLES_KEY);
-        if (raw) {
-          const obj = JSON.parse(await vaultDecrypt(raw)) as Record<string, string>;
-          for (const [k, v] of Object.entries(obj)) titleOf.set(k, v);
+      const raw = localStorage.getItem(TITLES_KEY);
+      if (raw) {
+        let plain: string;
+        try {
+          plain = await vaultDecrypt(raw);
+        } catch {
+          // Vault unavailable — DON'T latch, or persistTitles would clobber real titles. Allow a retry.
+          titlesHydrating = null;
+          return;
         }
-      } catch {
-        /* malformed/unavailable — start empty */
+        try {
+          const obj = JSON.parse(plain) as Record<string, string>;
+          for (const [k, v] of Object.entries(obj)) titleOf.set(k, v);
+        } catch {
+          /* decrypt succeeded but content is corrupt — start empty, latch below */
+        }
       }
       titlesHydrated = true;
     })();
@@ -41,6 +49,10 @@ export function hydrateTitles(): Promise<void> {
 }
 
 function persistTitles(): void {
+  if (!titlesHydrated) {
+    void hydrateTitles(); // load failed earlier — retry rather than persist over real titles
+    return;
+  }
   void (async () => {
     try {
       localStorage.setItem(TITLES_KEY, await vaultEncrypt(JSON.stringify(Object.fromEntries(titleOf))));

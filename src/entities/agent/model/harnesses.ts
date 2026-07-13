@@ -58,9 +58,9 @@ export interface PermissionMode {
   label: string;
 }
 
-// No "ask each time": the CLIs run headless (-p / exec), so they can't prompt — permission
-// requests would be silently denied. Saved bodies with the old "default" mode are migrated
-// to acceptEdits on load (codeChats.ts).
+// Both CLIs prompt interactively over their stdio protocols (claude can_use_tool / codex
+// requestApproval server requests) — requests surface as Allow/Deny cards in the transcript.
+// Saved bodies with the old "default" mode are migrated to acceptEdits on load (codeChats.ts).
 export const PERMISSION_MODES: PermissionMode[] = [
   { id: "acceptEdits", label: "Accept edits" },
   { id: "plan", label: "Plan mode" },

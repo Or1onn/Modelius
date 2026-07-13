@@ -35,19 +35,28 @@ export function hydrateSettings(): Promise<void> {
   if (hydrated) return Promise.resolve();
   if (!hydrating)
     hydrating = (async () => {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          const o = JSON.parse(await vaultDecrypt(raw));
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        let plain: string;
+        try {
+          plain = await vaultDecrypt(raw);
+        } catch {
+          // Vault unavailable — DON'T latch hydrated, or save() would clobber real settings with
+          // the defaults. Allow a retry.
+          hydrating = null;
+          return;
+        }
+        try {
+          const o = JSON.parse(plain);
           if (o && typeof o === "object") {
             if (VALID_POLICIES.has(o.policy)) cache.policy = o.policy;
             if (typeof o.customInstructions === "string") cache.customInstructions = o.customInstructions;
             if (typeof o.zoom === "number" && Number.isFinite(o.zoom)) cache.zoom = clampZoom(o.zoom);
             if (VALID_THEMES.has(o.theme)) cache.theme = o.theme;
           }
+        } catch {
+          /* decrypt succeeded but content is corrupt — keep defaults, latch below */
         }
-      } catch {
-        /* keep defaults */
       }
       hydrated = true;
       window.dispatchEvent(new Event(EVT));
@@ -58,6 +67,10 @@ export function hydrateSettings(): Promise<void> {
 function save(next: Settings): void {
   cache = next;
   window.dispatchEvent(new Event(EVT));
+  if (!hydrated) {
+    void hydrateSettings(); // load failed earlier — retry rather than persist defaults over real data
+    return;
+  }
   void (async () => {
     try {
       localStorage.setItem(STORAGE_KEY, await vaultEncrypt(JSON.stringify(next)));

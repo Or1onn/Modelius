@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { permissionDataFrom } from "@/features/run-agent/lib/codeTransport";
-import { buildControlResponse } from "@/features/run-agent/lib/permission";
+import { permissionDataFrom, codexPermissionDataFrom } from "@/features/run-agent/lib/codeTransport";
+import { buildControlResponse, buildJsonRpcResult } from "@/features/run-agent/lib/permission";
 
 // Wire-contract lock for the stdio permission protocol, verified live against claude 2.1.206
 // (phase-0 probes): CAPTURED_REQUEST is a real can_use_tool line the CLI emitted, and the
@@ -51,5 +51,66 @@ describe("permission control protocol", () => {
       type: "control_response",
       response: { subtype: "success", request_id: "r1", response: { behavior: "deny", message: "User denied this in the probe" } },
     });
+  });
+});
+
+// Codex app-server approval flow, verified live against codex-cli 0.142.5 (probe P5):
+// CODEX_APPROVAL is a real item/commandExecution/requestApproval server request the CLI emitted,
+// and the accept line asserted below is the exact response after which the command executed.
+const CODEX_APPROVAL = {
+  method: "item/commandExecution/requestApproval",
+  id: 0,
+  params: {
+    threadId: "019f5756-46ed-7093-8ba4-bf2a6e907a73",
+    turnId: "019f5756-5aad-7c73-a487-66733e0f2371",
+    itemId: "call_1",
+    startedAtMs: 1783876710752,
+    environmentId: "local",
+    reason: "probe needs approval card",
+    command: "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -Command \"node -e \\\"console.log('probe-ran')\\\"\"",
+    cwd: "D:\\Modelius",
+    commandActions: [{ type: "unknown", command: "node -e \"console.log('probe-ran')\"" }],
+    proposedExecpolicyAmendment: ["node", "-e", "console.log('probe-ran')"],
+    availableDecisions: ["accept", { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["node", "-e", "console.log('probe-ran')"] } }, "cancel"],
+  },
+};
+
+describe("codex approval protocol", () => {
+  it("decodes a real requestApproval server request into a codex data-permission part", () => {
+    const part = codexPermissionDataFrom(CODEX_APPROVAL, "stream-1");
+    expect(part).toEqual({
+      type: "data-permission",
+      id: "0",
+      data: {
+        streamId: "stream-1",
+        requestId: "0",
+        toolName: "Bash",
+        toolUseId: "call_1",
+        // the model's logical command from commandActions, not the powershell.exe wrapper
+        input: { command: 'node -e "console.log(\'probe-ran\')"', cwd: "D:\\Modelius", reason: "probe needs approval card" },
+        kind: "codex",
+        rpcId: 0,
+      },
+    });
+  });
+
+  it("maps fileChange approvals onto the Edit card and rejects unknown server requests", () => {
+    const part = codexPermissionDataFrom(
+      { method: "item/fileChange/requestApproval", id: 7, params: { itemId: "fc_1", grantRoot: "D:\\ws", reason: "outside workspace" } },
+      "s"
+    );
+    expect(part?.data.toolName).toBe("Edit");
+    expect(part?.data.input).toEqual({ file_path: "D:\\ws", reason: "outside workspace" });
+    // non-approval server requests are answered with a JSON-RPC error by the transport, not a card
+    expect(codexPermissionDataFrom({ method: "item/tool/requestUserInput", id: 8, params: {} }, "s")).toBeNull();
+    // notifications (no id) must never become cards
+    expect(codexPermissionDataFrom({ method: "item/agentMessage/delta", params: {} }, "s")).toBeNull();
+  });
+
+  it("builds the exact accept line the CLI executed on in the probe (numeric id stays numeric)", () => {
+    expect(buildJsonRpcResult(0, { decision: "accept" })).toBe('{"id":0,"result":{"decision":"accept"}}');
+    expect(buildJsonRpcResult("r-1", { decision: "decline" })).toBe('{"id":"r-1","result":{"decision":"decline"}}');
+    // codex's dialect omits the jsonrpc field entirely (probe-verified)
+    expect(JSON.parse(buildJsonRpcResult(0, {}))).not.toHaveProperty("jsonrpc");
   });
 });

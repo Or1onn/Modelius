@@ -1,9 +1,11 @@
-// session.rs — warm agent sessions. A code chat on a stdin_prompt harness (claude) keeps ONE
-// long-lived CLI process across turns: follow-up user messages are written to its stdin
-// (stream-json multi-turn, probe-verified on claude 2.1.206) instead of re-spawning per turn —
-// skipping process boot and the `--resume` transcript replay. agent.rs owns argv/env/spawn and
-// decides warm vs per-turn (run_once); this module owns the registry, the per-session stdout
-// pump, and lifecycle (interrupt / idle reaping / LRU cap / app-exit cleanup).
+// session.rs — warm agent sessions. A code chat keeps ONE long-lived CLI process across turns —
+// follow-up turns ride the process's own stdio protocol instead of re-spawning per turn, skipping
+// process boot and the resume transcript replay. Two protocols, one lifecycle:
+// - Claude (stream-json multi-turn + control_requests, probe-verified 2.1.206)
+// - Codex (`app-server` JSON-RPC threads/turns, probe-verified 0.142.5, lines in codex_proto.rs)
+// agent.rs owns argv/env/spawn and decides warm vs per-turn (run_once); this module owns the
+// registry, the per-session stdout pump, and lifecycle (interrupt / idle reaping / LRU cap /
+// app-exit cleanup).
 use crate::agent::{PipeEvent, StdinHandle};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,11 +30,57 @@ pub(crate) struct Fingerprint {
     pub harness: String,
     pub model: String,
     pub cwd: String,
-    // Reasoning depth ("" = no flag). argv-only — no in-session switch — so a change respawns.
+    // Reasoning depth ("" = no flag). Claude-only: argv-only there, so a change respawns.
+    // Codex effort is a native per-turn override (turn/start) — always "" in its fingerprint.
     pub effort: String,
     // (protocol, base_url, api_key) of a routed run; None = the CLI's native login.
     pub target: Option<(String, String, String)>,
     pub claude_token: Option<String>,
+    // ChatGPT account identity of a native codex run (account id + token hash) — auth rotation
+    // must respawn so the process re-reads the materialized CODEX_HOME. None for claude.
+    pub codex_account: Option<String>,
+}
+
+// Per-protocol runtime state. Claude needs none beyond the shared fields; a codex app-server
+// session tracks its JSON-RPC ids and the live thread/turn (codex_proto.rs builds the lines).
+pub(crate) enum SessionProto {
+    Claude,
+    Codex(CodexRuntime),
+}
+
+pub(crate) struct CodexRuntime {
+    // Set by the pump from the thread/start | thread/resume response.
+    thread_id: Mutex<Option<String>>,
+    // Set by the pump from turn/started; consumed by interrupt (turn/interrupt needs both ids).
+    turn_id: Mutex<Option<String>>,
+    // Client request ids. 1 = initialize, 2 = thread open (spawn_warm); turns/interrupts continue.
+    next_id: std::sync::atomic::AtomicU64,
+    // The pending thread-open request id + the waiter begin_turn blocks on (fresh spawns only).
+    thread_open_req: u64,
+    thread_ready_tx: Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>,
+    thread_ready_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Result<String, String>>>>,
+    // The in-flight turn/start request id — an RpcError for it must fail the turn (no
+    // turn/completed will follow).
+    turn_req: Mutex<Option<u64>>,
+}
+
+impl CodexRuntime {
+    pub fn new() -> Self {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        CodexRuntime {
+            thread_id: Mutex::new(None),
+            turn_id: Mutex::new(None),
+            next_id: std::sync::atomic::AtomicU64::new(3),
+            thread_open_req: 2,
+            thread_ready_tx: Mutex::new(Some(tx)),
+            thread_ready_rx: tokio::sync::Mutex::new(Some(rx)),
+            turn_req: Mutex::new(None),
+        }
+    }
+
+    fn take_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
 }
 
 // The turn currently streaming into the webview. Tauri channels are per-invoke, so every turn
@@ -45,6 +93,7 @@ struct ActiveTurn {
 
 pub(crate) struct AgentSession {
     fingerprint: Fingerprint,
+    proto: SessionProto,
     // Session-held stdin clone. Taken (dropped) on close so the CLI sees EOF once the per-turn
     // clone in agent_stdins is gone too. tokio Mutex on the handle (async writes); std Mutex on
     // the slot (never held across await).
@@ -135,11 +184,15 @@ impl AgentSession {
         s.flush().await
     }
 
-    // Reconcile the CLI's permission mode with what the webview asked for this turn. In-session
-    // switch (probe-verified: acked with {"mode":...}, enforced next turn) — cheaper than a
-    // fingerprint respawn, and idempotent if the CLI already switched itself (plan-approve's
-    // updatedPermissions setMode).
+    // Reconcile the CLI's permission mode with what the webview asked for this turn.
+    // Claude: in-session set_permission_mode control_request (probe-verified: acked with
+    // {"mode":...}, enforced next turn) — cheaper than a fingerprint respawn, and idempotent if
+    // the CLI already switched itself (plan-approve's updatedPermissions setMode).
+    // Codex: no-op — the mode rides every turn/start as approvalPolicy+sandboxPolicy overrides.
     pub async fn reconcile_permission_mode(&self, mode: &str) -> std::io::Result<()> {
+        if matches!(self.proto, SessionProto::Codex(_)) {
+            return Ok(());
+        }
         if mode.is_empty() || *self.permission_mode.lock().unwrap() == mode {
             return Ok(());
         }
@@ -154,17 +207,79 @@ impl AgentSession {
         Ok(())
     }
 
-    // Ask the CLI to stop the running turn but keep the process warm. The CLI acks instantly and
-    // ends the turn with a `result` (subtype error_during_execution) — the pump then finishes the
-    // turn normally. Probe-verified on 2.1.206.
+    // Deliver one user turn over the session's protocol. Err = pipe gone / protocol failure —
+    // the caller's write-failed retry respawns once.
+    pub async fn begin_turn(&self, prompt: &str, model: &str, effort: &str, mode: &str) -> std::io::Result<()> {
+        match &self.proto {
+            SessionProto::Claude => {
+                self.reconcile_permission_mode(mode).await?;
+                let line = serde_json::json!({
+                    "type": "user",
+                    "message": { "role": "user", "content": [{ "type": "text", "text": prompt }] }
+                })
+                .to_string();
+                self.write_line(&line).await
+            }
+            SessionProto::Codex(rt) => {
+                // Fresh spawn: wait for the thread/start | thread/resume response (the pump fires
+                // the oneshot). Reused session: thread_id is already set, no wait.
+                // (Guard extracted before the match — a temporary would live across the await.)
+                let known = rt.thread_id.lock().unwrap().clone();
+                let thread_id = match known {
+                    Some(t) => t,
+                    None => {
+                        let rx = rt.thread_ready_rx.lock().await.take().ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "thread never opened")
+                        })?;
+                        let opened = tokio::time::timeout(Duration::from_secs(20), rx)
+                            .await
+                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "thread open timed out"))?
+                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session died"))?;
+                        opened.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                    }
+                };
+                let id = rt.take_id();
+                *rt.turn_req.lock().unwrap() = Some(id);
+                *rt.turn_id.lock().unwrap() = None;
+                self.write_line(&crate::codex_proto::turn_start_line(id, &thread_id, prompt, model, effort, mode))
+                    .await
+            }
+        }
+    }
+
+    // Ask the CLI to stop the running turn but keep the process warm; the pump then finishes the
+    // turn normally. Claude: interrupt control_request → result subtype error_during_execution
+    // (probe-verified 2.1.206). Codex: turn/interrupt → turn/completed status "interrupted"
+    // (probe-verified 0.142.5). Err (e.g. no live turn ids yet) → caller falls back to kill.
     pub async fn interrupt(&self) -> std::io::Result<()> {
-        let line = serde_json::json!({
-            "type": "control_request",
-            "request_id": format!("int-{}", uuid_ish()),
-            "request": { "subtype": "interrupt" }
-        })
-        .to_string();
-        self.write_line(&line).await
+        match &self.proto {
+            SessionProto::Claude => {
+                let line = serde_json::json!({
+                    "type": "control_request",
+                    "request_id": format!("int-{}", uuid_ish()),
+                    "request": { "subtype": "interrupt" }
+                })
+                .to_string();
+                self.write_line(&line).await
+            }
+            SessionProto::Codex(rt) => {
+                let (thread_id, turn_id) = {
+                    let t = rt.thread_id.lock().unwrap().clone();
+                    let u = rt.turn_id.lock().unwrap().clone();
+                    match (t, u) {
+                        (Some(t), Some(u)) => (t, u),
+                        _ => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "no live codex turn to interrupt",
+                            ))
+                        }
+                    }
+                };
+                self.write_line(&crate::codex_proto::turn_interrupt_line(rt.take_id(), &thread_id, &turn_id))
+                    .await
+            }
+        }
     }
 
     // Hard stop: mark dead, drop stdin, kill, free the gateway. For cancel timeouts and app exit.
@@ -221,6 +336,7 @@ pub(crate) fn remove(key: &str) -> Option<Arc<AgentSession>> {
 pub(crate) fn spawn_session(
     key: &str,
     fingerprint: Fingerprint,
+    proto: SessionProto,
     permission_mode: String,
     mut child: tokio::process::Child,
     gateway: Option<crate::gateway::Gateway>,
@@ -240,6 +356,7 @@ pub(crate) fn spawn_session(
 
     let session = Arc::new(AgentSession {
         fingerprint,
+        proto,
         stdin: Mutex::new(Some(Arc::new(tokio::sync::Mutex::new(stdin)))),
         child: tokio::sync::Mutex::new(child),
         active: Mutex::new(None),
@@ -275,17 +392,28 @@ fn lru_victim(entries: impl Iterator<Item = (String, Instant)>, keep: &str) -> O
     entries.filter(|(k, _)| k != keep).min_by_key(|(_, t)| *t).map(|(k, _)| k)
 }
 
-// Long-lived stdout pump: every line goes to the attached turn; a `result` line ends that turn
-// (transport-side Done + waiter wakeup) but — unlike the per-turn path — leaves stdin open so the
-// CLI idles for the next stream-json user message. Stray lines between turns are dropped. EOF
-// means the process died: fail any in-flight turn with the stderr tail and drop the registry entry.
+// Long-lived stdout pump: every line goes to the attached turn; the protocol's turn-end marker
+// ends that turn (transport-side Done + waiter wakeup) but — unlike the per-turn path — leaves
+// stdin open so the CLI idles for the next turn. Stray lines between turns are dropped (codex
+// lifecycle responses are consumed into the runtime first). EOF means the process died: fail any
+// in-flight turn with the stderr tail and drop the registry entry.
 fn spawn_pump(key: String, session: Arc<AgentSession>, stdout: tokio::process::ChildStdout) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let end = is_result_line(&line);
+            let (end, fail) = match &session.proto {
+                // Claude: only a TOP-LEVEL result ends the turn (sidechain guard in is_result_line).
+                SessionProto::Claude => (is_result_line(&line), None),
+                SessionProto::Codex(rt) => pump_codex_line(rt, &line),
+            };
             let mut guard = session.active.lock().unwrap();
             if let Some(t) = guard.as_ref() {
+                if let Some(msg) = fail {
+                    // turn/start was rejected (RpcError) — no turn/completed will follow.
+                    let _ = t.channel.send(PipeEvent::Error(msg));
+                    finish_turn(guard.take().unwrap());
+                    continue;
+                }
                 let _ = t.channel.send(PipeEvent::Line(line));
                 if end {
                     finish_turn(guard.take().unwrap());
@@ -311,6 +439,60 @@ fn spawn_pump(key: String, session: Arc<AgentSession>, stdout: tokio::process::C
             map.remove(&key);
         }
     });
+}
+
+// Codex pump bookkeeping for one stdout line. Returns (turn_ended, turn_failed_message).
+// Tracks the thread id (thread open response → fires begin_turn's waiter), the live turn id
+// (turn/started → interrupt target), and ends the attached turn only on a turn/completed whose
+// threadId matches this session's — a sub-agent thread's completion must not end the parent turn.
+fn pump_codex_line(rt: &CodexRuntime, line: &str) -> (bool, Option<String>) {
+    use crate::codex_proto::{classify, CodexLine};
+    match classify(line) {
+        CodexLine::RpcResponse { id, thread_id } if id == rt.thread_open_req => {
+            let outcome = match thread_id {
+                Some(t) => {
+                    *rt.thread_id.lock().unwrap() = Some(t.clone());
+                    Ok(t)
+                }
+                None => Err("thread open response carried no thread id".to_string()),
+            };
+            if let Some(tx) = rt.thread_ready_tx.lock().unwrap().take() {
+                let _ = tx.send(outcome);
+            }
+            (false, None)
+        }
+        CodexLine::RpcError { id, message } => {
+            if id == rt.thread_open_req {
+                if let Some(tx) = rt.thread_ready_tx.lock().unwrap().take() {
+                    let _ = tx.send(Err(message));
+                }
+                (false, None)
+            } else {
+                let mut turn_req = rt.turn_req.lock().unwrap();
+                if *turn_req == Some(id) {
+                    *turn_req = None;
+                    (false, Some(message))
+                } else {
+                    (false, None)
+                }
+            }
+        }
+        CodexLine::TurnStarted { thread_id, turn_id } => {
+            if rt.thread_id.lock().unwrap().as_deref() == Some(thread_id.as_str()) {
+                *rt.turn_id.lock().unwrap() = Some(turn_id);
+            }
+            (false, None)
+        }
+        CodexLine::TurnCompleted { thread_id } => {
+            let ours = rt.thread_id.lock().unwrap().as_deref() == Some(thread_id.as_str());
+            if ours {
+                *rt.turn_id.lock().unwrap() = None;
+                *rt.turn_req.lock().unwrap() = None;
+            }
+            (ours, None)
+        }
+        _ => (false, None),
+    }
 }
 
 // Keep stderr flowing into a bounded tail (last ~2000 chars) for the death message, and mirror
@@ -404,19 +586,59 @@ mod tests {
 
     #[test]
     fn fingerprint_matches_on_run_identity_not_mode() {
-        let fp = |model: &str, effort: &str, token: Option<&str>| Fingerprint {
+        let fp = |model: &str, effort: &str, token: Option<&str>, account: Option<&str>| Fingerprint {
             harness: "claude-code".into(),
             model: model.into(),
             cwd: "D:\\proj".into(),
             effort: effort.into(),
             target: None,
             claude_token: token.map(String::from),
+            codex_account: account.map(String::from),
         };
-        assert!(fp("opus", "", None) == fp("opus", "", None));
-        assert!(fp("opus", "", None) != fp("sonnet", "", None)); // model change → respawn
-        assert!(fp("opus", "high", None) != fp("opus", "max", None)); // effort is argv-only → respawn
-        assert!(fp("opus", "", Some("t1")) != fp("opus", "", Some("t2"))); // auth rotation → respawn
-        // permission mode is not part of the fingerprint at all (switched in-session)
+        assert!(fp("opus", "", None, None) == fp("opus", "", None, None));
+        assert!(fp("opus", "", None, None) != fp("sonnet", "", None, None)); // model change → respawn
+        assert!(fp("opus", "high", None, None) != fp("opus", "max", None, None)); // claude effort is argv-only → respawn
+        assert!(fp("opus", "", Some("t1"), None) != fp("opus", "", Some("t2"), None)); // auth rotation → respawn
+        assert!(fp("gpt", "", None, Some("a:1")) != fp("gpt", "", None, Some("a:2"))); // codex account rotation → respawn
+        // permission mode is not part of the fingerprint at all (switched in-session);
+        // codex effort is not either (per-turn turn/start override) — agent_run passes "" there
+    }
+
+    #[test]
+    fn pump_codex_line_tracks_the_thread_and_ends_only_its_own_turns() {
+        let rt = CodexRuntime::new();
+        // thread open response (id 2) → thread id learned + begin_turn's waiter fired
+        let (end, fail) = pump_codex_line(&rt, r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"gpt-5.5"}}"#);
+        assert_eq!((end, fail.is_none()), (false, true));
+        assert_eq!(rt.thread_id.lock().unwrap().as_deref(), Some("th-1"));
+        assert!(rt.thread_ready_tx.lock().unwrap().is_none()); // oneshot consumed
+
+        // turn/started on our thread → interrupt target captured
+        let started = r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#;
+        pump_codex_line(&rt, started);
+        assert_eq!(rt.turn_id.lock().unwrap().as_deref(), Some("tu-1"));
+
+        // a sub-agent thread's completion must NOT end our turn
+        let foreign = r#"{"method":"turn/completed","params":{"threadId":"th-OTHER","turn":{"id":"x","status":"completed"}}}"#;
+        assert_eq!(pump_codex_line(&rt, foreign).0, false);
+
+        // our own completion ends the turn and clears the live turn id
+        let ours = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"interrupted"}}}"#;
+        assert_eq!(pump_codex_line(&rt, ours).0, true);
+        assert!(rt.turn_id.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn pump_codex_line_fails_the_turn_on_a_rejected_turn_start() {
+        let rt = CodexRuntime::new();
+        *rt.turn_req.lock().unwrap() = Some(5);
+        // an error for someone else's request is not ours to fail on
+        assert!(pump_codex_line(&rt, r#"{"id":9,"error":{"code":-1,"message":"nope"}}"#).1.is_none());
+        // an error for the in-flight turn/start fails the turn (no turn/completed will follow)
+        let (end, fail) = pump_codex_line(&rt, r#"{"id":5,"error":{"code":-32600,"message":"bad params"}}"#);
+        assert_eq!(end, false);
+        assert_eq!(fail.as_deref(), Some("bad params"));
+        assert!(rt.turn_req.lock().unwrap().is_none());
     }
 
     #[test]

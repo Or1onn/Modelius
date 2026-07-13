@@ -5,7 +5,7 @@
 // real provider key never enters the CLI process.
 // Mirrors the LLM streaming path (see stream.rs / compat.rs): one command, events over a Channel,
 // cancellation via the shared cancel registry.
-use crate::harness::{Arg, EnvSpec, HarnessSpec};
+use crate::harness::{Arg, EnvSpec, HarnessSpec, PromptChannel};
 use crate::stream::cancel_guard;
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-// Live stdin handles for runs on the stdio control protocol (harness.stdin_prompt), keyed by
-// stream id. `agent_respond` writes control_responses (permission allow/deny) into them while the
-// pump loop reads stdout. tokio Mutex on the handle: writes are async; the outer std Mutex only
+// Live stdin handles for runs holding a stdio protocol (warm harnesses), keyed by stream id.
+// `agent_respond` writes permission answers into them (claude control_responses / codex JSON-RPC
+// approval results) while the pump loop reads stdout. tokio Mutex on the handle: writes are async; the outer std Mutex only
 // guards map access (never held across await).
 pub(crate) type StdinHandle = Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>;
 
@@ -84,13 +84,12 @@ pub(crate) struct RouteTarget {
     pub api_key: String,
 }
 
-// Build argv from the harness's declarative template. The prompt is passed as a distinct argv
-// entry (never shell-interpolated). `gateway_url` (Some on a routed run) fills the {url} slot in
+// Build argv from the harness's declarative template. The prompt never enters argv — it rides
+// the harness's PromptChannel. `gateway_url` (Some on a routed run) fills the {url} slot in
 // Arg::RouteArgs; the gateway token is never placed in argv (env-only). `resume` (a session id
 // captured from a prior run) fills the {id} slot in Arg::Resume.
 fn build_argv(
     spec: &HarnessSpec,
-    prompt: &str,
     model: &str,
     permission_mode: &str,
     effort: &str,
@@ -101,7 +100,6 @@ fn build_argv(
     for a in spec.argv {
         match a {
             Arg::Lit(s) => args.push((*s).to_string()),
-            Arg::Prompt => args.push(prompt.to_string()),
             Arg::ModelFlag(flag) => {
                 if !model.is_empty() {
                     args.push((*flag).to_string());
@@ -249,8 +247,8 @@ fn write_codex_home(app: &tauri::AppHandle, auth: &CodexAuth) -> Result<std::pat
 
 // Run a harness turn: stream the CLI's stdout as agent events, honor cancellation. `target`
 // (absent for native-login runs) routes the CLI through the local gateway. With a `session_key`
-// (the code chat id) a stdin_prompt harness runs WARM: one long-lived process per chat, follow-up
-// turns written to its stdin (see session.rs); otherwise each turn spawns a fresh process.
+// (the code chat id) a warm-capable harness runs WARM: one long-lived process per chat, follow-up
+// turns over its stdio protocol (see session.rs); otherwise each turn spawns a fresh process.
 #[tauri::command]
 pub async fn agent_run(
     app: tauri::AppHandle,
@@ -292,26 +290,39 @@ pub async fn agent_run(
     }
     let path_env = crate::node_runtime::child_path_env(&app);
 
-    // Warm path (claude): reuse/spawn the chat's live process and feed it this turn over stdin.
-    // Only stdin_prompt harnesses can run warm — the others take the prompt as argv and exit.
-    if spec.stdin_prompt {
+    // Warm path: reuse/spawn the chat's live process and feed it this turn over its stdio
+    // protocol (claude stream-json / codex app-server JSON-RPC — session.rs begin_turn).
+    {
         if let Some(key) = session_key.filter(|k| !k.is_empty()) {
+            let is_codex = matches!(spec.channel, PromptChannel::CodexRpc);
+            let codex_home = match codex_auth.as_ref().filter(|_| is_codex) {
+                Some(a) => Some(write_codex_home(&app, a)?),
+                None => None,
+            };
             let run = WarmRun {
                 fingerprint: crate::session::Fingerprint {
                     harness,
                     model,
                     cwd,
-                    // argv-only knob: an effort change respawns the session (--resume keeps context)
-                    effort,
+                    // Claude: argv-only knob — an effort change respawns (--resume keeps context).
+                    // Codex: per-turn turn/start override — kept out so a change never respawns.
+                    effort: if is_codex { String::new() } else { effort.clone() },
                     target: target.map(|t| (t.protocol, t.base_url, t.api_key)),
                     claude_token,
+                    codex_account: codex_auth.as_ref().map(codex_account_id),
                 },
                 permission_mode,
                 resume,
                 prompt,
+                effort,
                 path_env,
+                codex_home,
             };
             return run_warm(&key, spec, &program, run, &cancel, &stream_id, &on_event).await;
+        }
+        if matches!(spec.channel, PromptChannel::CodexRpc) {
+            // app-server has no one-shot mode — a codex run is meaningless without a session.
+            return Err("codex runs require a session key".to_string());
         }
     }
 
@@ -347,9 +358,9 @@ pub async fn agent_run(
         .map(|(g, url)| (&spec.env, url, g.token.as_str(), model.as_str()));
 
     // Built here (not before the gateway) so Arg::RouteArgs can embed the gateway origin.
-    let args = build_argv(spec, &prompt, &model, &permission_mode, &effort, gateway_url.as_deref(), resume.as_deref());
+    let args = build_argv(spec, &model, &permission_mode, &effort, gateway_url.as_deref(), resume.as_deref());
 
-    let mut child = match spawn(&program, &args, &cwd, spec.extra_env, routed, codex_home.as_deref(), claude_token.as_deref(), path_env.as_deref(), spec.stdin_prompt) {
+    let mut child = match spawn(&program, &args, &cwd, spec.extra_env, routed, codex_home.as_deref(), claude_token.as_deref(), path_env.as_deref(), true) {
         Ok(c) => c,
         Err(e) => {
             if let Some(g) = &gateway {
@@ -361,11 +372,12 @@ pub async fn agent_run(
         }
     };
 
-    // stdin_prompt harness: deliver the prompt as a stream-json user message on stdin and keep
+    // Claude stream channel: deliver the prompt as a stream-json user message on stdin and keep
     // the pipe open for control_responses (permission answers via agent_respond). The guard
     // closes it on every exit path; the pump loop closes it early at the result line.
+    // (Codex never reaches this per-turn path — it always runs warm.)
     let _stdin_guard = StdinGuard { id: stream_id.clone() };
-    if spec.stdin_prompt {
+    if matches!(spec.channel, PromptChannel::ClaudeStream) {
         let mut si = match child.stdin.take() {
             Some(s) => s,
             None => {
@@ -427,7 +439,8 @@ pub async fn agent_run(
                 // With stream-json input the CLI idles for a next message after `result` — close
                 // stdin (drop the handle) so it exits and stdout reaches EOF. Top-level results
                 // only (a subagent's sidechain result must not end the turn) — see session.rs.
-                let done = spec.stdin_prompt && crate::session::is_result_line(&line);
+                let done = matches!(spec.channel, PromptChannel::ClaudeStream)
+                    && crate::session::is_result_line(&line);
                 // Dumb pipe: forward the raw stdout line; TS decodes it (transform.ts).
                 let _ = on_event.send(PipeEvent::Line(line));
                 if done {
@@ -485,12 +498,28 @@ struct WarmRun {
     permission_mode: String,
     resume: Option<String>,
     prompt: String,
+    // Raw effort as picked in the UI. For claude it's already in the fingerprint (argv);
+    // for codex it rides each turn/start (session.begin_turn) and stays out of the fingerprint.
+    effort: String,
     path_env: Option<std::ffi::OsString>,
+    // Materialized CODEX_HOME for a native codex run (None for claude / no forwarded auth).
+    codex_home: Option<std::path::PathBuf>,
+}
+
+// Fingerprint component for the ChatGPT account a codex run uses: auth rotation must respawn the
+// warm process so it re-reads the freshly materialized CODEX_HOME/auth.json. In-process identity
+// only (never persisted), so DefaultHasher is fine.
+fn codex_account_id(auth: &CodexAuth) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    auth.access_token.hash(&mut h);
+    format!("{}:{:x}", auth.account_id, h.finish())
 }
 
 // One turn against the chat's warm session: reuse the live process when the run identity matches,
-// else (re)spawn with --resume; write the user message to stdin; wait for the pump to see the
-// turn's `result`. Cancel interrupts in-place (process stays warm) and only kills a deaf CLI.
+// else (re)spawn (claude --resume / codex thread-resume); deliver the turn over the session's
+// protocol (begin_turn); wait for the pump to see the protocol's turn-end marker. Cancel
+// interrupts in-place (process stays warm) and only kills a deaf CLI.
 async fn run_warm(
     key: &str,
     spec: &'static HarnessSpec,
@@ -500,12 +529,6 @@ async fn run_warm(
     stream_id: &str,
     on_event: &tauri::ipc::Channel<PipeEvent>,
 ) -> Result<(), String> {
-    let initial = serde_json::json!({
-        "type": "user",
-        "message": { "role": "user", "content": [{ "type": "text", "text": run.prompt }] }
-    })
-    .to_string();
-
     // Permission answers route by stream id (agent_respond) — the guard drops this turn's
     // stdin registration on every exit path, mirroring the per-turn flow.
     let _stdin_guard = StdinGuard { id: stream_id.to_string() };
@@ -535,11 +558,9 @@ async fn run_warm(
             agent_stdins().lock().unwrap().insert(stream_id.to_string(), stdin);
         }
         let done_rx = session.attach_turn(on_event.clone());
-        let wrote = async {
-            session.reconcile_permission_mode(&run.permission_mode).await?;
-            session.write_line(&initial).await
-        }
-        .await;
+        let wrote = session
+            .begin_turn(&run.prompt, &run.fingerprint.model, &run.effort, &run.permission_mode)
+            .await;
         match wrote {
             Ok(()) => break (session, done_rx),
             Err(e) => {
@@ -617,10 +638,10 @@ async fn spawn_warm(
         .as_ref()
         .zip(gateway_url.as_deref())
         .map(|(g, url)| (&spec.env, url, g.token.as_str(), run.fingerprint.model.as_str()));
-    // stdin_prompt harness: Arg::Prompt is absent from the argv template — the prompt goes over stdin.
+    // The prompt goes over the stdio protocol, never argv. For codex, resume also rides the
+    // protocol (thread/resume below) — Arg::Resume only fires for claude.
     let args = build_argv(
         spec,
-        "",
         &run.fingerprint.model,
         &run.permission_mode,
         &run.fingerprint.effort,
@@ -633,7 +654,7 @@ async fn spawn_warm(
         &run.fingerprint.cwd,
         spec.extra_env,
         routed,
-        None, // codex_home — warm sessions are claude-only
+        run.codex_home.as_deref(),
         run.fingerprint.claude_token.as_deref(),
         run.path_env.as_deref(),
         true,
@@ -646,9 +667,14 @@ async fn spawn_warm(
             return Err(format!("failed to start '{}': {} (is it installed and on PATH?)", spec.bin, e));
         }
     };
+    let proto = match spec.channel {
+        PromptChannel::CodexRpc => crate::session::SessionProto::Codex(crate::session::CodexRuntime::new()),
+        _ => crate::session::SessionProto::Claude,
+    };
     let (session, evicted) = crate::session::spawn_session(
         key,
         run.fingerprint.clone(),
+        proto,
         run.permission_mode.clone(),
         child,
         gateway,
@@ -656,6 +682,28 @@ async fn spawn_warm(
     // Over the warm cap (or a same-key replacement): gracefully drop the losers.
     for old in evicted {
         old.close().await;
+    }
+    // Codex handshake, pipelined without awaiting responses (probe-verified): initialize +
+    // initialized + thread open. The pump consumes the thread response and unblocks begin_turn.
+    if matches!(spec.channel, PromptChannel::CodexRpc) {
+        let handshake = async {
+            session.write_line(&crate::codex_proto::initialize_line(1)).await?;
+            session.write_line(&crate::codex_proto::initialized_line()).await?;
+            session
+                .write_line(&crate::codex_proto::thread_open_line(
+                    2,
+                    run.resume.as_deref().filter(|s| !s.is_empty()),
+                    &run.fingerprint.model,
+                    &run.fingerprint.cwd,
+                    &run.permission_mode,
+                ))
+                .await
+        }
+        .await;
+        if let Err(e) = handshake {
+            crate::session::close_session(key).await;
+            return Err(format!("failed to start '{}' app-server: {}", spec.bin, e));
+        }
     }
     Ok(session)
 }
@@ -676,11 +724,10 @@ mod tests {
     #[test]
     fn build_argv_claude_carries_model_permission_and_control_protocol() {
         let s = spec("claude-code").unwrap();
-        let argv = build_argv(s, "do it", "claude-x", "plan", "", None, None);
+        let argv = build_argv(s, "claude-x", "plan", "", None, None);
         assert!(argv.contains(&"-p".to_string()));
-        // Prompt goes over stdin (stdin_prompt), not argv — the control-protocol flags do instead.
-        assert!(s.stdin_prompt);
-        assert!(!argv.contains(&"do it".to_string()));
+        // Prompt goes over stdin (PromptChannel::ClaudeStream), never argv.
+        assert!(matches!(s.channel, PromptChannel::ClaudeStream));
         assert!(argv.windows(2).any(|w| w[0] == "--input-format" && w[1] == "stream-json"));
         assert!(argv.windows(2).any(|w| w[0] == "--permission-prompt-tool" && w[1] == "stdio"));
         let mi = argv.iter().position(|a| a == "--model").unwrap();
@@ -691,24 +738,28 @@ mod tests {
     #[test]
     fn build_argv_omits_model_flag_when_no_model_picked() {
         let s = spec("claude-code").unwrap();
-        assert!(!build_argv(s, "hi", "", "", "", None, None).contains(&"--model".to_string()));
+        assert!(!build_argv(s, "", "", "", None, None).contains(&"--model".to_string()));
     }
 
     #[test]
     fn build_argv_claude_emits_effort_only_when_resolved() {
         let s = spec("claude-code").unwrap();
-        assert!(!build_argv(s, "hi", "", "", "", None, None).contains(&"--effort".to_string()));
-        let argv = build_argv(s, "hi", "", "", "high", None, None);
+        assert!(!build_argv(s, "", "", "", None, None).contains(&"--effort".to_string()));
+        let argv = build_argv(s, "", "", "high", None, None);
         let ei = argv.iter().position(|a| a == "--effort").unwrap();
         assert_eq!(argv[ei + 1], "high");
     }
 
     #[test]
-    fn build_argv_codex_emits_route_args_only_on_a_routed_run() {
+    fn build_argv_codex_is_app_server_with_route_args_only_on_a_routed_run() {
         let s = spec("codex").unwrap();
-        let native = build_argv(s, "hi", "gpt", "", "", None, None);
+        let native = build_argv(s, "gpt", "plan", "high", None, Some("thread-1"));
+        assert_eq!(native[0], "app-server");
+        // model / effort / permission / resume all ride the JSON-RPC protocol, never argv
+        assert!(!native.iter().any(|a| a == "--model" || a == "gpt"));
+        assert!(!native.iter().any(|a| a.contains("thread-1") || a.contains("high")));
         assert!(!native.iter().any(|a| a == "model_provider=modelius"));
-        let routed = build_argv(s, "hi", "gpt", "", "", Some("http://127.0.0.1:9000"), None);
+        let routed = build_argv(s, "gpt", "", "", Some("http://127.0.0.1:9000"), None);
         assert!(routed.iter().any(|a| a == "model_provider=modelius"));
         assert!(routed
             .iter()
@@ -718,20 +769,24 @@ mod tests {
     #[test]
     fn build_argv_claude_emits_resume_flag_only_with_an_id() {
         let s = spec("claude-code").unwrap();
-        assert!(!build_argv(s, "hi", "", "", "", None, Some("")).contains(&"--resume".to_string()));
-        let argv = build_argv(s, "hi", "", "", "", None, Some("sess-1"));
+        assert!(!build_argv(s, "", "", "", None, Some("")).contains(&"--resume".to_string()));
+        let argv = build_argv(s, "", "", "", None, Some("sess-1"));
         let ri = argv.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(argv[ri + 1], "sess-1");
     }
 
     #[test]
-    fn build_argv_codex_resume_subcommand_directly_follows_exec() {
-        let s = spec("codex").unwrap();
-        assert!(!build_argv(s, "hi", "", "", "", None, None).contains(&"resume".to_string()));
-        let argv = build_argv(s, "hi", "", "", "", None, Some("thread-1"));
-        assert_eq!(argv[0], "exec");
-        assert_eq!(argv[1], "resume");
-        assert_eq!(argv[2], "thread-1");
-        assert_eq!(argv.last().unwrap(), "hi"); // prompt stays the trailing positional
+    fn codex_account_id_tracks_token_rotation() {
+        let auth = |tok: &str| CodexAuth {
+            id_token: "id".into(),
+            access_token: tok.into(),
+            refresh_token: None,
+            account_id: "acc-1".into(),
+        };
+        assert_eq!(codex_account_id(&auth("t1")), codex_account_id(&auth("t1")));
+        assert_ne!(codex_account_id(&auth("t1")), codex_account_id(&auth("t2")));
+        assert!(codex_account_id(&auth("t1")).starts_with("acc-1:"));
+        // the raw token itself must never appear in the fingerprint component
+        assert!(!codex_account_id(&auth("supersecrettoken")).contains("supersecrettoken"));
     }
 }

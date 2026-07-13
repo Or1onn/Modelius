@@ -11,7 +11,7 @@ import { ctxTokens } from "@/shared/lib/tokens";
 import { useOutsideClick } from "@/shared/lib/useOutsideClick";
 import { useAutosize } from "@/shared/lib/useAutosize";
 import { MODEL_BY_ID } from "@/entities/model/model/registry";
-import { anthropicEffortTier, EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
+import { anthropicEffortTier, EFFORT_LEVELS, resolveEffort, CODEX_EFFORT_LEVELS, CODEX_EFFORT_DEFAULT, type EffortLevel } from "@/entities/model/model/apiIds";
 import { HARNESSES, HARNESS_BY_ID, PERMISSION_MODES, PERMISSION_LABEL, type NativeKind } from "@/entities/agent/model/harnesses";
 import { useHarnessStatuses, refreshHarnessStatuses, installHarness, cliLoggedIn } from "@/entities/agent/model/harnessStatus";
 import { hasAnthropicOAuth } from "@/entities/session/model/anthropicSession";
@@ -23,11 +23,11 @@ import { peekCodeModelGroups, listCodeModelGroups, type CodeModelGroup } from "@
 import { useGateways } from "@/entities/agent/model/gateways";
 import { GatewayModal } from "@/pages/code/ui/GatewayModal";
 import { listBranches, checkoutBranch } from "@/entities/agent/model/git";
-import { getCodeChat, getCodeConfig, setCodeConfig, subscribeCodeConfig } from "@/features/run-agent/lib/codeChatRegistry";
+import { getCodeChat, getCodeConfig, setCodeConfig, subscribeCodeConfig, isEmptyCodeChat } from "@/features/run-agent/lib/codeChatRegistry";
 import { getTurnStatus, subscribeTurnStatus } from "@/features/run-agent/lib/turnStatus";
 import { AssistantMessage } from "@/pages/code/ui/messageParts";
 import { CodeStats, PLogo } from "@/pages/code/ui/CodeStats";
-import { getRecentFolders, pushRecentFolder } from "@/pages/code/model/recentFolders";
+import { getRecentFolders, pushRecentFolder, getFolderBranch, setFolderBranch } from "@/pages/code/model/recentFolders";
 
 const basename = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
@@ -179,9 +179,11 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const harnessStatuses = useHarnessStatuses();
   const harness = HARNESS_BY_ID[harnessId];
   const registryModel = model.kind === "anthropic" ? MODEL_BY_ID[model.id] : undefined;
-  // Effort picker only for native Anthropic picks whose model gates it (mirrors resolvedEffort in
-  // the registry — other picks send no --effort flag at all).
+  // Effort picker for native picks whose harness supports it (mirrors resolvedEffort in the
+  // registry): Anthropic models that gate --effort, and codex models (rides turn/start).
   const effortTier = model.kind === "anthropic" ? anthropicEffortTier(model.id) : null;
+  const effortLevels = effortTier ? EFFORT_LEVELS[effortTier] : model.kind === "codex" ? CODEX_EFFORT_LEVELS : null;
+  const effortDefault = effortTier ? resolveEffort(effortTier, "auto") : CODEX_EFFORT_DEFAULT;
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const hintRef = useRef<HTMLDivElement>(null);
@@ -210,6 +212,8 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     ? (lastMeta.inputTokens ?? 0) + (lastMeta.cacheReadInputTokens ?? 0) + (lastMeta.cacheCreationInputTokens ?? 0)
     : 0;
   const cost = lastMeta?.totalCostUsd ?? null;
+  const active = messages.length > 0; // a started session: fold the folder strip into a top bar
+  const chatTitle = active ? userText(messages.find((m) => m.role === "user") as any) : "";
 
   useEffect(() => {
     setModelGroups(peekCodeModelGroups(harnessId));
@@ -227,12 +231,28 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     void refreshHarnessStatuses();
   }, []);
 
+  // A brand-new session inherits the last-used folder, so it's ready to go on launch.
+  useEffect(() => {
+    if (!cwd && isEmptyCodeChat(chatId)) {
+      const last = getRecentFolders()[0];
+      if (last) selectFolder(last);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatId]);
+
   useEffect(() => {
     let alive = true;
     void listBranches(cwd).then((info) => {
       if (!alive) return;
       setBranches(info.branches);
-      setBranch(info.current);
+      // Restore the branch this folder was last left on (checkout may fail on a dirty tree → revert).
+      const remembered = getFolderBranch(cwd);
+      if (remembered && remembered !== info.current && info.branches.includes(remembered)) {
+        setBranch(remembered);
+        checkoutBranch(cwd, remembered).catch(() => setBranch(info.current));
+      } else {
+        setBranch(info.current);
+      }
     });
     return () => { alive = false; };
   }, [cwd]);
@@ -267,6 +287,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     if (busy || next === branch) return;
     const prev = branch;
     setBranch(next);
+    setFolderBranch(cwd, next);
     checkoutBranch(cwd, next).catch(() => setBranch(prev));
   }
 
@@ -302,32 +323,30 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     void sendMessage({ text: "Plan approved — proceed with the implementation." });
   }
 
+  const folderPicker = (
+    <Picker
+      btnClass={"cd-folder-btn" + (cwd ? "" : " empty")}
+      label={cwd ? basename(cwd) : "Select folder"}
+      logo={<Icon name="folder" size={15} />}
+      menuHeader="Recent"
+      items={recents.map((d) => ({ id: d, label: basename(d), sub: d, check: d === cwd }))}
+      footer={{ label: "Open folder…", onSelect: pickFolder }}
+      onSelect={selectFolder}
+    />
+  );
+
   return (
     <div className="cd-wrap">
-      {/* Header: workspace folder selector */}
-      <header className="cd-top">
-        <div className="cd-top-title">
-          <Picker
-            down
-            btnClass={"cd-folder-btn" + (cwd ? "" : " empty")}
-            label={cwd ? basename(cwd) : "Select folder"}
-            logo={<Icon name="folder" size={15} />}
-            menuHeader="Recent"
-            items={recents.map((d) => ({ id: d, label: basename(d), sub: d, check: d === cwd }))}
-            footer={{ label: "Open folder…", onSelect: pickFolder }}
-            onSelect={selectFolder}
-          />
-        </div>
-        {showHint && !cwd && (
-          <div className="cd-folder-hint" role="status" ref={hintRef}>
-            <span className="cd-folder-hint-arrow" />
-            <div className="cd-folder-hint-txt">
-              <span className="cd-folder-hint-title">Choose a project folder to begin</span>
-              <span className="cd-folder-hint-sub">The agent reads, runs, and edits only inside this folder.</span>
-            </div>
-          </div>
-        )}
-      </header>
+      {/* Once a session is under way the folder chip lives in a slim top bar with the chat title. */}
+      {active && (
+        <header className="cd-top">
+          <span className="cd-top-title" title={chatTitle}>{chatTitle}</span>
+          <span className="cd-top-folder" title={cwd}>
+            <Icon name="folder" size={14} />
+            {basename(cwd)}
+          </span>
+        </header>
+      )}
 
       {/* Transcript */}
       <div className="cd-thread" ref={scrollRef}>
@@ -358,7 +377,19 @@ export function CodeScreen({ chatId }: { chatId: string }) {
 
       {/* Composer */}
       <div className="cd-composer-wrap">
-        <div className={"cd-composer" + (busy ? " busy" : "")}>
+        <div className="cd-plate">
+          {/* Workspace folder selector — enveloping plate wrapping the prompt input (new session only) */}
+          {!active && <div className="cd-plate-head">{folderPicker}</div>}
+          {showHint && !cwd && (
+            <div className="cd-folder-hint" role="status" ref={hintRef}>
+              <div className="cd-folder-hint-txt">
+                <span className="cd-folder-hint-title">Choose a project folder to begin</span>
+                <span className="cd-folder-hint-sub">The agent reads, runs, and edits only inside this folder.</span>
+              </div>
+              <span className="cd-folder-hint-arrow" />
+            </div>
+          )}
+          <div className={"cd-composer" + (busy ? " busy" : "")}>
           <textarea
             ref={taRef}
             value={input}
@@ -429,6 +460,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
             </button>
           </div>
         </div>
+        </div>
 
         {/* Controls row under the input: permission + effort left, branch + context ring right */}
         <div className="cd-underbar">
@@ -437,12 +469,12 @@ export function CodeScreen({ chatId }: { chatId: string }) {
             items={PERMISSION_MODES.map((m) => ({ id: m.id, label: m.label }))}
             onSelect={(id) => setCodeConfig(chatId, { permissionMode: id })}
           />
-          {effortTier && (
+          {effortLevels && (
             <Picker
-              label={`Effort: ${effort === "auto" ? "auto" : resolveEffort(effortTier, effort)}`}
+              label={`Effort: ${effort !== "auto" && effortLevels.includes(effort) ? effort : "auto"}`}
               items={[
-                { id: "auto", label: "Auto", sub: `→ ${resolveEffort(effortTier, "auto")}`, check: effort === "auto" },
-                ...EFFORT_LEVELS[effortTier].map((l) => ({ id: l, label: EFFORT_LABEL[l], check: effort === l })),
+                { id: "auto", label: "Auto", sub: `→ ${effortDefault}`, check: effort === "auto" },
+                ...effortLevels.map((l) => ({ id: l, label: EFFORT_LABEL[l], check: effort === l })),
               ]}
               onSelect={(id) => setCodeConfig(chatId, { effort: id as EffortLevel | "auto" })}
             />

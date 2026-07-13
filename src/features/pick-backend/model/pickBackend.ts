@@ -25,6 +25,7 @@ import {
   peekKeyProviderModels,
 } from "@/entities/session/model/keyProviders";
 import { listModels, peekModels, type RemoteModel } from "@/entities/session/api/providerModels";
+import { currentClaudeModels } from "@/entities/session/api/claudeModels";
 import { cached, peek } from "@/shared/lib/modelCache";
 
 // Messages API needs full ids — bare opus/sonnet/haiku aliases 404. Seeded with
@@ -40,19 +41,6 @@ function claudeFamilyOf(id: string): ClaudeFamily | null {
   if (id.includes("sonnet")) return "sonnet";
   if (id.includes("haiku")) return "haiku";
   return null;
-}
-
-// Keep only the newest model per family (assumes /v1/models is newest-first) to match the sub UI.
-function currentClaudeModels(models: RemoteModel[]): RemoteModel[] {
-  const seen = new Set<ClaudeFamily>();
-  const out: RemoteModel[] = [];
-  for (const m of models) {
-    const fam = claudeFamilyOf(m.id);
-    if (!fam || seen.has(fam)) continue;
-    seen.add(fam);
-    out.push(m);
-  }
-  return out;
 }
 
 // Claude models for the connected subscription, from /v1/models. Also refreshes
@@ -236,7 +224,7 @@ export async function listAvailableModels(): Promise<ModelOption[]> {
     const live = currentClaudeModels(await fetchClaudeSubscriptionModels().catch(() => [] as RemoteModel[]));
     out.push(...anthropicOptions(live.length ? live : claudeFallbackModels()));
   } else if (hasKey("anthropic")) {
-    out.push(...anthropicOptions(await listModels("anthropic").catch(() => [] as RemoteModel[])));
+    out.push(...anthropicOptions(currentClaudeModels(await listModels("anthropic").catch(() => [] as RemoteModel[]))));
   }
 
   for (const pid of KEY_PROVIDER_IDS)
@@ -258,7 +246,7 @@ export function peekAvailableModels(): ModelOption[] {
     const live = peekClaudeAccountModels();
     out.push(...anthropicOptions(live?.length ? live : claudeFallbackModels()));
   } else if (hasKey("anthropic")) {
-    out.push(...anthropicOptions(peekModels("anthropic") ?? []));
+    out.push(...anthropicOptions(currentClaudeModels(peekModels("anthropic") ?? [])));
   }
 
   for (const pid of KEY_PROVIDER_IDS)

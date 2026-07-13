@@ -12,6 +12,7 @@
     "fs:default",
     "updater:default",
     "process:default",
+    "core:window:allow-destroy",
     {
       "identifier": "fs:allow-write-text-file",
       "allow": [{ "path": "$HOME/**" }]

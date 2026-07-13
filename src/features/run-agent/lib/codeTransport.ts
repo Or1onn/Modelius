@@ -4,7 +4,7 @@
 import type { ChatTransport, UIMessage, UIMessageChunk } from "ai";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { createTransformer } from "./transform";
-import { createCodexTransformer } from "./codexTransform";
+import { createCodexAppServerTransformer } from "./codexAppServerTransform";
 import type { PermissionRequestData } from "./permission";
 import { bumpTurnActivity, clearTurnStatus, noteTurnStderr } from "./turnStatus";
 
@@ -22,7 +22,7 @@ export interface RunConfig {
   model: string;
   cwd: string;
   permissionMode: string;
-  effort: string; // Anthropic effort level, or "" for no override
+  effort: string; // reasoning effort (claude --effort / codex turn-start override), "" = none
   target?: { protocol: "anthropic" | "openai"; baseUrl: string; apiKey: string };
   codexAuth?: { idToken: string; accessToken: string; refreshToken?: string; accountId: string };
   claudeToken?: string;
@@ -32,6 +32,49 @@ export interface ResolvedSend {
   prompt: string;
   resume?: string; // prior CLI session id (from the last assistant message's metadata)
   run: RunConfig;
+}
+
+// Decode a codex app-server SERVER REQUEST (JSON-RPC {id, method, params} from the CLI to us)
+// into the `data-permission` part the transcript renders as an Allow/Deny card. Approval methods
+// map onto the canonical tool names the card already knows how to summarize; anything else
+// returns null (the transport answers it with a JSON-RPC error so the server never hangs).
+// Pure + exported so tests can feed it real captured lines (probe-verified codex-cli 0.142.5).
+export function codexPermissionDataFrom(
+  parsed: unknown,
+  streamId: string
+): { type: "data-permission"; id: string; data: PermissionRequestData } | null {
+  const req = parsed as { method?: string; id?: number | string; params?: Record<string, any> };
+  if (typeof req.method !== "string" || req.id === undefined || req.id === null) return null;
+  const p = req.params ?? {};
+  let toolName: string;
+  let input: Record<string, unknown>;
+  if (req.method === "item/commandExecution/requestApproval") {
+    // commandActions carries the model's logical command; params.command is the shell-wrapped
+    // spawn string — prefer the readable one (same choice as the transform's Bash rows).
+    const logical = Array.isArray(p.commandActions)
+      ? p.commandActions.map((a: any) => a?.command).filter(Boolean).join(" && ")
+      : "";
+    toolName = "Bash";
+    input = { command: logical || p.command || "", cwd: p.cwd, reason: p.reason };
+  } else if (req.method === "item/fileChange/requestApproval") {
+    toolName = "Edit";
+    input = { file_path: p.grantRoot ?? "", reason: p.reason };
+  } else {
+    return null;
+  }
+  return {
+    type: "data-permission",
+    id: String(req.id),
+    data: {
+      streamId,
+      requestId: String(req.id),
+      toolName,
+      toolUseId: typeof p.itemId === "string" ? p.itemId : undefined,
+      input,
+      kind: "codex",
+      rpcId: req.id,
+    },
+  };
 }
 
 // Decode a `can_use_tool` control_request stdout line into the `data-permission` part the
@@ -77,7 +120,8 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
   }): Promise<ReadableStream<UIMessageChunk>> {
     const { prompt, resume, run } = await this.resolve(options.messages);
     const streamId = crypto.randomUUID();
-    const transform = run.harness === "codex" ? createCodexTransformer() : createTransformer();
+    const isCodex = run.harness === "codex";
+    const transform = isCodex ? createCodexAppServerTransformer() : createTransformer();
     const channel = new Channel<PipeEvent>();
 
     return new ReadableStream<UIMessageChunk>({
@@ -100,10 +144,28 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
             } catch {
               return; // non-JSON line (banner/log) — ignore
             }
-            // Permission prompt (stdio control protocol): surface as a data part the transcript
-            // renders as an Allow/Deny card, answered via `agent_respond` (permission.ts). Lives
-            // here, not in the transform — the transport owns the streamId the answer targets.
-            if ((parsed as { type?: string }).type === "control_request") {
+            // Permission prompts surface as a data part the transcript renders as an Allow/Deny
+            // card, answered via `agent_respond` (permission.ts). Lives here, not in the
+            // transform — the transport owns the streamId the answer targets.
+            if (isCodex) {
+              // Codex server request = JSON-RPC {id, method} from the CLI. Approvals become
+              // cards; any other server request gets a JSON-RPC error line back immediately —
+              // an unanswered request would block the app-server forever.
+              const req = parsed as { method?: string; id?: number | string };
+              if (typeof req.method === "string" && req.id !== undefined && req.id !== null) {
+                const perm = codexPermissionDataFrom(parsed, streamId);
+                if (perm) push(perm);
+                else
+                  void invoke("agent_respond", {
+                    streamId,
+                    payload: JSON.stringify({
+                      id: req.id,
+                      error: { code: -32601, message: `unsupported request: ${req.method}` },
+                    }),
+                  }).catch(() => {});
+                return;
+              }
+            } else if ((parsed as { type?: string }).type === "control_request") {
               const perm = permissionDataFrom(parsed, streamId);
               if (perm) push(perm);
               return; // other control traffic is not transcript content

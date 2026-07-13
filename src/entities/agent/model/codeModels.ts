@@ -8,6 +8,7 @@ import { PROVIDERS } from "@/entities/model/model/registry";
 import { hasKey } from "@/entities/session/model/keys";
 import { KEY_PROVIDER_IDS, listKeyProviderModels, peekKeyProviderModels } from "@/entities/session/model/keyProviders";
 import { listModels, peekModels, type RemoteModel } from "@/entities/session/api/providerModels";
+import { listAppClaudeModels, peekAppClaudeModels } from "@/entities/session/api/claudeModels";
 import { peekOllamaModels, listOllamaModels } from "@/entities/session/model/ollamaSession";
 import { getGateways } from "@/entities/agent/model/gateways";
 import { nativeChoice, protocolPairSupported, type CodeModelChoice } from "@/entities/agent/model/codeModel";
@@ -35,7 +36,8 @@ function connectedGroup(pid: string, models: RemoteModel[] | null): CodeModelGro
 function buildGroups(
   harnessId: string,
   connected: Record<string, RemoteModel[] | null>,
-  ollama: RemoteModel[] | null
+  ollama: RemoteModel[] | null,
+  claude: RemoteModel[] | null
 ): CodeModelGroup[] {
   const harness = HARNESS_BY_ID[harnessId];
   if (!harness) return [];
@@ -43,7 +45,10 @@ function buildGroups(
   const groups: CodeModelGroup[] = [];
   if (harness.native) {
     const native = harness.native;
-    groups.push({ label: native.label, models: native.models().map((m) => nativeChoice(native.kind, m.id, m.name)) });
+    // The Anthropic native group uses the live /v1/models list when the app has an Anthropic
+    // connection; otherwise the CLI's own login is authed independently, so fall back to static.
+    const models = native.kind === "anthropic" && claude?.length ? claude : native.models();
+    groups.push({ label: native.label, models: models.map((m) => nativeChoice(native.kind, m.id, m.name)) });
   }
   if (!harness.routable) return groups;
 
@@ -75,17 +80,21 @@ const listProvider = (pid: string): Promise<RemoteModel[] | null> =>
       ? listModels("openai").catch(() => null)
       : listKeyProviderModels(pid).catch(() => null);
 
+const nativeIsAnthropic = (harnessId: string): boolean => HARNESS_BY_ID[harnessId]?.native?.kind === "anthropic";
+
 export function peekCodeModelGroups(harnessId: string): CodeModelGroup[] {
   const connected = Object.fromEntries(CONNECTED_IDS.map((pid) => [pid, peekProvider(pid)]));
-  return buildGroups(harnessId, connected, peekOllamaModels());
+  const claude = nativeIsAnthropic(harnessId) ? peekAppClaudeModels() : null;
+  return buildGroups(harnessId, connected, peekOllamaModels(), claude);
 }
 
 export async function listCodeModelGroups(harnessId: string): Promise<CodeModelGroup[]> {
-  if (!HARNESS_BY_ID[harnessId]?.routable) return buildGroups(harnessId, {}, null);
+  const claude = nativeIsAnthropic(harnessId) ? await listAppClaudeModels().catch(() => null) : null;
+  if (!HARNESS_BY_ID[harnessId]?.routable) return buildGroups(harnessId, {}, null, claude);
   const [ollama, ...lists] = await Promise.all([
     listOllamaModels().catch(() => null),
     ...CONNECTED_IDS.map((pid) => listProvider(pid)),
   ]);
   const connected = Object.fromEntries(CONNECTED_IDS.map((pid, i) => [pid, lists[i]]));
-  return buildGroups(harnessId, connected, ollama);
+  return buildGroups(harnessId, connected, ollama, claude);
 }

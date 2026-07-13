@@ -38,17 +38,26 @@ export function makeChatIndexStore(indexKey: string, evt: string, deleteBody: (i
     if (hydrated) return Promise.resolve();
     if (!hydrating)
       hydrating = (async () => {
-        try {
-          const raw = localStorage.getItem(indexKey);
-          if (raw) {
-            const arr = JSON.parse(await vaultDecrypt(raw));
+        const raw = localStorage.getItem(indexKey);
+        if (raw) {
+          let plain: string;
+          try {
+            plain = await vaultDecrypt(raw);
+          } catch {
+            // Vault/keychain temporarily unavailable — DON'T latch hydrated, or the next save()
+            // would clobber the real (still-encrypted) index with an empty one. Allow a retry.
+            hydrating = null;
+            return;
+          }
+          try {
+            const arr = JSON.parse(plain);
             if (Array.isArray(arr)) {
               cache = (arr as ChatIndexEntry[]).filter((c) => c && typeof c.id === "string");
               sorted = null;
             }
+          } catch {
+            /* decrypt succeeded but content is corrupt — keep empty, latch below */
           }
-        } catch {
-          /* keep empty */
         }
         hydrated = true;
         window.dispatchEvent(new Event(evt));
@@ -65,6 +74,10 @@ export function makeChatIndexStore(indexKey: string, evt: string, deleteBody: (i
     cache = list;
     sorted = null;
     window.dispatchEvent(new Event(evt));
+    if (!hydrated) {
+      void hydrate(); // load failed earlier — retry rather than persist an empty index over real data
+      return;
+    }
     void (async () => {
       try {
         localStorage.setItem(indexKey, await vaultEncrypt(JSON.stringify(list)));
@@ -203,10 +216,13 @@ export function makeBodyStore(prefix: string) {
     }
     if (raw === null) raw = localStorage.getItem(prefix + id); // browser / fallback-saved body
     if (!raw) return null;
+    // Let a vault-unavailable error propagate so the caller can keep the session loading and
+    // retry, rather than treating a transient failure as an empty chat (and later saving over it).
+    const plain = await vaultDecrypt(raw);
     try {
-      return JSON.parse(await vaultDecrypt(raw));
+      return JSON.parse(plain);
     } catch {
-      return null;
+      return null; // decrypt succeeded but body is corrupt
     }
   }
 

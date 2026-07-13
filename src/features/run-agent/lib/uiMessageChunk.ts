@@ -9,9 +9,11 @@ export type UIMessageChunk =
   | { type: "text-start"; id: string }
   | { type: "text-delta"; id: string; delta: string }
   | { type: "text-end"; id: string }
-  // Reasoning (Extended Thinking)
+  // Reasoning (Extended Thinking / codex reasoning summaries)
   | { type: "reasoning"; id: string; text: string }
+  | { type: "reasoning-start"; id: string }
   | { type: "reasoning-delta"; id: string; delta: string }
+  | { type: "reasoning-end"; id: string }
   // Tool calls
   | { type: "tool-input-start"; toolCallId: string; toolName: string }
   | { type: "tool-input-delta"; toolCallId: string; inputTextDelta: string }
