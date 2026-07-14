@@ -165,7 +165,7 @@ interface RunMeta { inputTokens?: number; cacheReadInputTokens?: number; cacheCr
 
 export function CodeScreen({ chatId }: { chatId: string }) {
   const chat = getCodeChat(chatId);
-  const { messages, status, sendMessage, stop: stopChat } = useChat({ chat, experimental_throttle: 50 });
+  const { messages, status, sendMessage, stop: stopChat } = useChat({ chat, throttle: 50 });
   const subscribe = useCallback((cb: () => void) => subscribeCodeConfig(chatId, cb), [chatId]);
   const getSnapshot = useCallback(() => getCodeConfig(chatId), [chatId]);
   const config = useSyncExternalStore(subscribe, getSnapshot);
