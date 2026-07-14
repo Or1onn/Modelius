@@ -98,7 +98,7 @@ export function Sidebar({
   const onRename = isCode ? onRenameCode : onRenameChat;
   return (
     <nav className="sidebar">
-      <div className="sb-logo">
+      <div className="sb-logo" data-tauri-drag-region>
         <span className="sb-mark">
           <span className="sb-mark-core" />
         </span>

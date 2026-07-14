@@ -587,7 +587,7 @@ export function ChatScreen({
     <div className="chat-wrap">
       <div className="chat-main">
         {/* Top bar */}
-        <header className="chat-top">
+        <header className="chat-top" data-tauri-drag-region>
           <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
             <span
               style={{

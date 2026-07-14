@@ -14,6 +14,7 @@ mod openai;
 mod secrets;
 mod session;
 mod stream;
+mod terminal;
 mod vault;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -59,6 +60,10 @@ pub fn run() {
             installer::harness_logged_in,
             git::git_branches,
             git::git_checkout,
+            terminal::terminal_open,
+            terminal::terminal_write,
+            terminal::terminal_resize,
+            terminal::terminal_close,
             artifacts::artifact_write,
             artifacts::artifact_read,
             secrets::secret_set,
@@ -76,6 +81,7 @@ pub fn run() {
             // a quit never strands claude processes (kill_on_drop only covers dropped handles).
             if let tauri::RunEvent::Exit = event {
                 session::close_all();
+                terminal::close_all();
             }
         });
 }

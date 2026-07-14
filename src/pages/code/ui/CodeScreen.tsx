@@ -27,6 +27,8 @@ import { getCodeChat, getCodeConfig, setCodeConfig, subscribeCodeConfig, isEmpty
 import { getTurnStatus, subscribeTurnStatus } from "@/features/run-agent/lib/turnStatus";
 import { AssistantMessage } from "@/pages/code/ui/messageParts";
 import { CodeStats, PLogo } from "@/pages/code/ui/CodeStats";
+import { TerminalPanel } from "@/pages/code/ui/TerminalPanel";
+import { useSettings } from "@/entities/settings/model/settings";
 import { getRecentFolders, pushRecentFolder, getFolderBranch, setFolderBranch } from "@/pages/code/model/recentFolders";
 
 const basename = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
@@ -44,12 +46,13 @@ function badgePid(model: CodeModelChoice): string {
 
 function ModelBadge({ model }: { model: CodeModelChoice }) {
   const pid = badgePid(model);
+  const modelId = model.kind === "connected" ? model.id : undefined; // vendor-prefixed → resolves the real brand logo
   // Non-native picks run the CLI through the local gateway proxy — flag them wherever the badge
   // shows, so tool-calling quirks are traceable to the routing at a glance.
   const routed = model.kind !== "anthropic" && model.kind !== "codex";
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-      {pid && <PLogo pid={pid} />}
+      {pid && <PLogo pid={pid} modelId={modelId} plain />}
       <span style={{ fontWeight: 520 }}>{model.label}</span>
       {routed && (
         <span style={{ fontSize: 11, color: "var(--text-3)", border: "1px solid var(--border)", borderRadius: 4, padding: "0 4px", whiteSpace: "nowrap" }}>
@@ -169,6 +172,11 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const { harness: harnessId, model, cwd, permissionMode, effort } = config;
 
   const [input, setInput] = useState("");
+  // Bottom terminal: mounted only while open. Re-fitting a hidden xterm under the shell `zoom`
+  // corrupts its grid, so closing tears it down and opening starts a fresh, correctly-fitted shell.
+  const { zoom } = useSettings();
+  const [termOpen, setTermOpen] = useState(false);
+  const toggleTerm = () => setTermOpen((v) => !v);
   const [recents, setRecents] = useState<string[]>(() => getRecentFolders());
   const [branches, setBranches] = useState<string[]>([]);
   const [branch, setBranch] = useState("");
@@ -185,6 +193,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const effortLevels = effortTier ? EFFORT_LEVELS[effortTier] : model.kind === "codex" ? CODEX_EFFORT_LEVELS : null;
   const effortDefault = effortTier ? resolveEffort(effortTier, "auto") : CODEX_EFFORT_DEFAULT;
   const scrollRef = useRef<HTMLDivElement>(null);
+  const pinnedRef = useRef(true); // at bottom → follow the stream; scrolling up unpins so the user can read back
   const taRef = useRef<HTMLTextAreaElement>(null);
   const hintRef = useRef<HTMLDivElement>(null);
   const [showHint, setShowHint] = useState(false);
@@ -224,7 +233,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
 
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
   }, [messages, status]);
 
   useEffect(() => {
@@ -339,17 +348,27 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     <div className="cd-wrap">
       {/* Once a session is under way the folder chip lives in a slim top bar with the chat title. */}
       {active && (
-        <header className="cd-top">
+        <header className="cd-top" data-tauri-drag-region>
           <span className="cd-top-title" title={chatTitle}>{chatTitle}</span>
           <span className="cd-top-folder" title={cwd}>
             <Icon name="folder" size={14} />
             {basename(cwd)}
           </span>
+          <button className={"cd-top-act" + (termOpen ? " on" : "")} onClick={toggleTerm} title="Toggle terminal">
+            <Icon name="terminal" size={16} />
+          </button>
         </header>
       )}
 
       {/* Transcript */}
-      <div className="cd-thread" ref={scrollRef}>
+      <div
+        className="cd-thread"
+        ref={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+        }}
+      >
         <div className="cd-thread-inner">
           {messages.length === 0 && !busy && <CodeStats />}
           {messages.map((m, i) =>
@@ -491,6 +510,11 @@ export function CodeScreen({ chatId }: { chatId: string }) {
           <ContextRing tokens={contextTokens} limit={registryModel?.ctx ? ctxTokens(registryModel.ctx) : 0} cost={cost} modelName={model.label} />
         </div>
       </div>
+
+      {/* Bottom terminal — real PTY, docked below the composer so the chat sits above it. */}
+      {termOpen && cwd && (
+        <TerminalPanel cwd={cwd} onClose={() => setTermOpen(false)} zoom={zoom} />
+      )}
 
       {gatewaysOpen && <GatewayModal onClose={() => setGatewaysOpen(false)} />}
       {authNeed && (

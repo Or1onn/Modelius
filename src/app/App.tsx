@@ -24,6 +24,7 @@ import { SettingsScreen } from "@/pages/settings/ui/SettingsScreen";
 import { SearchModal } from "@/widgets/search-modal/ui/SearchModal";
 import { ShortcutsModal } from "@/widgets/shortcuts-modal/ui/ShortcutsModal";
 import { Sidebar } from "@/app/ui/Sidebar";
+import { WindowControls } from "@/app/ui/WindowControls";
 import { Icon } from "@/shared/ui/Icon";
 import type { ScreenId } from "@/app/ui/ChatGroup";
 
@@ -235,8 +236,9 @@ export default function App() {
   const noise = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.6 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`;
 
   return (
-    <div className={"app" + (navCollapsed ? " nav-collapsed" : "") + (navResizing ? " nav-resizing" : "")} style={{ ...ROOT_STYLE, "--nav-w": navWidth + "px", "--app-zoom": zoom } as CSSProperties}>
+    <div className={"app" + (isTauri() ? " tauri" : "") + (navCollapsed ? " nav-collapsed" : "") + (navResizing ? " nav-resizing" : "")} style={{ ...ROOT_STYLE, "--nav-w": navWidth + "px", "--app-zoom": zoom, "--cap-h": screen === "code" ? "44px" : "52px" } as CSSProperties}>
       <div className="grain" style={{ backgroundImage: noise, opacity: "var(--grain-op)" }} />
+      {isTauri() && <WindowControls />}
       <Sidebar
         screen={screen}
         setScreen={setScreen}

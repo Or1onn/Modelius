@@ -87,6 +87,7 @@ input, textarea { font-family: inherit; }
 .app {
   display: grid;
   position: relative;
+  --cap-h: 52px;
   grid-template-columns: var(--nav-w, 252px) 1fr;
   transition: grid-template-columns .28s cubic-bezier(0.4, 0, 0.2, 1);
   /* Scale the whole UI. zoom enlarges the shell, so divide the height back out
@@ -116,6 +117,22 @@ input, textarea { font-family: inherit; }
   border-bottom-left-radius: var(--r-lg);
   transition: border-radius .28s cubic-bezier(0.4, 0, 0.2, 1);
 }
+
+/* Custom window controls (frameless Tauri window). Fixed top-right, above the grain.
+   Rendered inside .app so they inherit the shell zoom, keeping size consistent with the UI. */
+/* Caption cluster height tracks the current screen's top bar (--cap-h, set on .app) so the
+   glyphs sit vertically centred in line with the bar's own right-side icons. */
+.win-ctl { position: fixed; top: 0; right: 0; z-index: 10000; display: flex; height: var(--cap-h, 52px); }
+.win-ctl-btn {
+  width: 46px; height: 100%; display: grid; place-items: center;
+  color: var(--text-3); transition: background .12s ease, color .12s ease;
+}
+.win-ctl-btn:hover { background: rgba(var(--fg-rgb),0.09); color: var(--text-1); }
+.win-ctl-btn.close:hover { background: #E81123; color: #fff; }
+.win-ctl-btn svg { width: 10px; height: 10px; fill: none; stroke: currentColor; stroke-width: 1; }
+/* Reserve room at the right of the top bars so their content clears the caption buttons. */
+.app.tauri .chat-top, .app.tauri .cd-top { padding-right: 150px; }
+.app.tauri .screen-head { padding-right: 150px; }
 
 .icon-btn {
   width: 30px; height: 30px; display: grid; place-items: center;
@@ -1317,6 +1334,26 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 /* ============ Code mode ============ */
 .cd-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
+/* Bottom terminal panel — sits above the composer, resized by dragging its top edge. Kept in the
+   layout (height 0) while collapsed so the shell keeps running. */
+.cd-term { position: relative; flex-shrink: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); border-top: 1px solid var(--border); }
+.cd-term-resize { position: absolute; top: 0; left: 0; right: 0; height: 6px; transform: translateY(-3px); cursor: row-resize; z-index: 3; }
+.cd-term-head { display: flex; align-items: center; justify-content: space-between; height: 30px; padding: 0 8px 0 12px; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+.cd-term-title { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 560; color: var(--text-3); }
+.cd-term-title svg { color: var(--text-4); }
+.cd-term-x { width: 24px; height: 24px; display: grid; place-items: center; border-radius: var(--r-xs); color: var(--text-4); transition: background .12s, color .12s; }
+.cd-term-x:hover { background: var(--surface-2); color: var(--text-1); }
+.cd-term-host { flex: 1; min-height: 0; padding: 6px 4px 6px 10px; }
+.cd-term-host .xterm, .cd-term-host .xterm-viewport { height: 100% !important; }
+.cd-term-host .xterm-viewport { background: transparent !important; }
+/* Top-bar action button (terminal toggle, etc.) — sits at the right of .cd-top by the folder chip. */
+.cd-top-act { width: 28px; height: 28px; display: grid; place-items: center; border-radius: var(--r-sm); color: var(--text-3); transition: background .12s, color .12s; }
+.cd-top-act svg { color: var(--text-3); }
+.cd-top-act:hover { background: var(--surface-2); color: var(--text-1); }
+.cd-top-act:hover svg { color: var(--text-1); }
+.cd-top-act.on { background: color-mix(in oklab, var(--accent) 14%, transparent); color: var(--accent); }
+.cd-top-act.on svg { color: var(--accent); }
+
 /* Slim top bar once a session is running: chat title + the folder chip. */
 .cd-top {
   display: flex; align-items: center; gap: 10px; flex-shrink: 0;
@@ -1475,6 +1512,10 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 /* Active session: no folder strip above, so the input is the plate's only child — square-off the
    divider and round the top fully. */
 .cd-composer:first-child { border-top-color: transparent; border-radius: 15px; }
+/* ...but that transparent top is declared after the focus rule and, at equal specificity, wins —
+   so on focus the top edge stayed unpainted and its rounded corners read as clipped. Re-light the
+   top edge on focus too. */
+.cd-composer:first-child:focus-within { border-top-color: rgba(var(--fg-rgb), 0.24); }
 .cd-composer.busy { border-color: color-mix(in oklab, var(--accent) 30%, transparent); }
 .cd-composer textarea { display: block; width: 100%; resize: none; border: none; outline: none; background: transparent; color: var(--text-1); font-size: 14px; line-height: 1.55; padding: 2px 4px; min-height: 42px; max-height: 200px; }
 .cd-composer textarea::placeholder { color: var(--text-4); }
@@ -1503,6 +1544,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 .cd-comp-tool:hover { background: var(--surface-2); color: var(--text-1); }
 .cd-plogo { display: inline-grid; place-items: center; width: 17px; height: 17px; border-radius: 5px; font-family: var(--font-mono); font-size: 8.5px; font-weight: 600; letter-spacing: -0.02em; flex-shrink: 0; overflow: hidden; }
 .cd-plogo svg, .cd-plogo img { width: 13px; height: 13px; object-fit: contain; }
+.cd-plogo.plain { background: none; border: 0; border-radius: 0; }
 .cd-model-pick { display: inline-flex; align-items: center; gap: 7px; padding: 5px 9px 5px 8px; border-radius: 8px; border: 1px solid transparent; background: transparent; font-size: 13px; color: var(--text-2); cursor: pointer; transition: background .12s, color .12s; }
 .cd-model-pick:hover { background: var(--surface-2); color: var(--text-1); }
 .cd-model-pick svg { color: var(--text-3); }

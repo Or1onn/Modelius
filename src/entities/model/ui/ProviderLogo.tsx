@@ -1,7 +1,7 @@
 // ProviderLogo.tsx — provider/company brand icons served from the TheSVG CDN (no bundled files).
 // The slug is the provider id, or — for aggregator (OpenRouter) models "vendor/model" — the id's
 // vendor prefix. A few ids differ from TheSVG's slug; those are remapped. On a CDN miss, shows initials.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const THESVG = "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons";
 
@@ -95,11 +95,19 @@ function loadTone(slug: string, url: string): Promise<Tone> {
 
 // `short` (initials) shows until the CDN icon loads, and stays if it's missing/slow/errors — the
 // jsDelivr fetch can be slow or fail, and waiting only for onError leaves an empty slot meanwhile.
+// A cold jsDelivr edge often 404s/times-out the first hit then serves it warm, so onError retries a
+// couple times (cache-busted so the browser refetches) before settling on initials.
+const RETRIES = 2;
 export function ProviderLogo({ pid, short, modelId }: { pid: string; short: string; modelId?: string }) {
   const slug = slugFor(pid, modelId);
-  const url = `${THESVG}/${slug}/default.svg`;
+  const [attempt, setAttempt] = useState(0);
+  const url = `${THESVG}/${slug}/default.svg${attempt ? `?r=${attempt}` : ""}`;
   const [loaded, setLoaded] = useState(false);
   const [tone, setTone] = useState<Tone>(() => toneCache.get(slug) ?? null);
+  const retryTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  useEffect(() => setAttempt(0), [slug]); // fresh retry budget when the icon changes (instance reused in a list)
+  useEffect(() => () => clearTimeout(retryTimer.current), []);
 
   useEffect(() => {
     setLoaded(false); // re-show initials while the new slug's icon loads (instance reused in a list)
@@ -120,7 +128,13 @@ export function ProviderLogo({ pid, short, modelId }: { pid: string; short: stri
         aria-hidden="true"
         style={loaded ? undefined : { display: "none" }}
         onLoad={() => setLoaded(true)}
-        onError={() => setLoaded(false)}
+        onError={() => {
+          setLoaded(false);
+          if (attempt < RETRIES) {
+            clearTimeout(retryTimer.current);
+            retryTimer.current = setTimeout(() => setAttempt((a) => a + 1), 500 * (attempt + 1));
+          }
+        }}
       />
     </>
   );
