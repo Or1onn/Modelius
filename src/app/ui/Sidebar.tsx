@@ -1,5 +1,5 @@
 // Sidebar.tsx — left nav: logo, actions, screen nav, chat history, user footer.
-import { useRef, type CSSProperties } from "react";
+import { type CSSProperties } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { useChatStore } from "@/entities/chat/model/chats";
 import { useCodeChatStore } from "@/entities/agent/model/codeChats";
@@ -23,13 +23,9 @@ const MODES: { id: ScreenId; label: string; icon: string }[] = [
   { id: "code", label: "Code", icon: "code" },
 ];
 
-function ModeToggle({ screen, setScreen }: { screen: ScreenId; setScreen: (s: ScreenId) => void }) {
-  // Active mode index drives the sliding highlight. On a non-mode screen (Providers/Memory/Settings)
-  // the index is -1; park the bar on the last-used mode instead of hiding it.
-  const idx = MODES.findIndex((m) => m.id === screen);
-  const lastMode = useRef(0);
-  if (idx >= 0) lastMode.current = idx;
-  const active = idx >= 0 ? idx : lastMode.current;
+function ModeToggle({ mode, setScreen }: { mode: ScreenId; setScreen: (s: ScreenId) => void }) {
+  // Highlight follows the sticky workspace mode, so it stays put on overlay screens (Providers/Memory).
+  const active = Math.max(0, MODES.findIndex((m) => m.id === mode));
   return (
     <div
       className="mode-seg"
@@ -41,7 +37,7 @@ function ModeToggle({ screen, setScreen }: { screen: ScreenId; setScreen: (s: Sc
         <button
           key={m.id}
           role="tab"
-          aria-selected={screen === m.id}
+          aria-selected={mode === m.id}
           className={"mode-seg-btn" + (i === active ? " on" : "")}
           onClick={() => setScreen(m.id)}
         >
@@ -55,6 +51,7 @@ function ModeToggle({ screen, setScreen }: { screen: ScreenId; setScreen: (s: Sc
 
 export function Sidebar({
   screen,
+  mode,
   setScreen,
   onNewChat,
   onOpenSearch,
@@ -71,6 +68,7 @@ export function Sidebar({
   onRenameCode,
 }: {
   screen: ScreenId;
+  mode: ScreenId;
   setScreen: (s: ScreenId) => void;
   onNewChat: () => void;
   onOpenSearch: () => void;
@@ -89,7 +87,8 @@ export function Sidebar({
   const { getChats } = useChatStore();
   const { getCodeChats } = useCodeChatStore();
   // Code mode shows its own history + handlers; every other screen shows chat history.
-  const isCode = screen === "code";
+  // Keyed off the sticky mode (not screen) so browsing Providers/Memory keeps the Code workspace.
+  const isCode = mode === "code";
   const chats = isCode ? getCodeChats() : getChats();
   const recentsActiveId = isCode ? activeCodeChatId : activeChatId;
   const onOpen = isCode ? onOpenCode : onOpenChat;
@@ -108,7 +107,7 @@ export function Sidebar({
         </button>
       </div>
 
-      <ModeToggle screen={screen} setScreen={setScreen} />
+      <ModeToggle mode={mode} setScreen={setScreen} />
 
       <div className="sb-group">
         {TOP_ACTIONS.map((a) => (

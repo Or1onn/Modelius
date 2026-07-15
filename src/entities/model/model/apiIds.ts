@@ -13,16 +13,22 @@ export function toOpenAIModel(model: Model): string {
   return real[model.id] ?? (model.cap >= 90 ? "gpt-4o" : "gpt-4o-mini");
 }
 
-// Models reachable via a ChatGPT (Codex) subscription. Curated (no model-list endpoint),
-// lists only ids the subscription accepts: gpt-5.4 / gpt-5.3-codex 400, codex-spark is Pro-only.
+// FALLBACK Codex model set. The authoritative list is fetched live from codex app-server's
+// model/list (subscription-filtered) and cached — see entities/session/api/codexModels.ts. This
+// hardcoded set is used only when that fetch is cold/offline, and as the routing-metadata backbone
+// (LIVE_CODEX carries the cap/cost/spd scores model/list omits). Ids must match what the installed
+// codex CLI advertises verbatim — an unknown id makes a turn silently produce no answer.
 export const CODEX_MODELS: { id: string; name: string; note?: string }[] = [
-  { id: "gpt-5.5", name: "GPT-5.5", note: "default" },
-  { id: "gpt-5.4-mini", name: "GPT-5.4 mini" },
+  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", note: "default" },
+  { id: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
+  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna" },
+  { id: "gpt-5.5", name: "GPT-5.5" },
+  { id: "gpt-5.4", name: "GPT-5.4" },
 ];
 
 export function toCodexModel(model: Model): string {
   if (CODEX_MODELS.some((m) => m.id === model.id)) return model.id;
-  return model.cap >= 90 ? "gpt-5.5" : "gpt-5.4-mini";
+  return model.cap >= 90 ? "gpt-5.6-sol" : "gpt-5.6-luna";
 }
 
 // Capability tier → Claude family, so an off-registry pick (or a demo model under a
@@ -59,7 +65,7 @@ export function toAnthropicModel(model: Model): string {
 
 // output_config.effort tunes reasoning depth. Model-gated: Opus 4.5–4.8 + Sonnet 4.6 only
 // (others 400 on it). xhigh/max are Opus-only. null = unsupported.
-export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type EffortTier = "opus" | "sonnet";
 
 export function anthropicEffortTier(model: string): EffortTier | null {

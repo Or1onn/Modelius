@@ -8,18 +8,20 @@ import { PROVIDERS } from "@/entities/model/model/registry";
 import { hasKey } from "@/entities/session/model/keys";
 import { KEY_PROVIDER_IDS, listKeyProviderModels, peekKeyProviderModels } from "@/entities/session/model/keyProviders";
 import { listModels, peekModels, type RemoteModel } from "@/entities/session/api/providerModels";
-import { listAppClaudeModels, peekAppClaudeModels } from "@/entities/session/api/claudeModels";
+import { listAppClaudeModels, peekAppClaudeModels, currentClaudeModels } from "@/entities/session/api/claudeModels";
+import { listAppCodexModels, peekAppCodexModels } from "@/entities/session/api/codexModels";
 import { peekOllamaModels, listOllamaModels } from "@/entities/session/model/ollamaSession";
 import { getGateways } from "@/entities/agent/model/gateways";
-import { nativeChoice, protocolPairSupported, type CodeModelChoice } from "@/entities/agent/model/codeModel";
+import { nativeChoice, type CodeModelChoice } from "@/entities/agent/model/codeModel";
 
 export interface CodeModelGroup {
   label: string;
   models: CodeModelChoice[];
 }
 
-// Providers the gateway can serve (OpenAI-compatible): OpenAI by key + every keyed compat provider.
-const CONNECTED_IDS = ["openai", ...KEY_PROVIDER_IDS];
+// Providers the gateway can serve by API key: OpenAI, Anthropic (both directions now translated by
+// the local proxy), and every keyed compat provider (Gemini/Groq, OpenAI-compatible).
+const CONNECTED_IDS = ["openai", "anthropic", ...KEY_PROVIDER_IDS];
 
 // Non-native picks run the CLI through the local gateway proxy (protocol translation) — mark
 // their group headers so the picker distinguishes them from the CLI's own well-trodden login.
@@ -37,7 +39,8 @@ function buildGroups(
   harnessId: string,
   connected: Record<string, RemoteModel[] | null>,
   ollama: RemoteModel[] | null,
-  claude: RemoteModel[] | null
+  claude: RemoteModel[] | null,
+  codex: RemoteModel[] | null
 ): CodeModelGroup[] {
   const harness = HARNESS_BY_ID[harnessId];
   if (!harness) return [];
@@ -45,9 +48,14 @@ function buildGroups(
   const groups: CodeModelGroup[] = [];
   if (harness.native) {
     const native = harness.native;
-    // The Anthropic native group uses the live /v1/models list when the app has an Anthropic
-    // connection; otherwise the CLI's own login is authed independently, so fall back to static.
-    const models = native.kind === "anthropic" && claude?.length ? claude : native.models();
+    // Native groups use the app's live subscription list when connected (Anthropic /v1/models,
+    // Codex model/list); otherwise the CLI's own login is authed independently → static fallback.
+    const models =
+      native.kind === "anthropic" && claude?.length
+        ? claude
+        : native.kind === "codex" && codex?.length
+          ? codex
+          : native.models();
     groups.push({ label: native.label, models: models.map((m) => nativeChoice(native.kind, m.id, m.name)) });
   }
   if (!harness.routable) return groups;
@@ -61,7 +69,7 @@ function buildGroups(
       label: "Ollama (local)" + VIA_GATEWAY,
       models: ollama.map((m) => ({ kind: "ollama", id: m.id, label: m.name || m.id })),
     });
-  const gateways = getGateways().filter((g) => protocolPairSupported(harness.protocol, g.protocol ?? "anthropic"));
+  const gateways = getGateways();
   if (gateways.length)
     groups.push({
       label: "Gateways" + VIA_GATEWAY,
@@ -70,31 +78,42 @@ function buildGroups(
   return groups;
 }
 
-const peekProvider = (pid: string): RemoteModel[] | null =>
-  !hasKey(pid) ? null : pid === "openai" ? (peekModels("openai") ?? null) : peekKeyProviderModels(pid);
+const peekProvider = (pid: string): RemoteModel[] | null => {
+  if (!hasKey(pid)) return null;
+  if (pid === "openai") return peekModels("openai") ?? null;
+  // Anthropic by key: current-gen Claude models from /v1/models (same filter Providers uses).
+  if (pid === "anthropic") {
+    const raw = peekModels("anthropic");
+    return raw ? currentClaudeModels(raw) : null;
+  }
+  return peekKeyProviderModels(pid);
+};
 
-const listProvider = (pid: string): Promise<RemoteModel[] | null> =>
-  !hasKey(pid)
-    ? Promise.resolve(null)
-    : pid === "openai"
-      ? listModels("openai").catch(() => null)
-      : listKeyProviderModels(pid).catch(() => null);
+const listProvider = (pid: string): Promise<RemoteModel[] | null> => {
+  if (!hasKey(pid)) return Promise.resolve(null);
+  if (pid === "openai") return listModels("openai").catch(() => null);
+  if (pid === "anthropic") return listModels("anthropic").then(currentClaudeModels).catch(() => null);
+  return listKeyProviderModels(pid).catch(() => null);
+};
 
 const nativeIsAnthropic = (harnessId: string): boolean => HARNESS_BY_ID[harnessId]?.native?.kind === "anthropic";
+const nativeIsCodex = (harnessId: string): boolean => HARNESS_BY_ID[harnessId]?.native?.kind === "codex";
 
 export function peekCodeModelGroups(harnessId: string): CodeModelGroup[] {
   const connected = Object.fromEntries(CONNECTED_IDS.map((pid) => [pid, peekProvider(pid)]));
   const claude = nativeIsAnthropic(harnessId) ? peekAppClaudeModels() : null;
-  return buildGroups(harnessId, connected, peekOllamaModels(), claude);
+  const codex = nativeIsCodex(harnessId) ? peekAppCodexModels() : null;
+  return buildGroups(harnessId, connected, peekOllamaModels(), claude, codex);
 }
 
 export async function listCodeModelGroups(harnessId: string): Promise<CodeModelGroup[]> {
   const claude = nativeIsAnthropic(harnessId) ? await listAppClaudeModels().catch(() => null) : null;
-  if (!HARNESS_BY_ID[harnessId]?.routable) return buildGroups(harnessId, {}, null, claude);
+  const codex = nativeIsCodex(harnessId) ? await listAppCodexModels().catch(() => null) : null;
+  if (!HARNESS_BY_ID[harnessId]?.routable) return buildGroups(harnessId, {}, null, claude, codex);
   const [ollama, ...lists] = await Promise.all([
     listOllamaModels().catch(() => null),
     ...CONNECTED_IDS.map((pid) => listProvider(pid)),
   ]);
   const connected = Object.fromEntries(CONNECTED_IDS.map((pid, i) => [pid, lists[i]]));
-  return buildGroups(harnessId, connected, ollama, claude);
+  return buildGroups(harnessId, connected, ollama, claude, codex);
 }

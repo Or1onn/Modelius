@@ -26,6 +26,7 @@ import {
 } from "@/entities/session/model/keyProviders";
 import { listModels, peekModels, type RemoteModel } from "@/entities/session/api/providerModels";
 import { currentClaudeModels } from "@/entities/session/api/claudeModels";
+import { listAppCodexModels, peekAppCodexModels, type CodexModel } from "@/entities/session/api/codexModels";
 import { cached, peek } from "@/shared/lib/modelCache";
 
 // Messages API needs full ids — bare opus/sonnet/haiku aliases 404. Seeded with
@@ -198,8 +199,32 @@ export const modelAllowsWeb = (m: Model): boolean => {
 };
 
 // Picker-option builders shared by listAvailableModels/peekAvailableModels.
-const codexOptions = (): ModelOption[] =>
-  CODEX_MODELS.map((m) => ({ key: `chatgpt:${m.id}`, label: m.name, provider: "openai", backend: { kind: "chatgpt", model: m.id, label: m.name } }));
+// Codex rows come from the live subscription list when available (id+name), else the static set.
+const codexOptions = (models: { id: string; name: string }[]): ModelOption[] =>
+  models.map((m) => ({ key: `chatgpt:${m.id}`, label: m.name, provider: "openai", backend: { kind: "chatgpt", model: m.id, label: m.name } }));
+
+// Routing registry (with cap/cost/spd) for the connected ChatGPT account: the hardcoded LIVE_CODEX
+// reconciled to the live model/list — so Auto never routes to a plan-locked id. When the live list
+// is cold/absent, the full static set (best available knowledge). model/list carries no scores, so
+// live-only ids without a LIVE_CODEX entry are omitted from Auto (still manually pickable).
+const availableCodexRegistry = (): Model[] => {
+  const live = peekAppCodexModels();
+  if (!live) return LIVE_CODEX;
+  const ids = new Set(live.map((m) => m.id));
+  return LIVE_CODEX.filter((m) => ids.has(m.id));
+};
+
+// Display name for a codex id — the live list first, then the static set, then the raw id.
+const codexName = (id: string): string =>
+  peekAppCodexModels()?.find((m) => m.id === id)?.name ?? CODEX_MODELS.find((m) => m.id === id)?.name ?? id;
+
+// A codex id the connected account can actually run: the routed mapping, but if the live list is
+// present and excludes it (plan-locked / off-registry), fall to the account's default model.
+const availableCodexId = (want: string): string => {
+  const live = peekAppCodexModels();
+  if (!live || live.some((m) => m.id === want)) return want;
+  return (live.find((m) => m.isDefault) ?? live[0])?.id ?? want;
+};
 const openaiOptions = (models: RemoteModel[]): ModelOption[] =>
   models.map((m) => ({ key: `openai:${m.id}`, label: m.name, provider: "openai", backend: { kind: "openai", model: m.id, label: m.name } }));
 const anthropicOptions = (models: { id: string; name: string }[]): ModelOption[] =>
@@ -216,8 +241,10 @@ const claudeFallbackModels = (): { id: string; name: string }[] =>
 export async function listAvailableModels(): Promise<ModelOption[]> {
   const out: ModelOption[] = [];
 
-  if (hasOpenAIOAuth()) out.push(...codexOptions());
-  else if (hasKey("openai")) out.push(...openaiOptions(await listModels("openai").catch(() => [] as RemoteModel[])));
+  if (hasOpenAIOAuth()) {
+    const live = await listAppCodexModels().catch(() => [] as CodexModel[]);
+    out.push(...codexOptions(live.length ? live : CODEX_MODELS));
+  } else if (hasKey("openai")) out.push(...openaiOptions(await listModels("openai").catch(() => [] as RemoteModel[])));
 
   // Prefer OAuth over key — matches streamClaude.
   if (hasAnthropicOAuth()) {
@@ -239,7 +266,7 @@ export async function listAvailableModels(): Promise<ModelOption[]> {
 export function peekAvailableModels(): ModelOption[] {
   const out: ModelOption[] = [];
 
-  if (hasOpenAIOAuth()) out.push(...codexOptions());
+  if (hasOpenAIOAuth()) out.push(...codexOptions(peekAppCodexModels() ?? CODEX_MODELS));
   else if (hasKey("openai")) out.push(...openaiOptions(peekModels("openai") ?? []));
 
   if (hasAnthropicOAuth()) {
@@ -265,8 +292,8 @@ export function pickBackend(decision: Decision): Backend {
   // Codex id (not the routed pick), so name that.
   const openai = (): Backend => {
     if (hasOpenAIOAuth()) {
-      const model = toCodexModel(decision.chosen);
-      return { kind: "chatgpt", model, label: CODEX_MODELS.find((m) => m.id === model)?.name ?? model };
+      const model = availableCodexId(toCodexModel(decision.chosen));
+      return { kind: "chatgpt", model, label: codexName(model) };
     }
     return { kind: "openai", model: toOpenAIModel(decision.chosen), label: decision.chosen.name };
   };
@@ -309,7 +336,7 @@ export function pickBackend(decision: Decision): Backend {
 // so the routed pick is real and difficulty drives the choice end-to-end. Empty → demo registry.
 export function liveRoutingPool(): Model[] {
   const out: Model[] = [];
-  if (hasOpenAIOAuth()) out.push(...LIVE_CODEX);
+  if (hasOpenAIOAuth()) out.push(...availableCodexRegistry());
   else if (hasKey("openai")) out.push(...MODELS.filter((m) => m.provider === "openai"));
   if (hasAnthropicOAuth() || hasKey("anthropic")) out.push(...LIVE_ANTHROPIC);
   for (const pid of KEY_PROVIDER_IDS) if (hasKey(pid)) out.push(...keyProviderRoutingModels(pid)); // Gemini/Groq
@@ -322,8 +349,11 @@ export function liveRoutingPool(): Model[] {
 // OAuth within the routed provider. Falls back to cost-routed when no sub is connected.
 export function pickSummarizerBackend(fallback: Decision): Backend {
   if (hasOpenAIOAuth()) {
-    const m = CODEX_MODELS.find((c) => c.id.includes("mini")) ?? CODEX_MODELS[CODEX_MODELS.length - 1];
-    return { kind: "chatgpt", model: m.id, label: m.name };
+    // Cheapest model the account can run (subscription is flat-fee, but pick the lightest tier).
+    const pool = availableCodexRegistry();
+    const base = pool.length ? pool : LIVE_CODEX;
+    const m = base.reduce((a, b) => (b.cost < a.cost ? b : a), base[0]);
+    return { kind: "chatgpt", model: m.id, label: codexName(m.id) };
   }
   if (hasAnthropicOAuth()) return { kind: "anthropic", model: claudeIdByFamily.haiku, label: "Claude Haiku" };
   return pickBackend(fallback);

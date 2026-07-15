@@ -17,9 +17,11 @@ import { useHarnessStatuses, refreshHarnessStatuses, installHarness, cliLoggedIn
 import { hasAnthropicOAuth } from "@/entities/session/model/anthropicSession";
 import { hasOpenAIOAuth } from "@/entities/session/model/openaiSession";
 import { AuthModal } from "@/pages/code/ui/AuthModal";
-import { choiceKey, type CodeModelChoice } from "@/entities/agent/model/codeModel";
+import { choiceKey, defaultModelForHarness, type CodeModelChoice } from "@/entities/agent/model/codeModel";
 import { ModelMenu, type ModelMenuItem } from "@/entities/model/ui/ModelMenu";
 import { peekCodeModelGroups, listCodeModelGroups, type CodeModelGroup } from "@/entities/agent/model/codeModels";
+import { peekAppCodexModels } from "@/entities/session/api/codexModels";
+import { clearModelCache } from "@/shared/lib/modelCache";
 import { useGateways } from "@/entities/agent/model/gateways";
 import { GatewayModal } from "@/pages/code/ui/GatewayModal";
 import { listBranches, checkoutBranch } from "@/entities/agent/model/git";
@@ -33,7 +35,7 @@ import { getRecentFolders, pushRecentFolder, getFolderBranch, setFolderBranch } 
 
 const basename = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
-const EFFORT_LABEL: Record<EffortLevel, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "X-high", max: "Max" };
+const EFFORT_LABEL: Record<EffortLevel, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "X-high", max: "Max", ultra: "Ultra" };
 
 // ---- small model badge (provider logo + name) ----
 function badgePid(model: CodeModelChoice): string {
@@ -190,8 +192,19 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   // Effort picker for native picks whose harness supports it (mirrors resolvedEffort in the
   // registry): Anthropic models that gate --effort, and codex models (rides turn/start).
   const effortTier = model.kind === "anthropic" ? anthropicEffortTier(model.id) : null;
-  const effortLevels = effortTier ? EFFORT_LEVELS[effortTier] : model.kind === "codex" ? CODEX_EFFORT_LEVELS : null;
-  const effortDefault = effortTier ? resolveEffort(effortTier, "auto") : CODEX_EFFORT_DEFAULT;
+  // Codex efforts are per-model (5.6 adds max/ultra; Sol defaults to low) — from the live
+  // model/list when connected, else the static fallback.
+  const codexLive = model.kind === "codex" ? peekAppCodexModels()?.find((m) => m.id === model.id) : undefined;
+  const effortLevels = effortTier
+    ? EFFORT_LEVELS[effortTier]
+    : model.kind === "codex"
+      ? codexLive?.efforts.length
+        ? codexLive.efforts
+        : CODEX_EFFORT_LEVELS
+      : null;
+  const effortDefault = effortTier ? resolveEffort(effortTier, "auto") : codexLive?.defaultEffort ?? CODEX_EFFORT_DEFAULT;
+  // Effective level shown/checked: an explicit pick, else the model default ("auto" tracks it).
+  const activeEffort = effort !== "auto" && effortLevels?.includes(effort) ? effort : effortDefault;
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true); // at bottom → follow the stream; scrolling up unpins so the user can read back
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -227,8 +240,18 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   useEffect(() => {
     setModelGroups(peekCodeModelGroups(harnessId));
     let alive = true;
-    void listCodeModelGroups(harnessId).then((g) => { if (alive) setModelGroups(g); });
+    void listCodeModelGroups(harnessId).then((g) => {
+      if (!alive) return;
+      setModelGroups(g);
+      // Reconcile a stale codex pick: the hardcoded fallback default may lead with a plan-locked
+      // model (e.g. gpt-5.6-sol) that the freshly-loaded live list hides — reset to the live
+      // default so the selection isn't a model missing from the dropdown.
+      if (model.kind === "codex" && !g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(model)))) {
+        setCodeConfig(chatId, { model: defaultModelForHarness(harnessId) });
+      }
+    });
     return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gateways.length, harnessId]);
 
   useEffect(() => {
@@ -441,6 +464,14 @@ export function CodeScreen({ chatId }: { chatId: string }) {
               triggerPid={badgePid(model)}
               triggerModelId={model.kind === "connected" ? model.id : undefined}
               footer={harness?.routable ? { label: "Add gateway…", onSelect: () => setGatewaysOpen(true) } : undefined}
+              onRefresh={async () => {
+                clearModelCache();
+                const g = await listCodeModelGroups(harnessId);
+                setModelGroups(g);
+                if (model.kind === "codex" && !g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(model)))) {
+                  setCodeConfig(chatId, { model: defaultModelForHarness(harnessId) });
+                }
+              }}
             />
             <Picker
               label={harness.name}
@@ -490,11 +521,14 @@ export function CodeScreen({ chatId }: { chatId: string }) {
           />
           {effortLevels && (
             <Picker
-              label={`Effort: ${effort !== "auto" && effortLevels.includes(effort) ? effort : "auto"}`}
-              items={[
-                { id: "auto", label: "Auto", sub: `→ ${effortDefault}`, check: effort === "auto" },
-                ...effortLevels.map((l) => ({ id: l, label: EFFORT_LABEL[l], check: effort === l })),
-              ]}
+              label={`Effort: ${activeEffort}`}
+              items={effortLevels.map((l) => ({
+                // The model-default row carries id "auto" so picking it keeps tracking the default.
+                id: l === effortDefault ? "auto" : l,
+                label: EFFORT_LABEL[l],
+                sub: l === effortDefault ? "default" : undefined,
+                check: activeEffort === l,
+              }))}
               onSelect={(id) => setCodeConfig(chatId, { effort: id as EffortLevel | "auto" })}
             />
           )}

@@ -13,6 +13,7 @@ import { useOutsideClick } from "@/shared/lib/useOutsideClick";
 import { useAutosize } from "@/shared/lib/useAutosize";
 import { listAvailableModels, peekAvailableModels, optionAllowsImages, optionAllowsWeb } from "@/features/pick-backend/model/pickBackend";
 import { supportsReasoning } from "@/entities/model/lib/pricingSource";
+import { clearModelCache } from "@/shared/lib/modelCache";
 import { makeArtifact, rememberArtifactTitle, isLargePaste, wrapFence, type Artifact } from "@/entities/artifact/model/artifacts";
 import { collectVersions } from "@/entities/artifact/lib/versions";
 import { ExportButton } from "@/features/export-chat/ui/ExportButton";
@@ -458,6 +459,15 @@ export function ChatScreen({
           onOpenChange={(o) => {
             setModelMenuOpen(o);
             if (!o) setEffortOpen(false);
+          }}
+          onRefresh={async () => {
+            clearModelCache();
+            setModelsLoading(true);
+            try {
+              setOptions(await listAvailableModels());
+            } finally {
+              setModelsLoading(false);
+            }
           }}
           renderLeading={(mq) =>
             !mq || "auto routed by policy".includes(mq) ? (

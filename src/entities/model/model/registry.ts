@@ -67,8 +67,11 @@ export const LIVE_ANTHROPIC: Model[] = [
   { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", abbr: "Hk", provider: "anthropic", cost: 0.002, cap: 84, spd: 92, latency: 0.5, ctx: "200K", vision: true },
 ];
 export const LIVE_CODEX: Model[] = [
+  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", abbr: "56", provider: "openai", cost: 0.008, cap: 98, spd: 66, latency: 1.5, ctx: "200K", vision: true },
+  { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", abbr: "5t", provider: "openai", cost: 0.006, cap: 94, spd: 78, latency: 1.0, ctx: "200K", vision: true },
+  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", abbr: "5l", provider: "openai", cost: 0.0015, cap: 85, spd: 92, latency: 0.6, ctx: "200K", vision: true },
   { id: "gpt-5.5", name: "GPT-5.5", abbr: "55", provider: "openai", cost: 0.007, cap: 97, spd: 68, latency: 1.4, ctx: "200K", vision: true },
-  { id: "gpt-5.4-mini", name: "GPT-5.4 mini", abbr: "5m", provider: "openai", cost: 0.001, cap: 84, spd: 90, latency: 0.6, ctx: "200K", vision: true },
+  { id: "gpt-5.4", name: "GPT-5.4", abbr: "54", provider: "openai", cost: 0.006, cap: 94, spd: 78, latency: 1.0, ctx: "200K", vision: true },
 ];
 export const MODEL_BY_ID: Record<string, Model> = Object.fromEntries(
   [...MODELS, ...LIVE_ANTHROPIC, ...LIVE_CODEX].map((m) => [m.id, m])

@@ -4,8 +4,9 @@
 // harness is derived from the harness registry (protocol/routable/native), not hardcoded.
 // Secrets are never stored on the choice — only provider/gateway ids.
 import { LIVE_ANTHROPIC, MODEL_BY_ID } from "@/entities/model/model/registry";
-import { HARNESS_BY_ID, type HarnessProtocol, type NativeKind } from "@/entities/agent/model/harnesses";
-import { getGateways, type GatewayProtocol } from "@/entities/agent/model/gateways";
+import { HARNESS_BY_ID, type NativeKind } from "@/entities/agent/model/harnesses";
+import { getGateways } from "@/entities/agent/model/gateways";
+import { peekAppCodexModels } from "@/entities/session/api/codexModels";
 
 export type CodeModelChoice =
   | { kind: "anthropic"; id: string; label: string }
@@ -19,12 +20,6 @@ export const DEFAULT_CODE_MODEL: CodeModelChoice = {
   id: LIVE_ANTHROPIC[0].id,
   label: LIVE_ANTHROPIC[0].name,
 };
-
-// The one gateway pairing that isn't served yet: an OpenAI-protocol CLI can't drive an
-// Anthropic-protocol endpoint (that translation direction is a future gateway feature).
-export function protocolPairSupported(inbound: HarnessProtocol, outbound: GatewayProtocol): boolean {
-  return !(inbound === "openai" && outbound === "anthropic");
-}
 
 export function nativeChoice(kind: NativeKind, id: string, label: string): CodeModelChoice {
   switch (kind) {
@@ -42,8 +37,9 @@ export function choiceFitsHarness(choice: CodeModelChoice, harnessId: string): b
     return h.native?.kind === choice.kind;
   if (!h.routable) return false;
   if (choice.kind === "gateway") {
-    const g = getGateways().find((g) => g.id === choice.gatewayId);
-    return !!g && protocolPairSupported(h.protocol, g.protocol ?? "anthropic");
+    // Any gateway protocol now serves either inbound CLI protocol (the local proxy translates
+    // both directions), so a gateway pick fits any routable harness it's still configured for.
+    return getGateways().some((g) => g.id === choice.gatewayId);
   }
   return true; // ollama / connected serve both inbound protocols
 }
@@ -51,12 +47,22 @@ export function choiceFitsHarness(choice: CodeModelChoice, harnessId: string): b
 export function defaultModelForHarness(harnessId: string): CodeModelChoice {
   const h = HARNESS_BY_ID[harnessId];
   if (h?.native) {
+    // Codex: default to the account's live model/list (subscription-filtered) so the default
+    // matches the dropdown — the hardcoded native.models() may lead with a plan-locked model
+    // (e.g. gpt-5.6-sol) the live list hides. Fall back to static only when the cache is cold.
+    if (h.native.kind === "codex") {
+      const live = peekAppCodexModels();
+      if (live?.length) {
+        const m = live.find((x) => x.isDefault) ?? live[0];
+        return nativeChoice("codex", m.id, m.name);
+      }
+    }
     const m = h.native.models()[0];
     if (m) return nativeChoice(h.native.kind, m.id, m.name);
   }
-  // Routable-only harness (no own login): first compatible gateway, else a placeholder the
-  // send path rejects with a readable "pick a model" message.
-  const g = h ? getGateways().find((g) => protocolPairSupported(h.protocol, g.protocol ?? "anthropic")) : undefined;
+  // Routable-only harness (no own login): first configured gateway (any protocol routes now),
+  // else a placeholder the send path rejects with a readable "pick a model" message.
+  const g = getGateways()[0];
   if (g) return { kind: "gateway", id: g.model, label: g.name, gatewayId: g.id };
   return { kind: "connected", id: "", label: "Select model…", providerId: "" };
 }

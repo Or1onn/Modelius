@@ -245,6 +245,83 @@ fn write_codex_home(app: &tauri::AppHandle, auth: &CodexAuth) -> Result<std::pat
     Ok(dir)
 }
 
+// List the Codex models the connected ChatGPT account can actually run, by asking `codex
+// app-server`'s model/list — the same subscription-filtered set the CLI's `/model` shows (so a
+// free/Plus account never sees a Pro-only model like gpt-5.6-sol). A THROWAWAY app-server: spawn,
+// handshake, one request, kill. Kept off the warm session registry (session.rs) because the warm
+// pump only tracks thread/turn ids and discards other response bodies. Returns the raw
+// `{data:[…]}` result; the webview maps it to picker entries + effort tiers (codexModels.ts).
+#[tauri::command]
+pub async fn codex_list_models(
+    app: tauri::AppHandle,
+    codex_auth: CodexAuth,
+) -> Result<serde_json::Value, String> {
+    let spec = crate::harness::spec("codex").ok_or_else(|| "codex harness missing".to_string())?;
+    let program = crate::installer::resolve_bin(&app, spec.bin)
+        .ok_or_else(|| format!("'{}' not found — install it from the Environment picker.", spec.bin))?;
+    // npm-shipped CLI is a Node program — provision the portable runtime if the system Node is
+    // unusable, mirroring agent_run so a broken `node` can't make this fail silently.
+    if matches!(spec.install, crate::harness::Install::Npm(_))
+        && !crate::installer::is_native_install(&app, &program)
+        && !crate::node_runtime::system_node_acceptable()
+    {
+        crate::node_runtime::ensure(&app).await?;
+    }
+    let path_env = crate::node_runtime::child_path_env(&app);
+    let codex_home = write_codex_home(&app, &codex_auth)?;
+    // Native app-server run (no gateway/model/effort/resume): argv = ["app-server", "-c", …].
+    let args = build_argv(spec, "", "", "", None, None);
+    let mut child = spawn(
+        &program,
+        &args,
+        &codex_home.to_string_lossy(),
+        spec.extra_env,
+        None,
+        Some(codex_home.as_path()),
+        None,
+        path_env.as_deref(),
+        true,
+    )
+    .map_err(|e| format!("failed to start '{}' app-server: {}", spec.bin, e))?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| "no stdin".to_string())?;
+    let stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
+
+    // Handshake + model/list, pipelined without awaiting responses (probe-verified spawn_warm).
+    let write = async {
+        stdin.write_all(crate::codex_proto::initialize_line(1).as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.write_all(crate::codex_proto::initialized_line().as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.write_all(crate::codex_proto::model_list_line(2).as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await
+    };
+    if let Err(e) = write.await {
+        let _ = child.start_kill();
+        return Err(format!("failed to query model/list: {}", e));
+    }
+
+    // Read stdout until the id:2 response (or its error); bounded so a hung app-server can't wedge.
+    let mut lines = BufReader::new(stdout).lines();
+    let read = async {
+        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            if v.get("id").and_then(|i| i.as_u64()) != Some(2) {
+                continue;
+            }
+            if let Some(err) = v.get("error") {
+                return Err(err.get("message").and_then(|m| m.as_str()).unwrap_or("model/list failed").to_string());
+            }
+            return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
+        }
+        Err("codex app-server closed before answering model/list".to_string())
+    };
+    let out = tokio::time::timeout(std::time::Duration::from_secs(15), read).await;
+    let _ = child.start_kill();
+    out.unwrap_or_else(|_| Err("codex model/list timed out".to_string()))
+}
+
 // Run a harness turn: stream the CLI's stdout as agent events, honor cancellation. `target`
 // (absent for native-login runs) routes the CLI through the local gateway. With a `session_key`
 // (the code chat id) a warm-capable harness runs WARM: one long-lived process per chat, follow-up

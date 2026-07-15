@@ -55,6 +55,7 @@ pub fn run() {
             agent::agent_run,
             agent::agent_respond,
             agent::agent_session_close,
+            agent::codex_list_models,
             installer::harness_status,
             installer::harness_install,
             installer::harness_logged_in,

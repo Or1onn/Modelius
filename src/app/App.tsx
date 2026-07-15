@@ -46,6 +46,12 @@ const clampNav = (w: number) => Math.max(NAV_MIN, Math.min(w, NAV_MAX));
 
 export default function App() {
   const [screen, setScreen] = useState<ScreenId>("chat");
+  // Workspace mode (Chat vs Code) — sticky. Providers/Memory/Settings are overlay screens that
+  // don't belong to a mode, so they must not reset it back to Chat while you browse them.
+  const [mode, setMode] = useState<"chat" | "code">("chat");
+  useEffect(() => {
+    if (screen === "chat" || screen === "code") setMode(screen);
+  }, [screen]);
   const { policy, zoom, theme } = useSettings(); // routing policy + UI zoom + theme (persisted)
 
   // Drive the light/dark palette via a data-theme attribute on <html> so body + app both pick it up.
@@ -161,7 +167,7 @@ export default function App() {
   };
 
   // "New" and Cmd+N are mode-aware: create a code session in Code mode, else a chat.
-  const newInMode = () => (screen === "code" ? newCode() : newChat());
+  const newInMode = () => (mode === "code" ? newCode() : newChat());
   // Latest newInMode for the global keydown handler (which subscribes once).
   const newChatRef = useRef(newInMode);
   newChatRef.current = newInMode;
@@ -241,6 +247,7 @@ export default function App() {
       {isTauri() && <WindowControls />}
       <Sidebar
         screen={screen}
+        mode={mode}
         setScreen={setScreen}
         onNewChat={newInMode}
         onOpenSearch={() => setSearchOpen(true)}

@@ -12,6 +12,7 @@ import { costOf, priceSource as priceSource_ } from "@/entities/model/lib/pricin
 import type { Message, Decision, PolicyId, ImageRef } from "@/entities/model/model/registry";
 import type { ChatMsg, Delta, Backend, ModelOption } from "@/entities/model/model/backend";
 import { CODEX_MODELS, ctxForBackend, effortForDifficulty, type EffortLevel } from "@/entities/model/model/apiIds";
+import { peekAppCodexModels } from "@/entities/session/api/codexModels";
 import { pickBackend, pickSummarizerBackend, liveRoutingPool, modelAllowsWeb } from "@/features/pick-backend/model/pickBackend";
 import { streamLLM } from "@/features/stream-completion/model/streamLLM";
 import { memoryBlock, getMemories, applyMemoryOps, hydrateMemory } from "@/entities/memory/model/memory";
@@ -315,7 +316,8 @@ function backendBadge(backend: Backend, decision: Decision): { label: string; pr
   const provider =
     backend.kind === "anthropic" ? "anthropic" : backend.kind === "compat" ? backend.providerId ?? "" : "openai";
   if (provider === decision.chosen.provider && backend.kind !== "chatgpt") return undefined;
-  const codex = CODEX_MODELS.find((m) => m.id === backend.model);
+  const codex =
+    peekAppCodexModels()?.find((m) => m.id === backend.model) ?? CODEX_MODELS.find((m) => m.id === backend.model);
   return { label: codex?.name ?? backend.label ?? backend.model, provider };
 }
 

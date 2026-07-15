@@ -109,6 +109,12 @@ export function hasOpenAIOAuth(): boolean {
   return oauthPresent(readMeta());
 }
 
+// Connected account id from the sync meta ("" if none) — the cache-key suffix so a live model
+// list is scoped per account (a re-login on a different plan isn't served stale models).
+export function openaiAccountId(): string {
+  return readMeta()?.accountId ?? "";
+}
+
 export async function disconnectOpenAIOAuth(): Promise<void> {
   await write(null);
   clearModelCache();

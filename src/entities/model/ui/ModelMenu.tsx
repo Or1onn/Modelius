@@ -40,6 +40,7 @@ export function ModelMenu({
   renderLeading,
   extras,
   onOpenChange,
+  onRefresh,
   closeOnSelect = true,
 }: {
   items: ModelMenuItem[];
@@ -53,10 +54,12 @@ export function ModelMenu({
   renderLeading?: (q: string) => ReactNode; // rows above the list (e.g. chat's "Auto"), filtered by the live query
   extras?: ReactNode; // region rendered below the list, above the footer (e.g. chat's thinking/effort controls)
   onOpenChange?: (open: boolean) => void; // notify the caller so it can refetch on open / reset on close
+  onRefresh?: () => void | Promise<void>; // evict cached model lists + refetch (e.g. after a plan change)
   closeOnSelect?: boolean; // false keeps the menu open after a pick (chat tweaks effort/thinking after selecting)
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
   const [shown, setShown] = useState(PAGE);
   const wrapRef = useRef<HTMLDivElement>(null);
   const scrollPending = useRef(false);
@@ -130,6 +133,24 @@ export function ModelMenu({
               placeholder="Search models…"
               spellCheck={false}
             />
+            {onRefresh && (
+              <button
+                className={"model-menu-refresh" + (refreshing ? " spin" : "")}
+                title="Refresh models"
+                disabled={refreshing}
+                onClick={async () => {
+                  if (refreshing) return;
+                  setRefreshing(true);
+                  try {
+                    await onRefresh();
+                  } finally {
+                    setRefreshing(false);
+                  }
+                }}
+              >
+                <Icon name="refresh" size={13} />
+              </button>
+            )}
           </div>
           <div className="model-menu-scroll" onScroll={onScroll}>
             {lead}

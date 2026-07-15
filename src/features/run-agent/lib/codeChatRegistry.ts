@@ -17,6 +17,7 @@ import { anthropicEffortTier, resolveEffort, CODEX_EFFORT_LEVELS, type EffortLev
 import { getGateways, gatewaySecretKey } from "@/entities/agent/model/gateways";
 import { OLLAMA_HOST } from "@/entities/session/model/ollamaSession";
 import { getCodexAuth } from "@/entities/session/model/openaiSession";
+import { peekAppCodexModels } from "@/entities/session/api/codexModels";
 import { getAnthropicAccessToken } from "@/entities/session/model/anthropicSession";
 import { getKey } from "@/entities/session/model/keys";
 import { KEY_PROVIDER_BASE } from "@/entities/session/model/keyProviders";
@@ -89,6 +90,12 @@ async function resolveRouting(model: CodeModelChoice, harnessId: string): Promis
     if (!key) throw new Error(`API key for gateway "${g.name}" is missing from the keychain — re-add the gateway.`);
     return { protocol: g.protocol ?? "anthropic", baseUrl: g.baseUrl, apiKey: key };
   }
+  // Anthropic by key: the gateway translates the CLI's protocol onto /v1/messages.
+  if (model.providerId === "anthropic") {
+    const key = await getKey("anthropic").catch(() => "");
+    if (!key) throw new Error("No API key saved for anthropic — connect it in Providers.");
+    return { protocol: "anthropic", baseUrl: "https://api.anthropic.com", apiKey: key };
+  }
   const base = model.providerId === "openai" ? "https://api.openai.com/v1" : KEY_PROVIDER_BASE[model.providerId];
   if (!base) throw new Error(`Unknown provider "${model.providerId}" — pick another model.`);
   const key = await getKey(model.providerId).catch(() => "");
@@ -102,7 +109,10 @@ async function resolveRouting(model: CodeModelChoice, harnessId: string): Promis
 // as if the user never touched the knob. Everything else → "" (no effort).
 function resolvedEffort(config: CodeConfig): string {
   if (config.model.kind === "codex") {
-    return config.effort !== "auto" && CODEX_EFFORT_LEVELS.includes(config.effort) ? config.effort : "";
+    // Per-model efforts from the live model/list (5.6 adds max/ultra), static fallback.
+    const live = peekAppCodexModels()?.find((m) => m.id === config.model.id);
+    const levels = live?.efforts.length ? live.efforts : CODEX_EFFORT_LEVELS;
+    return config.effort !== "auto" && levels.includes(config.effort) ? config.effort : "";
   }
   if (config.model.kind !== "anthropic") return "";
   const tier = anthropicEffortTier(config.model.id);

@@ -74,6 +74,12 @@ pub(crate) fn turn_interrupt_line(id: u64, thread_id: &str, turn_id: &str) -> St
         .to_string()
 }
 
+// model/list — the models the connected account can run (subscription-filtered, the same set the
+// CLI's `/model` shows). Needs no thread; issued right after the handshake (codex_list_models).
+pub(crate) fn model_list_line(id: u64) -> String {
+    json!({ "id": id, "method": "model/list", "params": {} }).to_string()
+}
+
 // What the pump needs to know about one stdout line. Everything else (deltas, items, approvals,
 // token usage) is opaque here — forwarded raw and decoded in TS (codexAppServerTransform.ts).
 #[derive(Debug, PartialEq)]
@@ -162,6 +168,15 @@ mod tests {
         assert_eq!(v["method"], "initialize");
         assert_eq!(v["params"]["clientInfo"]["name"], "modelius");
         assert_eq!(initialized_line(), r#"{"method":"initialized"}"#);
+    }
+
+    #[test]
+    fn model_list_line_is_a_bare_request() {
+        let v: serde_json::Value = serde_json::from_str(&model_list_line(2)).unwrap();
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["method"], "model/list");
+        assert_eq!(v["params"], serde_json::json!({}));
+        assert!(v.get("jsonrpc").is_none());
     }
 
     #[test]

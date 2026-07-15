@@ -29,8 +29,8 @@ describe("toOpenAIModel", () => {
 describe("toCodexModel", () => {
   it("keeps subscription ids, else falls back by cap", () => {
     expect(toCodexModel(m("gpt-5.5", 97))).toBe("gpt-5.5");
-    expect(toCodexModel(m("unknown", 95))).toBe("gpt-5.5");
-    expect(toCodexModel(m("unknown", 80))).toBe("gpt-5.4-mini");
+    expect(toCodexModel(m("unknown", 95))).toBe("gpt-5.6-sol");
+    expect(toCodexModel(m("unknown", 80))).toBe("gpt-5.6-luna");
   });
 });
 

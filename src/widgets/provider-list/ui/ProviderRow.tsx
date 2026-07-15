@@ -9,6 +9,7 @@ import { listOllamaModels, refreshOllama, peekOllamaModels } from "@/entities/se
 import { listKeyProviderModels, peekKeyProviderModels } from "@/entities/session/model/keyProviders";
 import { listClaudeAccountModels, peekClaudeAccountModels } from "@/features/pick-backend/model/pickBackend";
 import { CODEX_MODELS } from "@/entities/model/model/apiIds";
+import { listAppCodexModels, peekAppCodexModels } from "@/entities/session/api/codexModels";
 import { useAnthropicAuth } from "@/features/connect-anthropic/model/anthropicAuth";
 import { useOpenAIAuth } from "@/features/connect-openai/model/openaiAuth";
 
@@ -50,8 +51,14 @@ function providerModelSource(
 ): { peek: () => RemoteModel[] | null; fetch: () => Promise<RemoteModel[]> } | null {
   if (PROVIDERS[pid].local) return { peek: () => peekOllamaModels(), fetch: () => listOllamaModels() };
   if (viaOAuth && pid === "openai") {
-    const codex = () => CODEX_MODELS.map((m) => ({ id: m.id, name: m.name }));
-    return { peek: codex, fetch: async () => codex() };
+    const fallback = () => CODEX_MODELS.map((m) => ({ id: m.id, name: m.name }));
+    return {
+      peek: () => peekAppCodexModels() ?? fallback(),
+      fetch: async () => {
+        const live = await listAppCodexModels();
+        return live.length ? live : fallback();
+      },
+    };
   }
   if (viaOAuth && pid === "anthropic")
     return { peek: () => peekClaudeAccountModels(), fetch: () => listClaudeAccountModels() };
