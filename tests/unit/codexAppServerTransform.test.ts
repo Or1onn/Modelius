@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { createCodexAppServerTransformer } from "@/features/run-agent/lib/codexAppServerTransform";
 
 // Wire-contract lock for the codex app-server v2 thread/turn surface, verified live against
-// codex-cli 0.142.5 (scripts/probeCodexAppServer.mjs). The lines below are captured verbatim
+// codex-cli 0.142.5. The lines below are captured verbatim
 // (ids shortened). If these tests fail after an edit, the app no longer speaks the proven shape.
 
 const TH = "019f574e-65c9-7793-9b68-1e3715c06bc9";

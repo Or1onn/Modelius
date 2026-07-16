@@ -21,7 +21,7 @@ const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max", "
 const asEffort = (s: unknown): EffortLevel | null =>
   typeof s === "string" && EFFORTS.has(s as EffortLevel) ? (s as EffortLevel) : null;
 
-// Raw model/list entry (the fields we read — see probe-out/p7.jsonl).
+// Raw model/list entry (the fields we read).
 interface RawCodexModel {
   id: string;
   displayName?: string;

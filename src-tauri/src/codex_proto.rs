@@ -1,7 +1,7 @@
 // codex_proto.rs — line builders + stdout classifier for the codex `app-server` protocol
 // (JSON-RPC-ish over JSONL: requests {id,method,params}, responses {id,result|error},
 // notifications {method,params}; NO "jsonrpc" field, no LSP framing). All shapes probe-verified
-// against codex-cli 0.142.5 (scripts/probeCodexAppServer.mjs) — the codex analog of the claude
+// against codex-cli 0.142.5 — the codex analog of the claude
 // 2.1.206 stdio control protocol session.rs speaks. Rust owns lifecycle lines (handshake,
 // thread/turn start, interrupt); every stdout line is still forwarded raw to TS for decoding.
 use serde_json::json;

@@ -1,6 +1,6 @@
 // kimi_proto.rs — line builders + stdout classifier for `kimi acp` (Agent Client Protocol,
 // strict JSON-RPC 2.0 over JSONL). All shapes probe-verified against @moonshot-ai/kimi-code
-// 0.25.0 (scripts/probeKimiAcp.mjs) — the kimi analog of codex_proto.rs. Key dialect difference:
+// 0.25.0 — the kimi analog of codex_proto.rs. Key dialect difference:
 // every line MUST carry "jsonrpc":"2.0" (the ACP SDK ignores messages without it). Rust owns
 // lifecycle lines (initialize, session open, prompt, cancel, set_model/set_mode); every stdout
 // line is still forwarded raw to TS for decoding (kimiAcpTransform.ts).

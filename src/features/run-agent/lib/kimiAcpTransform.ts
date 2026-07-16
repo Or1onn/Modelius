@@ -2,8 +2,8 @@ import type { UIMessageChunk } from "./uiMessageChunk";
 
 // Kimi `acp` (Agent Client Protocol) JSONL → AI SDK UIMessageChunk. The warm per-chat process
 // (session.rs) forwards session/update notifications and the turn-terminating session/prompt
-// response raw; this decodes them (probe-verified @moonshot-ai/kimi-code 0.25.0,
-// scripts/probeKimiAcp.mjs). Kimi's tool titles are already Claude-canonical names (Bash / Edit /
+// response raw; this decodes them (probe-verified @moonshot-ai/kimi-code 0.25.0).
+// Kimi's tool titles are already Claude-canonical names (Bash / Edit /
 // Read / Write / Glob / Grep / TodoList / …), so the shared renderer treats all three harnesses
 // uniformly; the ACP `kind` only backstops descriptive titles. Permission server requests never
 // reach here — codeTransport intercepts them into data-permission parts.

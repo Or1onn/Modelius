@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { mapCodex } from "@/entities/session/api/codexModels";
 
-// Shape mirrors codex app-server model/list (probe-out/p7.jsonl).
+// Shape mirrors codex app-server model/list.
 const raw = {
   data: [
     {

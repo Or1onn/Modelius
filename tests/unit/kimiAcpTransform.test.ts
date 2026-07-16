@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { createKimiAcpTransformer, kimiToolName, kimiToolInput } from "@/features/run-agent/lib/kimiAcpTransform";
 
 // Wire-contract lock for the kimi acp stream decode, against lines captured live from
-// @moonshot-ai/kimi-code 0.25.0 (scripts/probeKimiAcp.mjs). The Rust pump forwards
+// @moonshot-ai/kimi-code 0.25.0. The Rust pump forwards
 // session/update notifications and the turn-terminating session/prompt response.
 
 const SID = "session_a7ae7a72-1800-4f3b-8e87-23cb10ff8eeb";

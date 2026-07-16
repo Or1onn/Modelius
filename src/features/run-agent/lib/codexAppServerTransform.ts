@@ -2,7 +2,7 @@ import type { UIMessageChunk } from "./uiMessageChunk";
 
 // Codex `app-server` JSON-RPC notifications → AI SDK UIMessageChunk. The warm per-chat process
 // (session.rs) forwards every stdout line raw; this decodes the v2 thread/turn surface
-// (probe-verified codex-cli 0.142.5, scripts/probeCodexAppServer.mjs). Unlike the old
+// (probe-verified codex-cli 0.142.5). Unlike the old
 // `exec --json` path this streams real deltas: item/agentMessage/delta → text-delta,
 // item/reasoning/*Delta → reasoning-delta. Tool names are emitted canonical (Bash/Write/Edit/…)
 // so the shared renderer treats Claude and Codex uniformly. Approval server requests never reach
