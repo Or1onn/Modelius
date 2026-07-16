@@ -6,6 +6,7 @@ import { anthropicEffortTier, resolveEffort, type EffortLevel } from "@/entities
 import { getKey } from "@/entities/session/model/keys";
 import { getAnthropicAccessToken, handleAnthropicUnauthorized } from "@/entities/session/model/anthropicSession";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
+import { recordLimits } from "@/entities/session/model/usageLimits";
 import { systemBase, systemInstructions } from "@/features/stream-completion/lib/instructions";
 
 // Extended thinking lands with Claude 3.7; older 3.x models 400 on the param.
@@ -107,6 +108,7 @@ export async function* streamClaude(
     // (Key-path 401s aren't our token to clear.)
     (msg) => { if (oauth && /^Anthropic 401\b/.test(msg)) void handleAnthropicUnauthorized(); },
     signal,
-    streamId
+    streamId,
+    (headers) => recordLimits("anthropic", headers)
   );
 }

@@ -10,25 +10,14 @@ import {
   STAT_ORDER, type RangeId,
 } from "@/pages/code/model/codeUsage";
 
-// Provider mark: a small tinted initials/logo box (used by the Models list and the "working" badge).
+// Provider mark: the bare brand logo (used by the Models list and the "working" badge).
 // `modelId` (vendor-prefixed, e.g. "x-ai/grok-4.5") resolves the model's own brand instead of the
-// aggregator's (OpenRouter). `plain` drops the tinted box — used by the inline "working" badge.
-export function PLogo({ pid, modelId, plain }: { pid: string; modelId?: string; plain?: boolean }) {
+// aggregator's (OpenRouter). The wrapper only sizes the mark and colors the initials fallback.
+export function PLogo({ pid, modelId }: { pid: string; modelId?: string }) {
   const p = PROVIDERS[pid];
   if (!p) return <span>?</span>;
   return (
-    <span
-      className={"cd-plogo" + (plain ? " plain" : "")}
-      style={
-        plain
-          ? { color: p.color }
-          : {
-              color: p.color,
-              background: `color-mix(in oklab, ${p.color} 15%, transparent)`,
-              border: `1px solid color-mix(in oklab, ${p.color} 32%, transparent)`,
-            }
-      }
-    >
+    <span className="cd-plogo" style={{ color: p.color }}>
       <ProviderLogo pid={pid} short={p.short} modelId={modelId} />
     </span>
   );

@@ -38,6 +38,7 @@ export const PROVIDERS: Record<string, Provider> = {
   google: { id: "google", name: "Google Gemini", color: "#4E8FF7", short: "GG", local: false },
   groq: { id: "groq", name: "Groq", color: "#F5A623", short: "GQ", local: false },
   openrouter: { id: "openrouter", name: "OpenRouter", color: "#6E56CF", short: "OR", local: false },
+  moonshot: { id: "moonshot", name: "Moonshot AI", color: "#16D0CB", short: "Ki", local: false },
   ollama: { id: "ollama", name: "Ollama", color: "#8B7FF5", short: "OL", local: true },
 };
 
@@ -46,7 +47,7 @@ export const MODELS: Model[] = [
   { id: "gpt-4o", name: "GPT-4o", abbr: "4o", provider: "openai", cost: 0.005, cap: 94, spd: 70, latency: 1.2, ctx: "128K", vision: true },
   { id: "gpt-4o-mini", name: "GPT-4o mini", abbr: "4m", provider: "openai", cost: 0.00045, cap: 82, spd: 88, latency: 0.6, ctx: "128K", vision: true },
   { id: "o3", name: "o3", abbr: "o3", provider: "openai", cost: 0.02, cap: 97, spd: 40, latency: 4.1, ctx: "200K", vision: true },
-  { id: "claude-opus-4", name: "Claude Opus 4", abbr: "Op", provider: "anthropic", cost: 0.018, cap: 98, spd: 55, latency: 2.4, ctx: "200K", vision: true },
+  { id: "claude-opus-4", name: "Claude Opus 4", abbr: "Op", provider: "anthropic", cost: 0.018, cap: 98, spd: 55, latency: 2.4, ctx: "1M", vision: true },
   { id: "claude-sonnet-4", name: "Claude Sonnet 4", abbr: "Sn", provider: "anthropic", cost: 0.006, cap: 93, spd: 76, latency: 1.1, ctx: "200K", vision: true },
   { id: "claude-haiku-3-5", name: "Claude Haiku 3.5", abbr: "Hk", provider: "anthropic", cost: 0.001, cap: 80, spd: 90, latency: 0.5, ctx: "200K" },
   { id: "gemini-3.1-pro-preview", name: "Gemini 3 Pro", abbr: "Gp", provider: "google", cost: 0.0042, cap: 94, spd: 72, latency: 1.3, ctx: "1M", vision: true },
@@ -62,19 +63,29 @@ export const MODELS: Model[] = [
 // Live current-gen models for connected backends. liveRoutingPool() swaps these in for the
 // demo registry above, so the routed pick is a model the backend can actually serve.
 export const LIVE_ANTHROPIC: Model[] = [
-  { id: "claude-opus-4-8", name: "Claude Opus 4.8", abbr: "Op", provider: "anthropic", cost: 0.009, cap: 99, spd: 62, latency: 1.8, ctx: "200K", vision: true },
+  { id: "claude-opus-4-8", name: "Claude Opus 4.8", abbr: "Op", provider: "anthropic", cost: 0.009, cap: 99, spd: 62, latency: 1.8, ctx: "1M", vision: true },
   { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", abbr: "Sn", provider: "anthropic", cost: 0.006, cap: 94, spd: 80, latency: 0.9, ctx: "200K", vision: true },
   { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", abbr: "Hk", provider: "anthropic", cost: 0.002, cap: 84, spd: 92, latency: 0.5, ctx: "200K", vision: true },
 ];
 export const LIVE_CODEX: Model[] = [
-  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", abbr: "56", provider: "openai", cost: 0.008, cap: 98, spd: 66, latency: 1.5, ctx: "200K", vision: true },
-  { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", abbr: "5t", provider: "openai", cost: 0.006, cap: 94, spd: 78, latency: 1.0, ctx: "200K", vision: true },
-  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", abbr: "5l", provider: "openai", cost: 0.0015, cap: 85, spd: 92, latency: 0.6, ctx: "200K", vision: true },
-  { id: "gpt-5.5", name: "GPT-5.5", abbr: "55", provider: "openai", cost: 0.007, cap: 97, spd: 68, latency: 1.4, ctx: "200K", vision: true },
-  { id: "gpt-5.4", name: "GPT-5.4", abbr: "54", provider: "openai", cost: 0.006, cap: 94, spd: 78, latency: 1.0, ctx: "200K", vision: true },
+  { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", abbr: "56", provider: "openai", cost: 0.008, cap: 98, spd: 66, latency: 1.5, ctx: "400K", vision: true },
+  { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", abbr: "5t", provider: "openai", cost: 0.006, cap: 94, spd: 78, latency: 1.0, ctx: "400K", vision: true },
+  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", abbr: "5l", provider: "openai", cost: 0.0015, cap: 85, spd: 92, latency: 0.6, ctx: "400K", vision: true },
+  { id: "gpt-5.5", name: "GPT-5.5", abbr: "55", provider: "openai", cost: 0.007, cap: 97, spd: 68, latency: 1.4, ctx: "400K", vision: true },
+  { id: "gpt-5.4", name: "GPT-5.4", abbr: "54", provider: "openai", cost: 0.006, cap: 94, spd: 78, latency: 1.0, ctx: "400K", vision: true },
+];
+// Static fallback for the Kimi Code harness picker — the live list (session/new configOptions,
+// kimiModels.ts) replaces it once the CLI is installed and signed in, so these ids only need to
+// be plausible until then.
+export const LIVE_KIMI: Model[] = [
+  { id: "kimi-k2.7-code", name: "Kimi K2.7 Code", abbr: "K7", provider: "moonshot", cost: 0.002, cap: 95, spd: 74, latency: 1.1, ctx: "256K" },
+  { id: "kimi-k2.6", name: "Kimi K2.6", abbr: "K6", provider: "moonshot", cost: 0.002, cap: 93, spd: 72, latency: 1.2, ctx: "256K" },
+  { id: "kimi-k2.5", name: "Kimi K2.5", abbr: "K5", provider: "moonshot", cost: 0.0015, cap: 90, spd: 75, latency: 1.1, ctx: "256K" },
+  { id: "kimi-k2-thinking", name: "Kimi K2 Thinking", abbr: "Kt", provider: "moonshot", cost: 0.0025, cap: 92, spd: 55, latency: 2.0, ctx: "256K" },
+  { id: "kimi-k2-turbo", name: "Kimi K2 Turbo", abbr: "Kb", provider: "moonshot", cost: 0.001, cap: 86, spd: 92, latency: 0.5, ctx: "256K" },
 ];
 export const MODEL_BY_ID: Record<string, Model> = Object.fromEntries(
-  [...MODELS, ...LIVE_ANTHROPIC, ...LIVE_CODEX].map((m) => [m.id, m])
+  [...MODELS, ...LIVE_ANTHROPIC, ...LIVE_CODEX, ...LIVE_KIMI].map((m) => [m.id, m])
 );
 
 export const POLICIES: Record<PolicyId, Policy> = {

@@ -68,8 +68,27 @@ pub(crate) enum StreamEvent {
     // Why the model stopped ("max_tokens" / "length" / "max_output_tokens" / "end_turn" / "stop").
     // The webview offers "Continue" when this signals a max-output-tokens cutoff.
     StopReason(String),
+    // Provider rate-limit / usage headers (lowercased) captured from the response. Names vary by
+    // provider/version, so the raw matching set is forwarded and parsed in the webview.
+    RateLimit(HashMap<String, String>),
     Done,
     Error(String),
+}
+
+// Collect the provider's rate-limit / usage headers so the webview can show remaining quota. The
+// exact header schema differs across providers and versions, so forward every matching header raw
+// and interpret them in TS. Returns an empty map when the response carries none.
+pub(crate) fn rate_limit_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (name, value) in headers.iter() {
+        let n = name.as_str().to_ascii_lowercase();
+        if n.starts_with("anthropic-ratelimit") || n.starts_with("x-ratelimit") || n.starts_with("openai-") || n.starts_with("x-codex-") {
+            if let Ok(v) = value.to_str() {
+                out.insert(n, v.to_string());
+            }
+        }
+    }
+    out
 }
 
 // Build a "Provider STATUS [(retry-after: Ns)]" error prefix. Only a numeric

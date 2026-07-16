@@ -6,9 +6,11 @@ import { Icon } from "@/shared/ui/Icon";
 import { ModelMenu, type ModelMenuItem } from "@/entities/model/ui/ModelMenu";
 import { codeSegs } from "@/shared/lib/markdown";
 import { PROVIDERS, type Message, type PolicyId, type ImageRef } from "@/entities/model/model/registry";
-import type { ModelOption } from "@/entities/model/model/backend";
+import { providerKeyForBackend, type ModelOption } from "@/entities/model/model/backend";
+import { useChatProvider } from "@/entities/session/model/usageLimits";
+import { UsageMeter } from "@/widgets/usage-meter/ui/UsageMeter";
 import { anthropicEffortTier, ctxForBackend, EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
-import { estimateTokens, ctxTokens, fmtCompact } from "@/shared/lib/tokens";
+import { estimateTokens, ctxTokens } from "@/shared/lib/tokens";
 import { useOutsideClick } from "@/shared/lib/useOutsideClick";
 import { useAutosize } from "@/shared/lib/useAutosize";
 import { listAvailableModels, peekAvailableModels, optionAllowsImages, optionAllowsWeb } from "@/features/pick-backend/model/pickBackend";
@@ -577,6 +579,10 @@ export function ChatScreen({
     return { used, win, pct: win > 0 ? used / win : 0 };
   }, [messages, summary, modelSel]);
 
+  // Account the usage meter reads: the manual pick's backend, else the last backend that answered.
+  const lastProviderKey = useChatProvider(chatId);
+  const activeProviderKey = modelSel ? providerKeyForBackend(modelSel.backend) : lastProviderKey;
+
   // Resolve the open artifact live from current state, plus whether that block is still generating.
   const openMsg = openRef?.kind === "msg" ? messages[openRef.msgIndex] : undefined;
   const openArt = !openRef ? null : openRef.kind === "static" ? openRef.art : resolveBlock(openMsg, openRef.blockIndex);
@@ -613,18 +619,7 @@ export function ChatScreen({
             </span>
             <span className="chat-top-meta">{messages.length} messages</span>
             {messages.length > 0 && (
-              <span
-                className="ctx-meter"
-                data-level={ctxMeter.pct >= 0.85 ? "high" : ctxMeter.pct >= 0.5 ? "mid" : "low"}
-                title={`Context: ${Math.round(ctxMeter.used).toLocaleString()} / ${ctxMeter.win.toLocaleString()} tokens`}
-              >
-                <span className="ctx-meter-bar">
-                  <span className="ctx-meter-fill" style={{ width: Math.min(100, ctxMeter.pct * 100) + "%" }} />
-                </span>
-                <span className="ctx-meter-label">
-                  {fmtCompact(ctxMeter.used)} / {fmtCompact(ctxMeter.win)} · {Math.round(ctxMeter.pct * 100)}%
-                </span>
-              </span>
+              <UsageMeter used={ctxMeter.used} win={ctxMeter.win} providerKey={activeProviderKey} model={modelSel?.backend.model} />
             )}
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>

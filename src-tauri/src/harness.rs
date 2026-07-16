@@ -37,17 +37,21 @@ pub(crate) enum Arg {
     Resume,
 }
 
-// How a harness receives prompts. Both channels hold a live stdio protocol, so every harness
+// How a harness receives prompts. All channels hold a live stdio protocol, so every harness
 // runs WARM (one process per chat, follow-up turns without respawn — session.rs):
 // - ClaudeStream: stream-json user messages on stdin; permissions/interrupt/mode-switch ride the
 //   `control_request` stdio protocol (probe-verified claude 2.1.206).
 // - CodexRpc: `codex app-server` JSON-RPC over JSONL; Rust writes the lifecycle requests
 //   (codex_proto.rs), approvals arrive as server requests answered via agent_respond
 //   (probe-verified codex-cli 0.142.5).
+// - KimiAcp: `kimi acp` — Agent Client Protocol, strict JSON-RPC 2.0 over JSONL; lifecycle lines
+//   in kimi_proto.rs, session/request_permission server requests answered via agent_respond
+//   (probe-verified @moonshot-ai/kimi-code 0.25.0).
 #[derive(PartialEq)]
 pub(crate) enum PromptChannel {
     ClaudeStream,
     CodexRpc,
+    KimiAcp,
 }
 
 // Env vars that re-point the CLI at the gateway. Every name in `base_url`/`api_key` is set (some
@@ -204,6 +208,35 @@ static HARNESSES: &[HarnessSpec] = &[
             ],
         },
     },
+    // Moonshot Kimi Code CLI via `kimi acp` (Agent Client Protocol, JSON-RPC 2.0 over JSONL,
+    // probe-verified 0.25.0): one warm process per chat, lifecycle lines in kimi_proto.rs.
+    // Native Kimi-account login only (v1, front-end routable:false): `kimi login` device-code
+    // flow run in the app's built-in terminal. No spawn-time knobs work under `acp` (probe P8) —
+    // model and permission mode are set in-session (session/set_model, session/set_mode), so the
+    // argv is just the subcommand.
+    HarnessSpec {
+        id: "kimi-code",
+        bin: "kimi",
+        install: Install::Npm("@moonshot-ai/kimi-code"),
+        native_dist: None,
+        login_marker: &[".kimi-code/credentials/kimi-code.json"],
+        login_probe: &[],
+        extra_env: &[],
+        bin_hint: &[],
+        protocol: Proto::OpenAi, // unused while routable:false (Moonshot's API is OpenAI-compatible)
+        channel: PromptChannel::KimiAcp,
+        argv: &[Arg::Lit("acp")],
+        // Resume is a JSON-RPC method (session/resume), not argv.
+        resume_args: &[],
+        env: EnvSpec {
+            base_url: &[],
+            base_url_suffix: "",
+            api_key: &[],
+            model_pins: &[],
+            remove: &[],
+            route_args: &[],
+        },
+    },
 ];
 
 pub(crate) fn spec(id: &str) -> Option<&'static HarnessSpec> {
@@ -224,12 +257,13 @@ mod tests {
     fn spec_finds_known_harnesses_and_rejects_unknown() {
         assert_eq!(spec("claude-code").unwrap().bin, "claude");
         assert_eq!(spec("codex").unwrap().bin, "codex");
+        assert_eq!(spec("kimi-code").unwrap().bin, "kimi");
         assert!(spec("nope").is_none());
     }
 
     #[test]
     fn all_lists_every_harness_with_a_nonempty_argv() {
-        assert_eq!(all().len(), 2);
+        assert_eq!(all().len(), 3);
         assert!(all().iter().all(|h| !h.id.is_empty() && !h.argv.is_empty()));
     }
 
@@ -237,6 +271,14 @@ mod tests {
     fn harness_channels_match_their_protocols() {
         assert!(spec("claude-code").unwrap().channel == PromptChannel::ClaudeStream);
         assert!(spec("codex").unwrap().channel == PromptChannel::CodexRpc);
+        assert!(spec("kimi-code").unwrap().channel == PromptChannel::KimiAcp);
+    }
+
+    #[test]
+    fn kimi_login_marker_points_at_the_oauth_token_file() {
+        // 0.25.0 stores the device-flow token at ~/.kimi-code/credentials/kimi-code.json
+        // (FileTokenStorage, name "kimi-code") — installer::harness_logged_in checks this path.
+        assert_eq!(spec("kimi-code").unwrap().login_marker, &[".kimi-code/credentials/kimi-code.json"]);
     }
 
     #[test]

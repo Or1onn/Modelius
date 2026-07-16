@@ -102,7 +102,11 @@ export function ProviderLogo({ pid, short, modelId }: { pid: string; short: stri
   const slug = slugFor(pid, modelId);
   const [attempt, setAttempt] = useState(0);
   const url = `${THESVG}/${slug}/default.svg${attempt ? `?r=${attempt}` : ""}`;
-  const [loaded, setLoaded] = useState(false);
+  // The url whose icon finished loading. Derived, not reset in an effect: a cached icon can fire
+  // `load` before the mount's passive effects flush, and a `setLoaded(false)` there would clobber it
+  // — with no second `load` coming, the initials would stick forever.
+  const [okUrl, setOkUrl] = useState<string | null>(null);
+  const loaded = okUrl === url; // a new slug/attempt re-shows the initials on its own
   const [tone, setTone] = useState<Tone>(() => toneCache.get(slug) ?? null);
   const retryTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
 
@@ -110,7 +114,6 @@ export function ProviderLogo({ pid, short, modelId }: { pid: string; short: stri
   useEffect(() => () => clearTimeout(retryTimer.current), []);
 
   useEffect(() => {
-    setLoaded(false); // re-show initials while the new slug's icon loads (instance reused in a list)
     let alive = true;
     void loadTone(slug, url).then((v) => alive && setTone(v));
     return () => {
@@ -127,9 +130,8 @@ export function ProviderLogo({ pid, short, modelId }: { pid: string; short: stri
         alt=""
         aria-hidden="true"
         style={loaded ? undefined : { display: "none" }}
-        onLoad={() => setLoaded(true)}
+        onLoad={() => setOkUrl(url)}
         onError={() => {
-          setLoaded(false);
           if (attempt < RETRIES) {
             clearTimeout(retryTimer.current);
             retryTimer.current = setTimeout(() => setAttempt((a) => a + 1), 500 * (attempt + 1));

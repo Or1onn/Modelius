@@ -36,16 +36,20 @@ function readTheme() {
   };
 }
 
-export function TerminalPanel({ cwd, onClose, zoom }: {
+export function TerminalPanel({ cwd, onClose, zoom, bootstrapCommand }: {
   cwd: string;
   onClose: () => void;
   zoom: number;
+  // Typed into the shell right after it opens (e.g. `kimi login` for the CLI's device-code auth).
+  // Consumed once per mount — later prop changes don't reach an already-running shell.
+  bootstrapCommand?: string;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const ptyIdRef = useRef("");
+  const bootRef = useRef(bootstrapCommand);
   const [height, setHeight] = useState(() => clampH(Number(localStorage.getItem(HEIGHT_KEY)) || 280));
 
   // Boot the terminal once per mount. A *fresh* pty id per effect run is essential: StrictMode (dev)
@@ -83,6 +87,14 @@ export function TerminalPanel({ cwd, onClose, zoom }: {
     term.onData((d) => void invoke("terminal_write", { id: ptyId, data: d }));
 
     invoke("terminal_open", { id: ptyId, cwd, cols: term.cols, rows: term.rows, onEvent: channel })
+      .then(() => {
+        // Bootstrap command (e.g. `kimi login`): typed into the fresh shell like a keystroke, so
+        // the user sees exactly what runs. A StrictMode-discarded run's write lands in a pty that
+        // is closed by its own cleanup — harmless.
+        if (!disposed && bootRef.current) {
+          void invoke("terminal_write", { id: ptyId, data: bootRef.current + "\r" });
+        }
+      })
       .catch((e) => { if (!disposed) term.write(`\r\n\x1b[31mterminal failed to start: ${e}\x1b[0m\r\n`); });
 
     // Keep the pty grid in sync with the panel size.

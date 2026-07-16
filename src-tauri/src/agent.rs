@@ -322,6 +322,73 @@ pub async fn codex_list_models(
     out.unwrap_or_else(|_| Err("codex model/list timed out".to_string()))
 }
 
+// List the Kimi models the signed-in account can run. ACP has no standalone model-list method
+// (providers/list is unimplemented in 0.25.0), but every session/new response advertises the
+// model catalog as a configOptions "model" select — so this spawns a THROWAWAY `kimi acp`,
+// opens one session, and returns that response's result for the webview to mine (kimiModels.ts).
+// Requires the CLI's own login (unauthenticated session/new fails -32000) — callers fall back
+// to the static registry list on error.
+#[tauri::command]
+pub async fn kimi_list_models(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let spec = crate::harness::spec("kimi-code").ok_or_else(|| "kimi harness missing".to_string())?;
+    let program = crate::installer::resolve_bin(&app, spec.bin)
+        .ok_or_else(|| format!("'{}' not found — install it from the Environment picker.", spec.bin))?;
+    if matches!(spec.install, crate::harness::Install::Npm(_))
+        && !crate::installer::is_native_install(&app, &program)
+        && !crate::node_runtime::system_node_acceptable()
+    {
+        crate::node_runtime::ensure(&app).await?;
+    }
+    let path_env = crate::node_runtime::child_path_env(&app);
+    // session/new needs an existing cwd; the user's home dir always is.
+    let cwd = {
+        use tauri::Manager;
+        app.path()
+            .home_dir()
+            .map_err(|e| format!("no home dir: {e}"))?
+            .to_string_lossy()
+            .into_owned()
+    };
+    let args = build_argv(spec, "", "", "", None, None); // = ["acp"]
+    let mut child = spawn(&program, &args, &cwd, spec.extra_env, None, None, None, path_env.as_deref(), true)
+        .map_err(|e| format!("failed to start '{}' acp: {}", spec.bin, e))?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| "no stdin".to_string())?;
+    let stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
+
+    // Pipelined handshake + session open (probe-verified spawn_warm pattern).
+    let write = async {
+        stdin.write_all(crate::kimi_proto::initialize_line(1).as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.write_all(crate::kimi_proto::session_open_line(2, None, &cwd).as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await
+    };
+    if let Err(e) = write.await {
+        let _ = child.start_kill();
+        return Err(format!("failed to query kimi models: {}", e));
+    }
+
+    // Read stdout until the id:2 response (or its error); bounded so a hung acp can't wedge.
+    let mut lines = BufReader::new(stdout).lines();
+    let read = async {
+        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            if v.get("id").and_then(|i| i.as_u64()) != Some(2) || v.get("method").is_some() {
+                continue;
+            }
+            if let Some(err) = v.get("error") {
+                return Err(err.get("message").and_then(|m| m.as_str()).unwrap_or("session/new failed").to_string());
+            }
+            return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
+        }
+        Err("kimi acp closed before answering session/new".to_string())
+    };
+    let out = tokio::time::timeout(std::time::Duration::from_secs(15), read).await;
+    let _ = child.start_kill();
+    out.unwrap_or_else(|_| Err("kimi model discovery timed out".to_string()))
+}
+
 // Run a harness turn: stream the CLI's stdout as agent events, honor cancellation. `target`
 // (absent for native-login runs) routes the CLI through the local gateway. With a `session_key`
 // (the code chat id) a warm-capable harness runs WARM: one long-lived process per chat, follow-up
@@ -383,7 +450,12 @@ pub async fn agent_run(
                     cwd,
                     // Claude: argv-only knob — an effort change respawns (--resume keeps context).
                     // Codex: per-turn turn/start override — kept out so a change never respawns.
-                    effort: if is_codex { String::new() } else { effort.clone() },
+                    // Kimi: no effort surface at all — always out.
+                    effort: if matches!(spec.channel, PromptChannel::ClaudeStream) {
+                        effort.clone()
+                    } else {
+                        String::new()
+                    },
                     target: target.map(|t| (t.protocol, t.base_url, t.api_key)),
                     claude_token,
                     codex_account: codex_auth.as_ref().map(codex_account_id),
@@ -397,9 +469,9 @@ pub async fn agent_run(
             };
             return run_warm(&key, spec, &program, run, &cancel, &stream_id, &on_event).await;
         }
-        if matches!(spec.channel, PromptChannel::CodexRpc) {
-            // app-server has no one-shot mode — a codex run is meaningless without a session.
-            return Err("codex runs require a session key".to_string());
+        if matches!(spec.channel, PromptChannel::CodexRpc | PromptChannel::KimiAcp) {
+            // Neither app-server nor acp has a one-shot mode — these runs need a session.
+            return Err(format!("{} runs require a session key", spec.id));
         }
     }
 
@@ -746,13 +818,21 @@ async fn spawn_warm(
     };
     let proto = match spec.channel {
         PromptChannel::CodexRpc => crate::session::SessionProto::Codex(crate::session::CodexRuntime::new()),
-        _ => crate::session::SessionProto::Claude,
+        PromptChannel::KimiAcp => crate::session::SessionProto::Kimi(crate::session::KimiRuntime::new(run.resume.clone())),
+        PromptChannel::ClaudeStream => crate::session::SessionProto::Claude,
+    };
+    // A fresh kimi acp session always boots in "default" mode regardless of what the user picked
+    // (argv knobs don't bind — probe P8); register that truth so begin_turn's reconcile fires the
+    // session/set_mode on the first turn instead of assuming the pick took.
+    let initial_mode = match spec.channel {
+        PromptChannel::KimiAcp => "default".to_string(),
+        _ => run.permission_mode.clone(),
     };
     let (session, evicted) = crate::session::spawn_session(
         key,
         run.fingerprint.clone(),
         proto,
-        run.permission_mode.clone(),
+        initial_mode,
         child,
         gateway,
     )?;
@@ -780,6 +860,26 @@ async fn spawn_warm(
         if let Err(e) = handshake {
             crate::session::close_session(key).await;
             return Err(format!("failed to start '{}' app-server: {}", spec.bin, e));
+        }
+    }
+    // Kimi handshake, same pipelined pattern (probe-verified 0.25.0): initialize + session open
+    // (session/new, or session/resume with a prior id — resume replays no history, matching the
+    // webview's own transcript). Model and permission mode ride begin_turn (no spawn-time knobs).
+    if matches!(spec.channel, PromptChannel::KimiAcp) {
+        let handshake = async {
+            session.write_line(&crate::kimi_proto::initialize_line(1)).await?;
+            session
+                .write_line(&crate::kimi_proto::session_open_line(
+                    2,
+                    run.resume.as_deref().filter(|s| !s.is_empty()),
+                    &run.fingerprint.cwd,
+                ))
+                .await
+        }
+        .await;
+        if let Err(e) = handshake {
+            crate::session::close_session(key).await;
+            return Err(format!("failed to start '{}' acp: {}", spec.bin, e));
         }
     }
     Ok(session)
@@ -841,6 +941,19 @@ mod tests {
         assert!(routed
             .iter()
             .any(|a| a == "model_providers.modelius.base_url=http://127.0.0.1:9000/v1")); // {url} substituted
+    }
+
+    #[test]
+    fn build_argv_kimi_is_the_bare_acp_subcommand() {
+        // No spawn-time knobs bind under `acp` (probe P8): model rides session/set_model, mode
+        // rides session/set_mode, resume rides session/resume — argv stays ["acp"] no matter what.
+        let s = spec("kimi-code").unwrap();
+        assert!(matches!(s.channel, PromptChannel::KimiAcp));
+        assert_eq!(build_argv(s, "", "", "", None, None), vec!["acp"]);
+        assert_eq!(
+            build_argv(s, "kimi-k2.7-code", "bypassPermissions", "high", None, Some("session_prev")),
+            vec!["acp"]
+        );
     }
 
     #[test]

@@ -10,6 +10,17 @@ export interface Backend {
   baseUrl?: string; // compat only: the fixed endpoint root (e.g. Ollama, Gemini, Groq)
 }
 
+// Coarse account key a backend bills against — the key for its usage-limit/spend snapshot
+// (entities/session/usageLimits). "chatgpt" (subscription) and "openai" (API key) are kept
+// distinct because they have different limit surfaces (rate windows vs $ spend).
+export function providerKeyForBackend(b: Backend): string {
+  if (b.kind === "anthropic") return "anthropic";
+  if (b.kind === "chatgpt") return "chatgpt";
+  if (b.kind === "openai") return "openai";
+  if (b.kind === "compat") return b.providerId ?? "compat";
+  return "none";
+}
+
 // A manually selectable model, tied to a ready-to-use backend.
 export interface ModelOption {
   key: string;

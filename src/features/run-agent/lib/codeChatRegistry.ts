@@ -74,10 +74,10 @@ function textOf(msg: UIMessage | undefined): string {
 type SendTarget = RunConfig["target"];
 
 // Resolve the endpoint a run should land on — mirrors the old codeSessionStore.resolveRouting.
-// Native picks (anthropic/codex) → undefined (the CLI's own login); everything else routes through
-// the per-run local gateway. Throws a user-readable message on missing config/keys.
+// Native picks (anthropic/codex/kimi) → undefined (the CLI's own login); everything else routes
+// through the per-run local gateway. Throws a user-readable message on missing config/keys.
 async function resolveRouting(model: CodeModelChoice, harnessId: string): Promise<SendTarget> {
-  if (model.kind === "anthropic" || model.kind === "codex") return undefined;
+  if (model.kind === "anthropic" || model.kind === "codex" || model.kind === "kimi") return undefined;
   if (!model.id) throw new Error("Pick a model for this environment first (add a gateway or connect a provider).");
   if (model.kind === "ollama") {
     const proto = HARNESS_BY_ID[harnessId]?.protocol ?? "anthropic";

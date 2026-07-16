@@ -1,6 +1,7 @@
 // anthropic.rs — Anthropic OAuth token exchange, model listing, and the Messages
 // API streaming proxy. All run from Rust to avoid the webview's CORS limits.
-use crate::stream::{check_stream_status, http_client, json_or_err, pump_sse, StreamEvent};
+use crate::stream::{check_stream_status, http_client, json_or_err, pump_sse, rate_limit_headers, StreamEvent};
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 // Anthropic's OAuth token endpoint sends no CORS headers, so the webview can't
@@ -38,6 +39,32 @@ pub async fn anthropic_list_models(token: String, oauth: bool) -> Result<serde_j
     json_or_err(res, "Anthropic").await
 }
 
+// Fetch the subscription's remaining usage for the Code-mode meter (the CLI hides response
+// headers, so we ask directly). A minimal OAuth Messages call — we read only the
+// anthropic-ratelimit-unified-* response headers (session/weekly windows); the 1-token body is
+// discarded. Headers are returned even on a 429, which is when they matter most.
+#[tauri::command]
+pub async fn anthropic_usage(token: String, model: String) -> Result<HashMap<String, String>, String> {
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1,
+        // OAuth requires this exact first system block or the request is rejected as a disguised 429.
+        "system": [{ "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." }],
+        "messages": [{ "role": "user", "content": "." }],
+    });
+    let res = http_client()
+        .post("https://api.anthropic.com/v1/messages")
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header("authorization", format!("Bearer {}", token))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(rate_limit_headers(res.headers()))
+}
+
 // Proxy the Anthropic Messages API from Rust and stream text deltas back.
 // Going through Rust (rather than the webview's fetch) avoids the browser
 // origin, which OAuth/subscription accounts reject with a CORS org error.
@@ -67,6 +94,13 @@ pub async fn anthropic_messages_stream(
     let Some(res) = check_stream_status(res, "Anthropic", &on_event).await else {
         return Ok(());
     };
+
+    // Subscription (OAuth) responses carry anthropic-ratelimit-* headers with the session/weekly
+    // windows; forward them so the webview can show remaining quota. Read before pump_sse consumes res.
+    let rl = rate_limit_headers(res.headers());
+    if !rl.is_empty() {
+        let _ = on_event.send(StreamEvent::RateLimit(rl));
+    }
 
     // Parse the SSE stream; emit text deltas as they arrive. Usage trickles in across
     // events: input/cache on message_start, output (cumulative) on message_delta.

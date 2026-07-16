@@ -7,6 +7,7 @@ import { supportsImageOutput } from "@/entities/model/lib/pricingSource";
 import { isKeyProvider } from "@/entities/session/model/keyProviders";
 import { isTauri } from "@/shared/api/tauri";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
+import { recordLimits, recordLimitsFromHeaders } from "@/entities/session/model/usageLimits";
 import { systemInstructions } from "@/features/stream-completion/lib/instructions";
 import { sseJson } from "@/features/stream-completion/lib/sse";
 import type { Backend, ChatMsg, Delta } from "@/entities/model/model/backend";
@@ -29,6 +30,7 @@ export async function* streamCompat(
   const key = backend.providerId ? await getKey(backend.providerId) : "";
   // Gemini/Groq bill per token (real pricing); local endpoints are unmetered.
   const metered = isKeyProvider(backend.providerId ?? "");
+  const provKey = backend.providerId ?? "compat";
 
   // Same system contract as the other providers: shared prompt + model self-id line.
   const sysContent = systemInstructions(messages, modelName);
@@ -58,7 +60,7 @@ export async function* streamCompat(
   };
 
   if (!isTauri()) {
-    yield* browserStream(baseUrl, name, key, body, metered, signal);
+    yield* browserStream(baseUrl, name, key, provKey, body, metered, signal);
     return;
   }
 
@@ -68,12 +70,13 @@ export async function* streamCompat(
     (u) => ({ kind: "usage", inputTokens: u.input_tokens, outputTokens: u.output_tokens, reasoningTokens: u.reasoning_tokens, metered, cost: u.cost ?? undefined }),
     undefined,
     signal,
-    streamId
+    streamId,
+    (headers) => recordLimits(provKey, headers)
   );
 }
 
 // Browser-dev fallback: works only when the endpoint sends CORS headers (e.g. Ollama with OLLAMA_ORIGINS).
-async function* browserStream(baseUrl: string, name: string, key: string, body: unknown, metered: boolean, signal?: AbortSignal): AsyncGenerator<Delta> {
+async function* browserStream(baseUrl: string, name: string, key: string, provKey: string, body: unknown, metered: boolean, signal?: AbortSignal): AsyncGenerator<Delta> {
   const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/chat/completions`, {
     method: "POST",
     signal,
@@ -84,6 +87,7 @@ async function* browserStream(baseUrl: string, name: string, key: string, body: 
     },
     body: JSON.stringify(body),
   });
+  recordLimitsFromHeaders(provKey, res.headers);
   for await (const json of sseJson(res, name)) {
     const delta: string | undefined = json.choices?.[0]?.delta?.content;
     if (delta) yield { kind: "text", text: delta };

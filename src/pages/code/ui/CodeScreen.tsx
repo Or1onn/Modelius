@@ -7,17 +7,17 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type Re
 import { useChat } from "@ai-sdk/react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Icon } from "@/shared/ui/Icon";
-import { ctxTokens } from "@/shared/lib/tokens";
 import { useOutsideClick } from "@/shared/lib/useOutsideClick";
+import { refreshUsage, useUsageLimits, useUsageFetching, useSpend } from "@/entities/session/model/usageLimits";
+import { fmtReset, fmtUsd, winUsedPct } from "@/widgets/usage-meter/lib/format";
 import { useAutosize } from "@/shared/lib/useAutosize";
-import { MODEL_BY_ID } from "@/entities/model/model/registry";
 import { anthropicEffortTier, EFFORT_LEVELS, resolveEffort, CODEX_EFFORT_LEVELS, CODEX_EFFORT_DEFAULT, type EffortLevel } from "@/entities/model/model/apiIds";
 import { HARNESSES, HARNESS_BY_ID, PERMISSION_MODES, PERMISSION_LABEL, type NativeKind } from "@/entities/agent/model/harnesses";
 import { useHarnessStatuses, refreshHarnessStatuses, installHarness, cliLoggedIn } from "@/entities/agent/model/harnessStatus";
 import { hasAnthropicOAuth } from "@/entities/session/model/anthropicSession";
 import { hasOpenAIOAuth } from "@/entities/session/model/openaiSession";
 import { AuthModal } from "@/pages/code/ui/AuthModal";
-import { choiceKey, defaultModelForHarness, type CodeModelChoice } from "@/entities/agent/model/codeModel";
+import { choiceKey, codeContextTokens, defaultModelForHarness, type CodeModelChoice } from "@/entities/agent/model/codeModel";
 import { ModelMenu, type ModelMenuItem } from "@/entities/model/ui/ModelMenu";
 import { peekCodeModelGroups, listCodeModelGroups, type CodeModelGroup } from "@/entities/agent/model/codeModels";
 import { peekAppCodexModels } from "@/entities/session/api/codexModels";
@@ -41,6 +41,7 @@ const EFFORT_LABEL: Record<EffortLevel, string> = { low: "Low", medium: "Medium"
 function badgePid(model: CodeModelChoice): string {
   if (model.kind === "anthropic") return "anthropic";
   if (model.kind === "codex") return "openai";
+  if (model.kind === "kimi") return "moonshot";
   if (model.kind === "ollama") return "ollama";
   if (model.kind === "connected") return model.providerId;
   return "";
@@ -51,10 +52,10 @@ function ModelBadge({ model }: { model: CodeModelChoice }) {
   const modelId = model.kind === "connected" ? model.id : undefined; // vendor-prefixed → resolves the real brand logo
   // Non-native picks run the CLI through the local gateway proxy — flag them wherever the badge
   // shows, so tool-calling quirks are traceable to the routing at a glance.
-  const routed = model.kind !== "anthropic" && model.kind !== "codex";
+  const routed = model.kind !== "anthropic" && model.kind !== "codex" && model.kind !== "kimi";
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-      {pid && <PLogo pid={pid} modelId={modelId} plain />}
+      {pid && <PLogo pid={pid} modelId={modelId} />}
       <span style={{ fontWeight: 520 }}>{model.label}</span>
       {routed && (
         <span style={{ fontSize: 11, color: "var(--text-3)", border: "1px solid var(--border)", borderRadius: 4, padding: "0 4px", whiteSpace: "nowrap" }}>
@@ -122,17 +123,35 @@ function Picker({ label, logo, items, onSelect, onOpen, down, btnClass, menuHead
 const fmtTokens = (n: number): string =>
   n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "K" : String(n);
 
+// The account key this code chat's model bills against (for the usage meter). Native CLI logins map
+// to their subscription account; a connected key uses its provider id. Others (gateway/Ollama) have
+// no first-class usage surface here.
+function codeProviderKey(model: CodeModelChoice): string | undefined {
+  if (model.kind === "anthropic") return "anthropic";
+  if (model.kind === "codex") return "chatgpt";
+  if (model.kind === "connected") return model.providerId;
+  return undefined;
+}
+
 // Context-window fill ring (Claude Code Desktop style): an arc that fills as the prompt grows.
-function ContextRing({ tokens, limit, cost, modelName }: { tokens: number; limit: number; cost: number | null; modelName: string }) {
+function ContextRing({ tokens, limit, cost, modelName, providerKey, modelId }: { tokens: number; limit: number; cost: number | null; modelName: string; providerKey?: string; modelId?: string }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useOutsideClick(ref, open, () => setOpen(false));
+  const snap = useUsageLimits(providerKey);
+  const spend = useSpend(providerKey);
+  const fetching = useUsageFetching(providerKey);
+  const windows = snap?.windows ?? [];
+  const balance = snap?.balanceUsd;
+  useEffect(() => {
+    if (open) void refreshUsage(providerKey, modelId);
+  }, [open, providerKey, modelId]);
   const pct = limit > 0 ? Math.min(1, tokens / limit) : 0;
   const r = 6.5;
   const c = 2 * Math.PI * r;
   return (
     <div className="cd-ctx" ref={ref} style={{ position: "relative" }}>
-      <button className="cd-ctx-btn" onClick={() => setOpen((v) => !v)} title="Context & usage">
+      <button className="cd-ctx-btn" onClick={() => setOpen((v) => !v)} onMouseEnter={() => void refreshUsage(providerKey, modelId)} title="Context & usage">
         <svg width="16" height="16" viewBox="0 0 16 16">
           <circle cx="8" cy="8" r={r} className="cd-ctx-track" fill="none" strokeWidth="2" />
           <circle
@@ -152,10 +171,55 @@ function ContextRing({ tokens, limit, cost, modelName }: { tokens: number; limit
           <div className="cd-ctx-pop-sub">
             {fmtTokens(tokens)} / {limit > 0 ? fmtTokens(limit) : "?"} tokens
           </div>
-          <div className="cd-ctx-pop-row" style={{ marginTop: 10 }}>
-            <span>Usage</span>
-            <span>{cost != null ? `$${cost.toFixed(cost < 0.01 ? 4 : 2)}` : "—"}</span>
-          </div>
+
+          {/* Probe in flight with nothing cached yet — show a placeholder, not an empty gap. */}
+          {windows.length === 0 && fetching && (
+            <div className="cd-ctx-plan">
+              <div className="cd-ctx-plan-head">Plan usage limits</div>
+              <div className="cd-ctx-pop-sub">Loading…</div>
+            </div>
+          )}
+
+          {/* Subscription rate-limit windows, one labelled bar each (Claude Code's "Plan usage limits"). */}
+          {windows.length > 0 && (
+            <div className="cd-ctx-plan">
+              <div className="cd-ctx-plan-head">Plan usage limits</div>
+              {windows.map((w, i) => {
+                const used = winUsedPct(w);
+                const reset = fmtReset(w.resetsAt);
+                const lvl = used == null ? undefined : used >= 90 ? "crit" : used >= 75 ? "warn" : undefined;
+                return (
+                  <div className="cd-ctx-win" key={i}>
+                    <div className="cd-ctx-win-top">
+                      <span className="cd-ctx-win-label">{w.label}</span>
+                      <span className="cd-ctx-win-meta">
+                        {reset && <em>{reset}</em>}
+                        <b>{used != null ? `${used}%` : "—"}</b>
+                      </span>
+                    </div>
+                    <div className="cd-ctx-bar" data-level={lvl}><span style={{ width: `${used ?? 0}%` }} /></div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Dollar figures: local run cost only for API-key chats (no plan windows); spend/balance when known. */}
+          {cost != null && windows.length === 0 && (
+            <div className="cd-ctx-pop-row" style={{ marginTop: 10 }}>
+              <span>Usage</span>
+              <span>{fmtUsd(cost)}</span>
+            </div>
+          )}
+          {spend > 0 && (
+            <div className="cd-ctx-pop-row"><span>Spent (Modelius)</span><span>{fmtUsd(spend)}</span></div>
+          )}
+          {balance && (
+            <div className="cd-ctx-pop-row">
+              <span>Balance</span>
+              <span>{balance.limit != null ? `${fmtUsd(balance.usage)} / ${fmtUsd(balance.limit)}` : `${fmtUsd(balance.usage)} used`}</span>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -167,7 +231,7 @@ interface RunMeta { inputTokens?: number; cacheReadInputTokens?: number; cacheCr
 
 export function CodeScreen({ chatId }: { chatId: string }) {
   const chat = getCodeChat(chatId);
-  const { messages, status, sendMessage, stop: stopChat } = useChat({ chat, throttle: 50 });
+  const { messages, status, error, sendMessage, stop: stopChat } = useChat({ chat, throttle: 50 });
   const subscribe = useCallback((cb: () => void) => subscribeCodeConfig(chatId, cb), [chatId]);
   const getSnapshot = useCallback(() => getCodeConfig(chatId), [chatId]);
   const config = useSyncExternalStore(subscribe, getSnapshot);
@@ -178,7 +242,22 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   // corrupts its grid, so closing tears it down and opening starts a fresh, correctly-fitted shell.
   const { zoom } = useSettings();
   const [termOpen, setTermOpen] = useState(false);
-  const toggleTerm = () => setTermOpen((v) => !v);
+  // Command typed into the terminal right after it opens (the kimi login flow); a manual toggle
+  // always starts a plain shell.
+  const [termCmd, setTermCmd] = useState<string | null>(null);
+  const toggleTerm = () => { setTermCmd(null); setTermOpen((v) => !v); };
+  // A kimi turn that failed for want of a login (the Rust pump stamps such errors with a
+  // `kimi login` hint): instead of surfacing the raw error, open the built-in terminal with the
+  // login pre-typed — the user completes the device-code flow and just sends again.
+  const kimiLoginNeeded =
+    !!error && harnessId === "kimi-code" && /kimi login/.test(error.message ?? "");
+  const handledLoginErr = useRef<unknown>(null);
+  useEffect(() => {
+    if (!kimiLoginNeeded || handledLoginErr.current === error) return;
+    handledLoginErr.current = error; // one terminal per distinct failure, not per re-render
+    setTermCmd("kimi login");
+    setTermOpen(true);
+  }, [kimiLoginNeeded, error]);
   const [recents, setRecents] = useState<string[]>(() => getRecentFolders());
   const [branches, setBranches] = useState<string[]>([]);
   const [branch, setBranch] = useState("");
@@ -188,7 +267,6 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const gateways = useGateways();
   const harnessStatuses = useHarnessStatuses();
   const harness = HARNESS_BY_ID[harnessId];
-  const registryModel = model.kind === "anthropic" ? MODEL_BY_ID[model.id] : undefined;
   // Effort picker for native picks whose harness supports it (mirrors resolvedEffort in the
   // registry): Anthropic models that gate --effort, and codex models (rides turn/start).
   const effortTier = model.kind === "anthropic" ? anthropicEffortTier(model.id) : null;
@@ -243,10 +321,10 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     void listCodeModelGroups(harnessId).then((g) => {
       if (!alive) return;
       setModelGroups(g);
-      // Reconcile a stale codex pick: the hardcoded fallback default may lead with a plan-locked
-      // model (e.g. gpt-5.6-sol) that the freshly-loaded live list hides — reset to the live
-      // default so the selection isn't a model missing from the dropdown.
-      if (model.kind === "codex" && !g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(model)))) {
+      // Reconcile a stale codex/kimi pick: the hardcoded fallback default may lead with a model
+      // (e.g. plan-locked gpt-5.6-sol, or a renamed kimi alias) that the freshly-loaded live list
+      // hides — reset to the live default so the selection isn't a model missing from the dropdown.
+      if ((model.kind === "codex" || model.kind === "kimi") && !g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(model)))) {
         setCodeConfig(chatId, { model: defaultModelForHarness(harnessId) });
       }
     });
@@ -332,10 +410,22 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     if (!text) return;
     const kind = harness?.native?.kind;
     if (!force && kind && model.kind === kind) {
-      const connected = kind === "anthropic" ? hasAnthropicOAuth() : hasOpenAIOAuth();
+      // Kimi has no app-side OAuth — its gate rests entirely on the CLI's own credentials.
+      const connected = kind === "anthropic" ? hasAnthropicOAuth() : kind === "codex" ? hasOpenAIOAuth() : false;
       if (!connected && !(await cliLoggedIn(harnessId))) {
-        setAuthNeed(kind);
-        return;
+        if (kind === "kimi") {
+          // No modal for kimi — its login IS a terminal flow, so go straight there. A second
+          // send with the login terminal already up means "send anyway" (the CLI-login check is
+          // best-effort and must never hard-block).
+          if (!(termOpen && termCmd === "kimi login")) {
+            setTermCmd("kimi login");
+            setTermOpen(true);
+            return;
+          }
+        } else {
+          setAuthNeed(kind);
+          return;
+        }
       }
     }
     setInput("");
@@ -414,6 +504,26 @@ export function CodeScreen({ chatId }: { chatId: string }) {
               {workNote && <span className="cd-work-note mono">{workNote}</span>}
             </div>
           )}
+          {/* A failed turn otherwise ends silently: stream errors land on the Chat's error
+              state, which nothing here rendered before — the spinner stopped and the user saw
+              nothing (live-verified via the kimi no-model failure). A kimi login failure gets
+              the terminal flow (auto-opened above) instead of the raw error. */}
+          {!busy && status === "error" && error && (
+            kimiLoginNeeded ? (
+              <div className="cd-turn-error info" role="status">
+                <Icon name="terminal" size={13} />
+                <span>
+                  Kimi sign-in required — complete <code className="mono">kimi login</code> in the
+                  terminal below, then send your message again.
+                </span>
+              </div>
+            ) : (
+              <div className="cd-turn-error" role="alert">
+                <Icon name="close" size={13} />
+                <span>{error.message || "The agent turn failed."}</span>
+              </div>
+            )
+          )}
         </div>
       </div>
 
@@ -468,7 +578,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
                 clearModelCache();
                 const g = await listCodeModelGroups(harnessId);
                 setModelGroups(g);
-                if (model.kind === "codex" && !g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(model)))) {
+                if ((model.kind === "codex" || model.kind === "kimi") && !g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(model)))) {
                   setCodeConfig(chatId, { model: defaultModelForHarness(harnessId) });
                 }
               }}
@@ -541,13 +651,18 @@ export function CodeScreen({ chatId }: { chatId: string }) {
               onSelect={selectBranch}
             />
           )}
-          <ContextRing tokens={contextTokens} limit={registryModel?.ctx ? ctxTokens(registryModel.ctx) : 0} cost={cost} modelName={model.label} />
+          <ContextRing tokens={contextTokens} limit={codeContextTokens(model)} cost={cost} modelName={model.label} providerKey={codeProviderKey(model)} modelId={model.id} />
         </div>
       </div>
 
       {/* Bottom terminal — real PTY, docked below the composer so the chat sits above it. */}
       {termOpen && cwd && (
-        <TerminalPanel cwd={cwd} onClose={() => setTermOpen(false)} zoom={zoom} />
+        <TerminalPanel
+          cwd={cwd}
+          onClose={() => { setTermOpen(false); setTermCmd(null); }}
+          zoom={zoom}
+          bootstrapCommand={termCmd ?? undefined}
+        />
       )}
 
       {gatewaysOpen && <GatewayModal onClose={() => setGatewaysOpen(false)} />}

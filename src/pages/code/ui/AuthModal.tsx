@@ -1,8 +1,9 @@
 // AuthModal.tsx — sign-in modal for native harness runs (Code mode). Shown when the picked model
 // runs on the CLI's own account but neither the app's connection nor the CLI's credentials are
 // present. Anthropic is two-step (browser → paste code), ChatGPT/Codex is one-shot (loopback
-// callback). "Continue anyway" bypasses the gate: CLI-login detection is best-effort (e.g.
-// keyring-backed logins) and must never hard-block.
+// callback). Kimi never gets this modal — its login is a terminal flow, so CodeScreen opens the
+// built-in terminal on `kimi login` directly. "Continue anyway" bypasses the gate: CLI-login
+// detection is best-effort (e.g. keyring-backed logins) and must never hard-block.
 import { useState } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import type { NativeKind } from "@/entities/agent/model/harnesses";

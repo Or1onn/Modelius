@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getKey } from "@/entities/session/model/keys";
 import { getOpenAIAuth, handleOpenAIUnauthorized } from "@/entities/session/model/openaiSession";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
+import { recordLimits, recordLimitsFromHeaders } from "@/entities/session/model/usageLimits";
 import { systemInstructions } from "@/features/stream-completion/lib/instructions";
 import { sseJson } from "@/features/stream-completion/lib/sse";
 import type { ChatMsg, Delta, ImagePart } from "@/entities/model/model/backend";
@@ -64,7 +65,8 @@ export async function* streamChatGPT(
     // try a refresh and only disconnect if it's definitively rejected.
     (msg) => { if (/^ChatGPT 401\b/.test(msg)) void handleOpenAIUnauthorized(); },
     signal,
-    streamId
+    streamId,
+    (headers) => recordLimits("chatgpt", headers)
   );
 }
 
@@ -105,6 +107,8 @@ export async function* streamChat(
       ...(tools.length ? { tools } : {}),
     }),
   });
+
+  recordLimitsFromHeaders("openai", res.headers); // x-ratelimit-* on the response
 
   for await (const json of sseJson(res, "OpenAI")) {
     switch (json.type) {

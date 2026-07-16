@@ -11,6 +11,7 @@ export type StreamEvent =
   | { type: "image"; data: string }
   | { type: "usage"; data: RawUsage }
   | { type: "stop_reason"; data: string }
+  | { type: "rate_limit"; data: Record<string, string> }
   | { type: "done" }
   | { type: "error"; data: string };
 
@@ -22,7 +23,8 @@ export async function* channelToDeltas(
   mapUsage: (u: RawUsage) => Delta,
   onError?: (msg: string) => void,
   signal?: AbortSignal,
-  streamId?: string
+  streamId?: string,
+  onRateLimit?: (headers: Record<string, string>) => void
 ): AsyncGenerator<Delta> {
   const channel = new Channel<StreamEvent>();
   const queue: Delta[] = [];
@@ -50,6 +52,7 @@ export async function* channelToDeltas(
     else if (msg.type === "image") queue.push({ kind: "image", dataUrl: msg.data });
     else if (msg.type === "usage") queue.push(mapUsage(msg.data));
     else if (msg.type === "stop_reason") queue.push({ kind: "stop", reason: msg.data });
+    else if (msg.type === "rate_limit") onRateLimit?.(msg.data); // account-global, out-of-band
     else if (msg.type === "error") {
       error = msg.data;
       finished = true;

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { permissionDataFrom, codexPermissionDataFrom } from "@/features/run-agent/lib/codeTransport";
-import { buildControlResponse, buildJsonRpcResult } from "@/features/run-agent/lib/permission";
+import { permissionDataFrom, codexPermissionDataFrom, kimiPermissionDataFrom } from "@/features/run-agent/lib/codeTransport";
+import { buildControlResponse, buildJsonRpcResult, buildAcpResult, pickAcpOption } from "@/features/run-agent/lib/permission";
 
 // Wire-contract lock for the stdio permission protocol, verified live against claude 2.1.206
 // (phase-0 probes): CAPTURED_REQUEST is a real can_use_tool line the CLI emitted, and the
@@ -112,5 +112,75 @@ describe("codex approval protocol", () => {
     expect(buildJsonRpcResult("r-1", { decision: "decline" })).toBe('{"id":"r-1","result":{"decision":"decline"}}');
     // codex's dialect omits the jsonrpc field entirely (probe-verified)
     expect(JSON.parse(buildJsonRpcResult(0, {}))).not.toHaveProperty("jsonrpc");
+  });
+});
+
+// Kimi ACP permission flow, verified live against @moonshot-ai/kimi-code 0.25.0 (probe P5):
+// KIMI_PERMISSION is a real session/request_permission server request the CLI emitted, and the
+// selected-outcome line asserted below is the exact response after which the command executed.
+const KIMI_PERMISSION = {
+  jsonrpc: "2.0",
+  id: 0,
+  method: "session/request_permission",
+  params: {
+    sessionId: "session_a7ae7a72-1800-4f3b-8e87-23cb10ff8eeb",
+    options: [
+      { optionId: "approve_once", name: "Approve once", kind: "allow_once" },
+      { optionId: "approve_always", name: "Approve for this session", kind: "allow_always" },
+      { optionId: "reject", name: "Reject", kind: "reject_once" },
+    ],
+    toolCall: {
+      toolCallId: "0:call_1",
+      title: "Bash",
+      content: [{ type: "content", content: { type: "text", text: '{"command":"node -e \\"console.log(\'probe-ran\')\\""}' } }],
+    },
+  },
+};
+
+describe("kimi acp permission protocol", () => {
+  it("decodes a real session/request_permission into a kimi data-permission part", () => {
+    const part = kimiPermissionDataFrom(KIMI_PERMISSION, "stream-1");
+    expect(part).toEqual({
+      type: "data-permission",
+      id: "0",
+      data: {
+        streamId: "stream-1",
+        requestId: "0",
+        toolName: "Bash", // kimi titles are already canonical tool names
+        toolUseId: "0:call_1",
+        input: { command: "node -e \"console.log('probe-ran')\"" }, // parsed from the args JSON
+        kind: "kimi",
+        rpcId: 0,
+        options: [
+          { optionId: "approve_once", name: "Approve once", kind: "allow_once" },
+          { optionId: "approve_always", name: "Approve for this session", kind: "allow_always" },
+          { optionId: "reject", name: "Reject", kind: "reject_once" },
+        ],
+      },
+    });
+  });
+
+  it("only decodes permission requests with an answerable id", () => {
+    expect(kimiPermissionDataFrom({ jsonrpc: "2.0", method: "session/update", params: {} }, "s")).toBeNull();
+    expect(kimiPermissionDataFrom({ jsonrpc: "2.0", method: "session/request_permission", params: {} }, "s")).toBeNull();
+    expect(kimiPermissionDataFrom({ jsonrpc: "2.0", id: 1, method: "fs/read_text_file", params: {} }, "s")).toBeNull();
+  });
+
+  it("picks the one-shot option for the card's Allow/Deny answer", () => {
+    const options = KIMI_PERMISSION.params.options;
+    expect(pickAcpOption(options, "allow")?.optionId).toBe("approve_once");
+    expect(pickAcpOption(options, "reject")?.optionId).toBe("reject");
+    // *_once missing → the *_always variant, then anything offered
+    expect(pickAcpOption([{ optionId: "a", kind: "allow_always" }], "allow")?.optionId).toBe("a");
+    expect(pickAcpOption([{ optionId: "x", kind: "weird" }], "reject")?.optionId).toBe("x");
+    expect(pickAcpOption([], "allow")).toBeNull();
+  });
+
+  it("builds the exact strict JSON-RPC answer the CLI executed on in the probe", () => {
+    // The "jsonrpc" field is mandatory in the ACP dialect — its absence is a silent hang.
+    expect(buildAcpResult(0, { outcome: { outcome: "selected", optionId: "approve_once" } })).toBe(
+      '{"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"approve_once"}}}'
+    );
+    expect(JSON.parse(buildAcpResult("r-1", {}))).toHaveProperty("jsonrpc", "2.0");
   });
 });

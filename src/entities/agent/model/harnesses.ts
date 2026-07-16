@@ -3,7 +3,7 @@
 // mirror the Rust spec table in src-tauri/src/harness.rs. `protocol` is the API dialect the CLI
 // speaks when re-routed through the local gateway; `routable` says whether the CLI supports
 // env-based endpoint override at all; `native` describes the CLI's own login (no routing).
-import { LIVE_ANTHROPIC, LIVE_CODEX } from "@/entities/model/model/registry";
+import { LIVE_ANTHROPIC, LIVE_CODEX, LIVE_KIMI } from "@/entities/model/model/registry";
 
 export interface HarnessModel {
   id: string; // passed to the CLI's --model flag
@@ -11,7 +11,7 @@ export interface HarnessModel {
 }
 
 export type HarnessProtocol = "anthropic" | "openai";
-export type NativeKind = "anthropic" | "codex";
+export type NativeKind = "anthropic" | "codex" | "kimi";
 
 export interface AgentHarness {
   id: string; // matches the Rust harness id in src-tauri/src/harness.rs
@@ -45,6 +45,18 @@ export const HARNESSES: AgentHarness[] = [
       kind: "codex",
       label: "ChatGPT (Codex)",
       models: () => LIVE_CODEX.map((m) => ({ id: m.id, name: m.name })),
+    },
+  },
+  {
+    id: "kimi-code",
+    name: "Kimi Code",
+    bin: "kimi",
+    protocol: "openai", // unused while routable:false (Moonshot's API is OpenAI-compatible)
+    routable: false, // v1: native Kimi-account login only (`kimi login` in the built-in terminal)
+    native: {
+      kind: "kimi",
+      label: "Moonshot (Kimi)",
+      models: () => LIVE_KIMI.map((m) => ({ id: m.id, name: m.name })),
     },
   },
 ];

@@ -5,7 +5,8 @@ import type { ChatTransport, UIMessage, UIMessageChunk } from "ai";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { createTransformer } from "./transform";
 import { createCodexAppServerTransformer } from "./codexAppServerTransform";
-import type { PermissionRequestData } from "./permission";
+import { createKimiAcpTransformer, kimiToolName, kimiToolInput } from "./kimiAcpTransform";
+import { buildAcpResult, type AcpPermissionOption, type PermissionRequestData } from "./permission";
 import { bumpTurnActivity, clearTurnStatus, noteTurnStderr } from "./turnStatus";
 
 // Raw pipe events from Rust agent.rs (PipeEvent).
@@ -18,7 +19,7 @@ type PipeEvent =
 // Everything the Rust `agent_run` command needs for one turn. Resolved per-send (model/cwd/harness
 // can change between turns, routing keys are fetched lazily) by the store that owns the transport.
 export interface RunConfig {
-  harness: string; // "claude-code" | "codex"
+  harness: string; // "claude-code" | "codex" | "kimi-code"
   model: string;
   cwd: string;
   permissionMode: string;
@@ -77,6 +78,40 @@ export function codexPermissionDataFrom(
   };
 }
 
+// Decode a kimi `session/request_permission` ACP server request into the `data-permission` part.
+// The request's own options ride along — the answer must echo one of their optionIds
+// (permission.ts pickAcpOption). Anything else with method+id gets a JSON-RPC error back from the
+// transport so the agent never wedges on an unanswered request. Pure + exported for tests
+// (shape probe-verified @moonshot-ai/kimi-code 0.25.0).
+export function kimiPermissionDataFrom(
+  parsed: unknown,
+  streamId: string
+): { type: "data-permission"; id: string; data: PermissionRequestData } | null {
+  const req = parsed as { method?: string; id?: number | string; params?: Record<string, any> };
+  if (req.method !== "session/request_permission" || req.id === undefined || req.id === null) return null;
+  const p = req.params ?? {};
+  const toolCall = p.toolCall ?? {};
+  const options: AcpPermissionOption[] = Array.isArray(p.options)
+    ? p.options
+        .filter((o: any) => typeof o?.optionId === "string")
+        .map((o: any) => ({ optionId: o.optionId, name: typeof o.name === "string" ? o.name : undefined, kind: String(o.kind ?? "") }))
+    : [];
+  return {
+    type: "data-permission",
+    id: String(req.id),
+    data: {
+      streamId,
+      requestId: String(req.id),
+      toolName: kimiToolName(toolCall),
+      toolUseId: typeof toolCall.toolCallId === "string" ? toolCall.toolCallId : undefined,
+      input: kimiToolInput(toolCall),
+      kind: "kimi",
+      rpcId: req.id,
+      options,
+    },
+  };
+}
+
 // Decode a `can_use_tool` control_request stdout line into the `data-permission` part the
 // transcript renders as an Allow/Deny card (answered via permission.ts). Null for any other
 // control traffic. Pure + exported so tests can feed it real captured CLI lines
@@ -121,8 +156,17 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
     const { prompt, resume, run } = await this.resolve(options.messages);
     const streamId = crypto.randomUUID();
     const isCodex = run.harness === "codex";
-    const transform = isCodex ? createCodexAppServerTransformer() : createTransformer();
+    const isKimi = run.harness === "kimi-code";
+    const transform = isCodex
+      ? createCodexAppServerTransformer()
+      : isKimi
+        ? createKimiAcpTransformer()
+        : createTransformer();
     const channel = new Channel<PipeEvent>();
+    // Kimi permission requests still pending when the user hits Stop: ACP obliges the client to
+    // answer every request, so the abort handler resolves them as "cancelled" before cancelling
+    // the stream — an unanswered request could otherwise wedge the agent mid-cancel.
+    const pendingKimiPerms = new Set<number | string>();
 
     return new ReadableStream<UIMessageChunk>({
       start: (controller) => {
@@ -163,6 +207,28 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
                       error: { code: -32601, message: `unsupported request: ${req.method}` },
                     }),
                   }).catch(() => {});
+                return;
+              }
+            } else if (isKimi) {
+              // Kimi ACP server request — same contract, strict JSON-RPC 2.0 (the error line
+              // must carry "jsonrpc" or the SDK drops it and the agent hangs). fs/* and
+              // terminal/* never arrive (capabilities declared false at initialize).
+              const req = parsed as { method?: string; id?: number | string };
+              if (typeof req.method === "string" && req.id !== undefined && req.id !== null) {
+                const perm = kimiPermissionDataFrom(parsed, streamId);
+                if (perm) {
+                  pendingKimiPerms.add(req.id);
+                  push(perm);
+                } else {
+                  void invoke("agent_respond", {
+                    streamId,
+                    payload: JSON.stringify({
+                      jsonrpc: "2.0",
+                      id: req.id,
+                      error: { code: -32601, message: `unsupported request: ${req.method}` },
+                    }),
+                  }).catch(() => {});
+                }
                 return;
               }
             } else if ((parsed as { type?: string }).type === "control_request") {
@@ -222,6 +288,16 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
         options.abortSignal?.addEventListener(
           "abort",
           () => {
+            // Resolve any kimi permission requests still on screen as "cancelled" first —
+            // session/cancel can't complete while a request is pending an answer. A request the
+            // user already answered gets a benign duplicate-response no-op server-side.
+            for (const id of pendingKimiPerms) {
+              void invoke("agent_respond", {
+                streamId,
+                payload: buildAcpResult(id, { outcome: { outcome: "cancelled" } }),
+              }).catch(() => {});
+            }
+            pendingKimiPerms.clear();
             void invoke("cancel_stream", { streamId }).catch(() => {});
             clearTurnStatus(this.chatId);
             try {

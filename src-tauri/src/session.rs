@@ -1,8 +1,9 @@
 // session.rs — warm agent sessions. A code chat keeps ONE long-lived CLI process across turns —
 // follow-up turns ride the process's own stdio protocol instead of re-spawning per turn, skipping
-// process boot and the resume transcript replay. Two protocols, one lifecycle:
+// process boot and the resume transcript replay. Three protocols, one lifecycle:
 // - Claude (stream-json multi-turn + control_requests, probe-verified 2.1.206)
 // - Codex (`app-server` JSON-RPC threads/turns, probe-verified 0.142.5, lines in codex_proto.rs)
+// - Kimi (`kimi acp` ACP sessions, probe-verified 0.25.0, lines in kimi_proto.rs)
 // agent.rs owns argv/env/spawn and decides warm vs per-turn (run_once); this module owns the
 // registry, the per-session stdout pump, and lifecycle (interrupt / idle reaping / LRU cap /
 // app-exit cleanup).
@@ -42,10 +43,12 @@ pub(crate) struct Fingerprint {
 }
 
 // Per-protocol runtime state. Claude needs none beyond the shared fields; a codex app-server
-// session tracks its JSON-RPC ids and the live thread/turn (codex_proto.rs builds the lines).
+// session tracks its JSON-RPC ids and the live thread/turn (codex_proto.rs builds the lines);
+// a kimi acp session tracks its session id and the in-flight prompt (kimi_proto.rs).
 pub(crate) enum SessionProto {
     Claude,
     Codex(CodexRuntime),
+    Kimi(KimiRuntime),
 }
 
 pub(crate) struct CodexRuntime {
@@ -75,6 +78,50 @@ impl CodexRuntime {
             thread_ready_tx: Mutex::new(Some(tx)),
             thread_ready_rx: tokio::sync::Mutex::new(Some(rx)),
             turn_req: Mutex::new(None),
+        }
+    }
+
+    fn take_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+// Simpler than CodexRuntime: an ACP turn is bounded by the RESPONSE to our session/prompt
+// request (not a notification), and session/cancel needs no turn id.
+pub(crate) struct KimiRuntime {
+    // From the session/new response — or pre-set when resuming (session/resume responses carry
+    // no sessionId; the resume id IS the session id, so begin_turn never has to wait for it).
+    session_id: Mutex<Option<String>>,
+    // Client request ids. 1 = initialize, 2 = session open (spawn_warm); turns continue.
+    next_id: std::sync::atomic::AtomicU64,
+    session_open_req: u64,
+    // The waiter begin_turn blocks on for a fresh session/new (resume paths skip it).
+    session_ready_tx: Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>,
+    session_ready_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Result<String, String>>>>,
+    // The in-flight session/prompt request id — its response ends the turn; an error for any
+    // request while it is set fails the turn (set_model/set_mode are pipelined ahead of it).
+    prompt_req: Mutex<Option<u64>>,
+    // The model already applied via session/set_model — sent once per process (model changes
+    // respawn via the fingerprint, like codex).
+    model_sent: Mutex<Option<String>>,
+    // Gates forwarding of notifications until the session-open response is consumed, so a
+    // history replay (if the open method ever switches from resume to load) can't duplicate
+    // into the live transcript.
+    forwarding: AtomicBool,
+}
+
+impl KimiRuntime {
+    pub fn new(resume: Option<String>) -> Self {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        KimiRuntime {
+            session_id: Mutex::new(resume.filter(|s| !s.is_empty())),
+            next_id: std::sync::atomic::AtomicU64::new(3),
+            session_open_req: 2,
+            session_ready_tx: Mutex::new(Some(tx)),
+            session_ready_rx: tokio::sync::Mutex::new(Some(rx)),
+            prompt_req: Mutex::new(None),
+            model_sent: Mutex::new(None),
+            forwarding: AtomicBool::new(false),
         }
     }
 
@@ -189,8 +236,10 @@ impl AgentSession {
     // {"mode":...}, enforced next turn) — cheaper than a fingerprint respawn, and idempotent if
     // the CLI already switched itself (plan-approve's updatedPermissions setMode).
     // Codex: no-op — the mode rides every turn/start as approvalPolicy+sandboxPolicy overrides.
+    // Kimi: no-op here — session/set_mode needs the session id, so begin_turn's Kimi arm
+    // reconciles inline once the id is in hand.
     pub async fn reconcile_permission_mode(&self, mode: &str) -> std::io::Result<()> {
-        if matches!(self.proto, SessionProto::Codex(_)) {
+        if matches!(self.proto, SessionProto::Codex(_) | SessionProto::Kimi(_)) {
             return Ok(());
         }
         if mode.is_empty() || *self.permission_mode.lock().unwrap() == mode {
@@ -244,13 +293,61 @@ impl AgentSession {
                 self.write_line(&crate::codex_proto::turn_start_line(id, &thread_id, prompt, model, effort, mode))
                     .await
             }
+            SessionProto::Kimi(rt) => {
+                let _ = effort; // no effort surface in ACP — thinking variants are model aliases
+                // Fresh session/new: wait for the pump to consume the response (it carries the
+                // session id). Resume/reused sessions have the id already.
+                let known = rt.session_id.lock().unwrap().clone();
+                let session_id = match known {
+                    Some(s) => s,
+                    None => {
+                        let rx = rt.session_ready_rx.lock().await.take().ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session never opened")
+                        })?;
+                        let opened = tokio::time::timeout(Duration::from_secs(20), rx)
+                            .await
+                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "session open timed out"))?
+                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session died"))?;
+                        opened.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                    }
+                };
+                // Arm the turn BEFORE the pipelined config writes: a rejected set_mode/set_model
+                // must fail this turn deterministically (live-verified: an account whose login
+                // populated no model catalog rejects set_model; racing the prompt write would
+                // otherwise sometimes swallow the error into a silent empty turn).
+                let id = rt.take_id();
+                *rt.prompt_req.lock().unwrap() = Some(id);
+                // A fresh acp session always boots in "default" mode (argv knobs don't bind —
+                // probe P8), so spawn_warm registers it as "default" and the first turn
+                // reconciles here. Acks ({}) are swallowed by the pump; errors while the prompt
+                // is in flight fail the turn.
+                if !mode.is_empty() && *self.permission_mode.lock().unwrap() != mode {
+                    self.write_line(&crate::kimi_proto::set_mode_line(
+                        rt.take_id(),
+                        &session_id,
+                        crate::kimi_proto::kimi_mode(mode),
+                    ))
+                    .await?;
+                    *self.permission_mode.lock().unwrap() = mode.to_string();
+                }
+                // Model is pinned per process (fingerprint) but has no spawn-time flag — apply it
+                // in-session once.
+                if !model.is_empty() && rt.model_sent.lock().unwrap().as_deref() != Some(model) {
+                    self.write_line(&crate::kimi_proto::set_model_line(rt.take_id(), &session_id, model))
+                        .await?;
+                    *rt.model_sent.lock().unwrap() = Some(model.to_string());
+                }
+                self.write_line(&crate::kimi_proto::prompt_line(id, &session_id, prompt)).await
+            }
         }
     }
 
     // Ask the CLI to stop the running turn but keep the process warm; the pump then finishes the
     // turn normally. Claude: interrupt control_request → result subtype error_during_execution
     // (probe-verified 2.1.206). Codex: turn/interrupt → turn/completed status "interrupted"
-    // (probe-verified 0.142.5). Err (e.g. no live turn ids yet) → caller falls back to kill.
+    // (probe-verified 0.142.5). Kimi: session/cancel notification → the pending session/prompt
+    // resolves with stopReason "cancelled" (probe-verified 0.25.0). Err (e.g. no live turn ids
+    // yet) → caller falls back to kill.
     pub async fn interrupt(&self) -> std::io::Result<()> {
         match &self.proto {
             SessionProto::Claude => {
@@ -278,6 +375,16 @@ impl AgentSession {
                 };
                 self.write_line(&crate::codex_proto::turn_interrupt_line(rt.take_id(), &thread_id, &turn_id))
                     .await
+            }
+            SessionProto::Kimi(rt) => {
+                let session_id = rt.session_id.lock().unwrap().clone();
+                match session_id {
+                    Some(sid) => self.write_line(&crate::kimi_proto::cancel_line(&sid)).await,
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no live kimi session to interrupt",
+                    )),
+                }
             }
         }
     }
@@ -401,20 +508,29 @@ fn spawn_pump(key: String, session: Arc<AgentSession>, stdout: tokio::process::C
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let (end, fail) = match &session.proto {
+            // Per-line verdict: (turn ended, turn failed message, forward the raw line). Claude
+            // and codex forward every line; kimi withholds lifecycle responses (consumed into the
+            // runtime) and pre-ready notifications (replay guard).
+            let (end, fail, forward) = match &session.proto {
                 // Claude: only a TOP-LEVEL result ends the turn (sidechain guard in is_result_line).
-                SessionProto::Claude => (is_result_line(&line), None),
-                SessionProto::Codex(rt) => pump_codex_line(rt, &line),
+                SessionProto::Claude => (is_result_line(&line), None, true),
+                SessionProto::Codex(rt) => {
+                    let (end, fail) = pump_codex_line(rt, &line);
+                    (end, fail, true)
+                }
+                SessionProto::Kimi(rt) => pump_kimi_line(rt, &line),
             };
             let mut guard = session.active.lock().unwrap();
             if let Some(t) = guard.as_ref() {
                 if let Some(msg) = fail {
-                    // turn/start was rejected (RpcError) — no turn/completed will follow.
+                    // The turn's request was rejected (RpcError) — no completion will follow.
                     let _ = t.channel.send(PipeEvent::Error(msg));
                     finish_turn(guard.take().unwrap());
                     continue;
                 }
-                let _ = t.channel.send(PipeEvent::Line(line));
+                if forward {
+                    let _ = t.channel.send(PipeEvent::Line(line));
+                }
                 if end {
                     finish_turn(guard.take().unwrap());
                 }
@@ -492,6 +608,77 @@ fn pump_codex_line(rt: &CodexRuntime, line: &str) -> (bool, Option<String>) {
             (ours, None)
         }
         _ => (false, None),
+    }
+}
+
+// Kimi pump bookkeeping for one stdout line. Returns (turn_ended, turn_failed_message, forward).
+// Consumes the session-open response (fires begin_turn's waiter, opens the forwarding gate) and
+// ends the attached turn on the session/prompt response — which IS forwarded, because the TS
+// transform reads its stopReason for the finish metadata. set_model/set_mode acks are swallowed;
+// an error while a prompt is in flight fails the turn (the config lines are pipelined ahead of
+// it, so their rejection would otherwise strand the turn).
+fn pump_kimi_line(rt: &KimiRuntime, line: &str) -> (bool, Option<String>, bool) {
+    use crate::kimi_proto::{classify, KimiLine};
+    match classify(line) {
+        KimiLine::Response { id, session_id } if id == rt.session_open_req => {
+            if let Some(sid) = session_id {
+                // session/new carries the id; session/resume doesn't (it was pre-set).
+                *rt.session_id.lock().unwrap() = Some(sid);
+            }
+            let outcome = match rt.session_id.lock().unwrap().clone() {
+                Some(sid) => Ok(sid),
+                None => Err("session open response carried no session id".to_string()),
+            };
+            rt.forwarding.store(true, Ordering::SeqCst);
+            if let Some(tx) = rt.session_ready_tx.lock().unwrap().take() {
+                let _ = tx.send(outcome);
+            }
+            (false, None, false)
+        }
+        KimiLine::Error { id, code, message } => {
+            // authRequired (-32000): tell the user how to fix it — kimi's own login lives in the
+            // built-in terminal (AuthModal wires the same command). An unconfigured model means
+            // the login never populated the account's model catalog (live-verified: happens when
+            // Kimi can't verify the account's membership) — say that instead of kimi's
+            // edit-config.toml advice.
+            let msg = if code == -32000 {
+                format!("{} — open the built-in terminal and run `kimi login`", message)
+            } else if message.contains("not configured in config.toml") {
+                format!(
+                    "{} — your Kimi account has no models available. Re-run `kimi login` in the built-in terminal and check that your Kimi Code membership is active.",
+                    message
+                )
+            } else {
+                message
+            };
+            if id == rt.session_open_req {
+                if let Some(tx) = rt.session_ready_tx.lock().unwrap().take() {
+                    let _ = tx.send(Err(msg));
+                    return (false, None, false);
+                }
+                // Resume path: nobody waits on the oneshot — fall through and fail the turn.
+            }
+            let mut prompt_req = rt.prompt_req.lock().unwrap();
+            if prompt_req.is_some() {
+                *prompt_req = None;
+                // The failure may have been the pipelined set_model — forget the "already sent"
+                // mark so a retry re-asserts the model instead of silently running without one.
+                *rt.model_sent.lock().unwrap() = None;
+                (false, Some(msg), false)
+            } else {
+                (false, None, false)
+            }
+        }
+        KimiLine::Response { id, .. } => {
+            let mut prompt_req = rt.prompt_req.lock().unwrap();
+            if *prompt_req == Some(id) {
+                *prompt_req = None;
+                (true, None, true) // the stopReason line — forwarded, ends the turn
+            } else {
+                (false, None, false) // set_model / set_mode ack — swallowed
+            }
+        }
+        KimiLine::Other => (false, None, rt.forwarding.load(Ordering::SeqCst)),
     }
 }
 
@@ -639,6 +826,76 @@ mod tests {
         assert_eq!(end, false);
         assert_eq!(fail.as_deref(), Some("bad params"));
         assert!(rt.turn_req.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn pump_kimi_line_opens_the_session_and_ends_the_turn_on_the_prompt_response() {
+        let rt = KimiRuntime::new(None);
+        // notification BEFORE the session opens → suppressed (replay guard)
+        let note = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"H"}}}}"#;
+        assert_eq!(pump_kimi_line(&rt, note), (false, None, false));
+
+        // session/new response (id 2) → session id learned, gate opened, waiter fired, NOT forwarded
+        let open = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1","configOptions":[]}}"#;
+        assert_eq!(pump_kimi_line(&rt, open), (false, None, false));
+        assert_eq!(rt.session_id.lock().unwrap().as_deref(), Some("s1"));
+        assert!(rt.session_ready_tx.lock().unwrap().is_none()); // oneshot consumed
+
+        // notification after ready → forwarded
+        assert_eq!(pump_kimi_line(&rt, note), (false, None, true));
+        // server request (permission) → forwarded too, TS answers it
+        let perm = r#"{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{}}"#;
+        assert_eq!(pump_kimi_line(&rt, perm), (false, None, true));
+
+        *rt.prompt_req.lock().unwrap() = Some(5);
+        // a set_model / set_mode ack is swallowed and does NOT end the turn
+        assert_eq!(pump_kimi_line(&rt, r#"{"jsonrpc":"2.0","id":3,"result":{}}"#), (false, None, false));
+        // the prompt response ends the turn AND is forwarded (transform reads stopReason)
+        let done = r#"{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}"#;
+        assert_eq!(pump_kimi_line(&rt, done), (true, None, true));
+        assert!(rt.prompt_req.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn pump_kimi_line_surfaces_auth_errors_with_the_login_hint() {
+        // Fresh spawn: the session-open error goes to begin_turn's waiter
+        let rt = KimiRuntime::new(None);
+        let auth_err = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}}"#;
+        assert_eq!(pump_kimi_line(&rt, auth_err), (false, None, false));
+        let rx = rt.session_ready_rx.try_lock().unwrap().take().unwrap();
+        let err = rx.blocking_recv().unwrap().unwrap_err();
+        assert!(err.contains("kimi login"), "hint missing: {}", err);
+
+        // Resume path (session id pre-set, waiter unused): an error while the prompt is in
+        // flight fails the turn instead
+        let rt = KimiRuntime::new(Some("s1".into()));
+        rt.session_ready_tx.lock().unwrap().take(); // waiter already consumed by a prior turn
+        *rt.prompt_req.lock().unwrap() = Some(4);
+        let (end, fail, _) = pump_kimi_line(&rt, r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}}"#);
+        assert_eq!(end, false);
+        assert!(fail.unwrap().contains("kimi login"));
+        assert!(rt.prompt_req.lock().unwrap().is_none());
+
+        // an error with no turn in flight is swallowed
+        let rt = KimiRuntime::new(Some("s1".into()));
+        rt.session_ready_tx.lock().unwrap().take();
+        assert_eq!(
+            pump_kimi_line(&rt, r#"{"jsonrpc":"2.0","id":9,"error":{"code":-1,"message":"nope"}}"#),
+            (false, None, false)
+        );
+    }
+
+    #[test]
+    fn kimi_runtime_presets_the_session_id_on_resume() {
+        let rt = KimiRuntime::new(Some("session_prev".into()));
+        assert_eq!(rt.session_id.lock().unwrap().as_deref(), Some("session_prev"));
+        // resume responses carry no sessionId — the pre-set id must survive the open response
+        let open = r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#;
+        pump_kimi_line(&rt, open);
+        assert_eq!(rt.session_id.lock().unwrap().as_deref(), Some("session_prev"));
+        assert!(rt.forwarding.load(Ordering::SeqCst));
+        // empty resume string = fresh session
+        assert!(KimiRuntime::new(Some(String::new())).session_id.lock().unwrap().is_none());
     }
 
     #[test]

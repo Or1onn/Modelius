@@ -1,6 +1,6 @@
 // compat.rs — generic OpenAI-compatible endpoints (Ollama, Groq, OpenRouter, …):
 // model listing + chat-completions SSE proxy, CORS-free. `provider` is only the error label.
-use crate::stream::{check_stream_status, http_client, json_or_err, pump_sse, StreamEvent};
+use crate::stream::{check_stream_status, http_client, json_or_err, pump_sse, rate_limit_headers, StreamEvent};
 use std::ops::ControlFlow;
 
 fn join_url(base: &str, path: &str) -> String {
@@ -29,6 +29,19 @@ pub async fn ollama_show(base_url: String, model: String) -> Result<serde_json::
         .await
         .map_err(|e| e.to_string())?;
     json_or_err(res, "Ollama").await
+}
+
+// GET https://openrouter.ai/api/v1/key — the key's spend limit + usage (USD). OpenRouter is the
+// only supported provider that exposes an account balance; others have no equivalent endpoint.
+#[tauri::command]
+pub async fn openrouter_key_status(key: String) -> Result<serde_json::Value, String> {
+    let res = http_client()
+        .get("https://openrouter.ai/api/v1/key")
+        .header("authorization", format!("Bearer {}", key))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    json_or_err(res, "OpenRouter").await
 }
 
 // POST {base}/chat/completions with stream:true; SSE parsed here, deltas over the channel.
@@ -61,6 +74,11 @@ pub async fn compat_chat_stream(
     let Some(res) = check_stream_status(res, &provider, &on_event).await else {
         return Ok(());
     };
+
+    let rl = rate_limit_headers(res.headers());
+    if !rl.is_empty() {
+        let _ = on_event.send(StreamEvent::RateLimit(rl));
+    }
 
     pump_sse(res, &cancel.flag, |data| {
         if data == "[DONE]" {

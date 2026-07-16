@@ -10,7 +10,8 @@ import { getCustomInstructions } from "@/entities/settings/model/settings";
 import { estimateTokens, ctxTokens } from "@/shared/lib/tokens";
 import { costOf, priceSource as priceSource_ } from "@/entities/model/lib/pricing";
 import type { Message, Decision, PolicyId, ImageRef } from "@/entities/model/model/registry";
-import type { ChatMsg, Delta, Backend, ModelOption } from "@/entities/model/model/backend";
+import { providerKeyForBackend, type ChatMsg, type Delta, type Backend, type ModelOption } from "@/entities/model/model/backend";
+import { addSpend, setChatProvider } from "@/entities/session/model/usageLimits";
 import { CODEX_MODELS, ctxForBackend, effortForDifficulty, type EffortLevel } from "@/entities/model/model/apiIds";
 import { peekAppCodexModels } from "@/entities/session/api/codexModels";
 import { pickBackend, pickSummarizerBackend, liveRoutingPool, modelAllowsWeb } from "@/features/pick-backend/model/pickBackend";
@@ -668,6 +669,10 @@ async function realSend(
         : costOf(backend.model, u)
       : undefined;
     const priceSource = cost != null ? (exact != null ? "live" : priceSource_(backend.model) ?? undefined) : undefined;
+    // Track the account this chat bills against (for the usage meter) and accumulate key spend.
+    const provKey = providerKeyForBackend(backend);
+    setChatProvider(s.chatId, provKey);
+    if (cost != null) addSpend(provKey, cost);
     const asstIndex = s.messages.length - 1; // this turn's assistant message; stable (append-only)
     patchAt(s, asstIndex, { ...finalizeFields(acc, reason, genImgs), usage: u, latencyMs, cost, priceSource, truncated: isMaxTokens(stopReason) || undefined });
     if (acc.trim()) void extractAndSave(acc); // persist large code the model returned

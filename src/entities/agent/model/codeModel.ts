@@ -1,4 +1,4 @@
-// codeModel.ts — the Code-mode model selection. Native kinds ("anthropic"/"codex") run
+// codeModel.ts — the Code-mode model selection. Native kinds ("anthropic"/"codex"/"kimi") run
 // the CLI on its own login; "ollama"/"connected"/"gateway" re-route the CLI through the per-run
 // local gateway (see src-tauri/src/gateway.rs) toward the picked endpoint. Which kinds fit which
 // harness is derived from the harness registry (protocol/routable/native), not hardcoded.
@@ -7,10 +7,13 @@ import { LIVE_ANTHROPIC, MODEL_BY_ID } from "@/entities/model/model/registry";
 import { HARNESS_BY_ID, type NativeKind } from "@/entities/agent/model/harnesses";
 import { getGateways } from "@/entities/agent/model/gateways";
 import { peekAppCodexModels } from "@/entities/session/api/codexModels";
+import { peekAppKimiModels } from "@/entities/session/api/kimiModels";
+import { ctxTokens } from "@/shared/lib/tokens";
 
 export type CodeModelChoice =
   | { kind: "anthropic"; id: string; label: string }
   | { kind: "codex"; id: string; label: string }
+  | { kind: "kimi"; id: string; label: string }
   | { kind: "ollama"; id: string; label: string }
   | { kind: "connected"; id: string; label: string; providerId: string }
   | { kind: "gateway"; id: string; label: string; gatewayId: string };
@@ -27,13 +30,15 @@ export function nativeChoice(kind: NativeKind, id: string, label: string): CodeM
       return { kind: "anthropic", id, label };
     case "codex":
       return { kind: "codex", id, label };
+    case "kimi":
+      return { kind: "kimi", id, label };
   }
 }
 
 export function choiceFitsHarness(choice: CodeModelChoice, harnessId: string): boolean {
   const h = HARNESS_BY_ID[harnessId];
   if (!h) return false;
-  if (choice.kind === "anthropic" || choice.kind === "codex")
+  if (choice.kind === "anthropic" || choice.kind === "codex" || choice.kind === "kimi")
     return h.native?.kind === choice.kind;
   if (!h.routable) return false;
   if (choice.kind === "gateway") {
@@ -55,6 +60,15 @@ export function defaultModelForHarness(harnessId: string): CodeModelChoice {
       if (live?.length) {
         const m = live.find((x) => x.isDefault) ?? live[0];
         return nativeChoice("codex", m.id, m.name);
+      }
+    }
+    // Kimi: same live-first rule — the CLI's own catalog (and its currentValue default) beats
+    // the static guess once discovery has run.
+    if (h.native.kind === "kimi") {
+      const live = peekAppKimiModels();
+      if (live?.length) {
+        const m = live.find((x) => x.isDefault) ?? live[0];
+        return nativeChoice("kimi", m.id, m.name);
       }
     }
     const m = h.native.models()[0];
@@ -82,4 +96,18 @@ export function choiceKey(c: CodeModelChoice): string {
 
 export function sameChoice(a: CodeModelChoice, b: CodeModelChoice): boolean {
   return choiceKey(a) === choiceKey(b);
+}
+
+// Context-window size (in tokens) for a Code-mode pick, for the context-fill ring. No model list or
+// CLI event carries this, so: registry hit first (exact id), then per-family defaults matching what
+// each CLI hardcodes internally. 0 = unknown → the ring shows "?" rather than a wrong denominator.
+export function codeContextTokens(model: CodeModelChoice): number {
+  const reg = MODEL_BY_ID[model.id];
+  if (reg?.ctx) return ctxTokens(reg.ctx);
+  const id = model.id.toLowerCase();
+  // Opus is 1M; other Claude models 200K (unless an explicit 1M-context id).
+  if (model.kind === "anthropic") return ctxTokens(id.includes("opus") || id.includes("[1m]") || id.includes("-1m") ? "1M" : "200K");
+  if (model.kind === "codex") return ctxTokens("400K"); // gpt-5.x family
+  if (model.kind === "kimi") return ctxTokens("256K"); // kimi k2.x family
+  return 0; // connected / ollama / gateway — arbitrary third-party model, size unknown
 }

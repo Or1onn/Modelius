@@ -1,6 +1,6 @@
 // openai.rs — "Sign in with ChatGPT" (Codex OAuth): loopback callback capture,
 // token exchange/refresh, and the Responses API streaming proxy.
-use crate::stream::{check_stream_status, http_client, json_or_err, pump_sse, StreamEvent};
+use crate::stream::{check_stream_status, http_client, json_or_err, pump_sse, rate_limit_headers, StreamEvent};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -117,6 +117,35 @@ pub async fn openai_oauth_token(form: HashMap<String, String>) -> Result<serde_j
 
 // Stream a completion from the ChatGPT subscription backend (Responses API).
 // Runs from Rust to use the OAuth bearer token without browser-origin/CORS limits.
+// Fetch the ChatGPT subscription's remaining usage for the Code-mode meter (the codex CLI hides
+// response headers). A minimal non-streaming Responses call — we read only the rate-limit response
+// headers; the tiny body is discarded. Best-effort: returns an empty map if the backend rejects it.
+#[tauri::command]
+pub async fn chatgpt_usage(token: String, account_id: String, model: String) -> Result<HashMap<String, String>, String> {
+    // The codex responses endpoint only serves streaming ("Stream must be set to true"); the
+    // rate-limit headers arrive on the response head, so we read them and drop the stream unread.
+    let body = serde_json::json!({
+        "model": model,
+        "instructions": ".",
+        "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "." }] }],
+        "stream": true,
+        "store": false,
+    });
+    let mut builder = http_client()
+        .post("https://chatgpt.com/backend-api/codex/responses")
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("authorization", format!("Bearer {}", token))
+        .header("openai-beta", "responses=experimental")
+        .header("originator", "codex_cli_rs")
+        .json(&body);
+    if !account_id.is_empty() {
+        builder = builder.header("chatgpt-account-id", account_id);
+    }
+    let res = builder.send().await.map_err(|e| e.to_string())?;
+    Ok(rate_limit_headers(res.headers()))
+}
+
 #[tauri::command]
 pub async fn openai_responses_stream(
     body: serde_json::Value,
@@ -142,6 +171,11 @@ pub async fn openai_responses_stream(
     let Some(res) = check_stream_status(res, "ChatGPT", &on_event).await else {
         return Ok(());
     };
+
+    let rl = rate_limit_headers(res.headers());
+    if !rl.is_empty() {
+        let _ = on_event.send(StreamEvent::RateLimit(rl));
+    }
 
     pump_sse(res, &cancel.flag, |data| {
         if data == "[DONE]" {

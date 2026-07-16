@@ -9,6 +9,7 @@ mod gateway;
 mod git;
 mod harness;
 mod installer;
+mod kimi_proto;
 mod node_runtime;
 mod openai;
 mod secrets;
@@ -45,17 +46,21 @@ pub fn run() {
             anthropic::anthropic_oauth_token,
             anthropic::anthropic_list_models,
             anthropic::anthropic_messages_stream,
+            anthropic::anthropic_usage,
             openai::openai_await_callback,
             openai::openai_oauth_token,
             openai::openai_responses_stream,
+            openai::chatgpt_usage,
             compat::compat_list_models,
             compat::compat_chat_stream,
+            compat::openrouter_key_status,
             compat::ollama_show,
             stream::cancel_stream,
             agent::agent_run,
             agent::agent_respond,
             agent::agent_session_close,
             agent::codex_list_models,
+            agent::kimi_list_models,
             installer::harness_status,
             installer::harness_install,
             installer::harness_logged_in,
