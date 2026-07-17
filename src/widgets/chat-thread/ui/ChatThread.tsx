@@ -1,10 +1,13 @@
 // ChatThread.tsx — scrolling message list: user/assistant turns, reasoning + memory notes, routing rows.
-import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+// Rows are memoized: during streaming only the last message object changes identity (the store
+// clones just the streaming message), so every settled row skips its re-render per token.
+import { Fragment, memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { branchGroup } from "@/pages/chat/lib/branches";
 import { ModelBadge } from "@/entities/model/ui/ModelBadge";
 import { Markdown, segmentBody } from "@/shared/lib/markdown";
 import { fmtCompact } from "@/shared/lib/tokens";
+import { useCopyButton } from "@/shared/lib/useCopyButton";
 import { useAutosize } from "@/shared/lib/useAutosize";
 import { POLICIES, type PolicyId, type Message } from "@/entities/model/model/registry";
 import { isLargeBlock, isFileArtifact, makeArtifact, wrapFence, type Artifact } from "@/entities/artifact/model/artifacts";
@@ -93,7 +96,7 @@ function UserContent({
 }
 
 // A user turn with an inline edit affordance. Editing truncates the thread from here and resends.
-function UserRow({
+const UserRow = memo(function UserRow({
   msg,
   index,
   canEdit,
@@ -181,7 +184,7 @@ function UserRow({
       </div>
     </div>
   );
-}
+});
 
 // An assistant answer: prose as markdown; a code block as a card when large (≥15 lines / 4 KB),
 // else inline. Same size test while streaming, so a small block stays inline from its first token.
@@ -248,18 +251,10 @@ function MemoryNote({ facts }: { facts: string[] }) {
 
 // Per-answer actions: copy (with brief "copied" feedback) and regenerate (last turn only).
 function AsstActions({ text, canRegenerate, onRegenerate }: { text: string; canRegenerate: boolean; onRegenerate?: () => void }) {
-  const [copied, setCopied] = useState(false);
-  const copy = () =>
-    navigator.clipboard?.writeText(text).then(
-      () => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1400);
-      },
-      () => {}
-    );
+  const { copied, copy } = useCopyButton();
   return (
     <>
-      <button className="asst-act" title={copied ? "Copied" : "Copy"} onClick={copy}>
+      <button className="asst-act" title={copied ? "Copied" : "Copy"} onClick={() => copy(text)}>
         <Icon name={copied ? "check" : "copy"} size={15} />
       </button>
       {canRegenerate && (
@@ -270,6 +265,104 @@ function AsstActions({ text, canRegenerate, onRegenerate }: { text: string; canR
     </>
   );
 }
+
+// $ meta for a turn: only metered turns show a cost; subscription/offline (usage, no cost)
+// shows nothing. No estimate while streaming (it would vanish at completion on a subscription) —
+// the estimate branch is only for static seed turns.
+function costMeta(msg: Message): ReactNode {
+  if (msg.cost != null)
+    return <span className="asst-meta mono">${msg.cost > 0 && msg.cost < 0.001 ? msg.cost.toFixed(6) : msg.cost.toFixed(4)}</span>;
+  if (!msg.usage && !msg.streaming)
+    return (
+      <span className="asst-meta mono">
+        {msg.decision!.chosenCost === 0 ? "free" : "$" + msg.decision!.chosenCost.toFixed(4)}
+      </span>
+    );
+  return null;
+}
+
+// An assistant turn: model badge + meta head, reasoning, body, memory note, actions foot.
+const AsstRow = memo(function AsstRow({
+  msg,
+  index,
+  isLast,
+  phase,
+  onOpenBlock,
+  onRegenerate,
+  onContinue,
+}: {
+  msg: Message;
+  index: number;
+  isLast: boolean;
+  phase: "idle" | "routing" | "streaming";
+  onOpenBlock: (msgIndex: number, blockIndex: number) => void;
+  onRegenerate?: () => void;
+  onContinue?: () => void;
+}) {
+  return (
+    <div className={"row-asst" + (!msg.streaming && msg.text.startsWith("⚠️ ") ? " asst-error" : "")}>
+      <div className="asst-head">
+        {msg.modelLabel ? (
+          <ModelBadge label={msg.modelLabel} provider={msg.modelProvider} size="sm" />
+        ) : (
+          <ModelBadge modelId={msg.decision!.chosen.id} model={msg.decision!.chosen} size="sm" />
+        )}
+        <span className="asst-meta">
+          <Icon name="bolt" size={11} style={{ opacity: 0.6 }} />
+          {msg.latencyMs != null ? (msg.latencyMs / 1000).toFixed(1) : msg.decision!.latency}s
+        </span>
+        {msg.usage && (
+          <span className="asst-meta mono" title="tokens sent / received / reasoning">
+            ↑ {fmtCompact(msg.usage.inputTokens)} ↓ {fmtCompact(msg.usage.outputTokens)}
+            {!!msg.usage.reasoningTokens && <> ⟳ {fmtCompact(msg.usage.reasoningTokens)}</>}
+          </span>
+        )}
+        {costMeta(msg)}
+        {msg.ts && !msg.streaming && (
+          <span className="asst-meta msg-ts" title={fmtFull(msg.ts)}>
+            {fmtTime(msg.ts)}
+          </span>
+        )}
+      </div>
+      {msg.reasoning && <ReasoningBlock text={msg.reasoning} streaming={!!msg.streaming} />}
+      <div className="asst-body md">
+        <AssistantBody
+          text={msg.streaming ? msg.shown || "" : msg.text}
+          streaming={!!msg.streaming && msg.text === ""}
+          onOpen={(bi) => onOpenBlock(index, bi)}
+        />
+        {msg.genImages && msg.genImages.length > 0 && (
+          <div className="asst-images">
+            {msg.genImages.map((u, k) => (
+              <img className="asst-image" key={k} src={u} alt="Generated image" />
+            ))}
+          </div>
+        )}
+        {msg.streaming && <span className="cursor" />}
+      </div>
+      {msg.memory && msg.memory.length > 0 && <MemoryNote facts={msg.memory} />}
+      {!msg.streaming &&
+        (msg.text.startsWith("⚠️ ") && phase === "idle" && isLast ? (
+          <div className="asst-foot">
+            <button className="retry-btn" onClick={onRegenerate}>
+              <Icon name="refresh" size={14} />
+              Retry
+            </button>
+          </div>
+        ) : (
+          <div className="asst-foot">
+            <AsstActions text={msg.text} canRegenerate={phase === "idle" && isLast} onRegenerate={onRegenerate} />
+            {msg.truncated && phase === "idle" && isLast && (
+              <button className="continue-btn" onClick={onContinue} title="Response cut off by the token limit">
+                <Icon name="arrowR" size={14} />
+                Continue
+              </button>
+            )}
+          </div>
+        ))}
+    </div>
+  );
+});
 
 // ◀ k/n ▶ switcher shown at a branch divergence point. `align` matches the diverging turn's side.
 function BranchNav({ n, k, align, onPrev, onNext }: { n: number; k: number; align: "user" | "asst"; onPrev: () => void; onNext: () => void }) {
@@ -373,89 +466,18 @@ export function ChatThread({
           ) : null;
           const row =
             msg.role === "user" ? (
-              <UserRow
+              <UserRow msg={msg} index={i} canEdit={phase === "idle"} onOpenBlock={onOpenBlock} onEditResend={onEditResend} />
+            ) : (
+              <AsstRow
                 msg={msg}
                 index={i}
-              canEdit={phase === "idle"}
-              onOpenBlock={onOpenBlock}
-              onEditResend={onEditResend}
-            />
-          ) : (
-            <div className={"row-asst" + (!msg.streaming && msg.text.startsWith("⚠️ ") ? " asst-error" : "")}>
-              <div className="asst-head">
-                {msg.modelLabel ? (
-                  <ModelBadge label={msg.modelLabel} provider={msg.modelProvider} size="sm" />
-                ) : (
-                  <ModelBadge modelId={msg.decision!.chosen.id} model={msg.decision!.chosen} size="sm" />
-                )}
-                <span className="asst-meta">
-                  <Icon name="bolt" size={11} style={{ opacity: 0.6 }} />
-                  {msg.latencyMs != null ? (msg.latencyMs / 1000).toFixed(1) : msg.decision!.latency}s
-                </span>
-                {msg.usage && (
-                  <span className="asst-meta mono" title="tokens sent / received / reasoning">
-                    ↑ {fmtCompact(msg.usage.inputTokens)} ↓ {fmtCompact(msg.usage.outputTokens)}
-                    {!!msg.usage.reasoningTokens && <> ⟳ {fmtCompact(msg.usage.reasoningTokens)}</>}
-                  </span>
-                )}
-                {/* $ only for metered turns; subscription/offline (usage, no cost) shows nothing.
-                    No estimate while streaming (would vanish at completion on a subscription).
-                    The estimate branch is only for static seed turns. */}
-                {msg.cost != null ? (
-                  <span className="asst-meta mono">${msg.cost > 0 && msg.cost < 0.001 ? msg.cost.toFixed(6) : msg.cost.toFixed(4)}</span>
-                ) : !msg.usage && !msg.streaming ? (
-                  <span className="asst-meta mono">
-                    {msg.decision!.chosenCost === 0 ? "free" : "$" + msg.decision!.chosenCost.toFixed(4)}
-                  </span>
-                ) : null}
-                {msg.ts && !msg.streaming && (
-                  <span className="asst-meta msg-ts" title={fmtFull(msg.ts)}>
-                    {fmtTime(msg.ts)}
-                  </span>
-                )}
-              </div>
-              {msg.reasoning && <ReasoningBlock text={msg.reasoning} streaming={!!msg.streaming} />}
-              <div className="asst-body md">
-                <AssistantBody
-                  text={msg.streaming ? msg.shown || "" : msg.text}
-                  streaming={!!msg.streaming && msg.text === ""}
-                  onOpen={(bi) => onOpenBlock(i, bi)}
-                />
-                {msg.genImages && msg.genImages.length > 0 && (
-                  <div className="asst-images">
-                    {msg.genImages.map((u, k) => (
-                      <img className="asst-image" key={k} src={u} alt="Generated image" />
-                    ))}
-                  </div>
-                )}
-                {msg.streaming && <span className="cursor" />}
-              </div>
-              {msg.memory && msg.memory.length > 0 && <MemoryNote facts={msg.memory} />}
-              {!msg.streaming &&
-                (msg.text.startsWith("⚠️ ") && phase === "idle" && i === messages.length - 1 ? (
-                  <div className="asst-foot">
-                    <button className="retry-btn" onClick={onRegenerate}>
-                      <Icon name="refresh" size={14} />
-                      Retry
-                    </button>
-                  </div>
-                ) : (
-                  <div className="asst-foot">
-                    <AsstActions
-                      text={msg.text}
-                      canRegenerate={phase === "idle" && i === messages.length - 1}
-                      onRegenerate={onRegenerate}
-                    />
-                    {msg.truncated && phase === "idle" && i === messages.length - 1 && (
-                      <button className="continue-btn" onClick={onContinue} title="Response cut off by the token limit">
-                        <Icon name="arrowR" size={14} />
-                        Continue
-                      </button>
-                    )}
-                  </div>
-                ))}
-            </div>
-          );
+                isLast={i === messages.length - 1}
+                phase={phase}
+                onOpenBlock={onOpenBlock}
+                onRegenerate={onRegenerate}
+                onContinue={onContinue}
+              />
+            );
           return (
             <Fragment key={i}>
               {row}

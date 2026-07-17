@@ -1,42 +1,38 @@
 import type {MCPServer, MCPServerStatus, MessageMetadata, UIMessageChunk} from "./uiMessageChunk";
+import { finishTurn, startGate } from "./baseTransformer";
 
 export function createTransformer() {
   let textId: string | null = null
   let textStarted = false
-  let started = false
-  let startTime: number | null = null
+  const gate = startGate()
 
-  // Track streaming tool calls
   let currentToolCallId: string | null = null
   let currentToolName: string | null = null
   let accumulatedToolInput = ""
 
-  // Track already emitted tool IDs to avoid duplicates
-  // (tools can come via streaming AND in the final assistant message)
+  // Tools can arrive via streaming AND in the final assistant message — dedupe by id.
   const emittedToolIds = new Set<string>()
 
-  // Track the last text block ID for final response marking
-  // This is used to identify when there's a "final text" response after tools
+  // Last closed text block — marks the "final text" response after tools.
   let lastTextId: string | null = null
 
-  // Track parent tool context for nested tools (e.g., Explore agent)
+  // Parent tool context for nested tools (e.g., Explore agent)
   let currentParentToolUseId: string | null = null
 
-  // Map original toolCallId -> composite toolCallId (for tool-result matching)
+  // Original toolCallId -> composite toolCallId (for tool-result matching)
   const toolIdMapping = new Map<string, string>()
 
-  // Track compacting system tool for matching status->boundary events
+  // Compacting system tool, for matching status->boundary events
   let lastCompactId: string | null = null
   let compactCounter = 0
 
-  // Track streaming thinking for Extended Thinking
   let currentThinkingId: string | null = null
   let accumulatedThinking = ""
-  let inThinkingBlock = false // Track if we're currently in a thinking block
-  let thinkingJsonStarted = false // Track if we've sent the JSON prefix for thinking deltas
+  let inThinkingBlock = false
+  let thinkingJsonStarted = false // JSON prefix for thinking deltas sent yet?
 
-  // Track usage from the last main assistant message (exclude sidechain/subagents).
-  // This is used for accurate context window display in final metadata.
+  // Usage from the last main (non-sidechain/subagent) assistant message — feeds the
+  // context-window display in final metadata.
   let lastMainAssistantUsage: {
     input_tokens: number
     cache_read_input_tokens: number
@@ -44,7 +40,6 @@ export function createTransformer() {
     output_tokens: number
   } | null = null
 
-  // Helper to create composite toolCallId: "parentId:childId" or just "childId"
   const makeCompositeId = (originalId: string, parentId: string | null): string => {
     if (parentId) return `${parentId}:${originalId}`
     return originalId
@@ -52,21 +47,17 @@ export function createTransformer() {
 
   const genId = () => `text-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
 
-  // Helper to end current text block
   function* endTextBlock(): Generator<UIMessageChunk> {
     if (textStarted && textId) {
       yield { type: "text-end", id: textId }
-      // Track the last text ID for final response marking
       lastTextId = textId
       textStarted = false
       textId = null
     }
   }
 
-  // Helper to end current tool input
   function* endToolInput(): Generator<UIMessageChunk> {
     if (currentToolCallId) {
-      // Track this tool ID to avoid duplicates from assistant message
       emittedToolIds.add(currentToolCallId)
 
       let parsedInput = {}
@@ -103,13 +94,7 @@ export function createTransformer() {
       currentParentToolUseId = msg.parent_tool_use_id
     }
 
-    // Emit start once
-    if (!started) {
-      started = true
-      startTime = Date.now()
-      yield { type: "start" }
-      yield { type: "start-step" }
-    }
+    yield* gate.ensure()
 
     // Reset thinking state on new message start to prevent memory leaks
     if (msg.type === "stream_event" && msg.event?.type === "message_start") {
@@ -463,14 +448,12 @@ export function createTransformer() {
             ? resolvedInputTokens + resolvedOutputTokens
             : undefined,
         totalCostUsd: msg.total_cost_usd,
-        durationMs: startTime ? Date.now() - startTime : undefined,
+        durationMs: gate.elapsed(),
         resultSubtype: msg.subtype || "success",
         // Include finalTextId for collapsing tools when there's a final response
         finalTextId: lastTextId || undefined,
       }
-      yield { type: "message-metadata", messageMetadata: metadata }
-      yield { type: "finish-step" }
-      yield { type: "finish", messageMetadata: metadata }
+      yield* finishTurn(metadata)
     }
   }
 }

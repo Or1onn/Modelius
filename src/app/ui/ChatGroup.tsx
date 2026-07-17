@@ -221,8 +221,11 @@ function ChatMenu({
     });
   }, [x, y]);
 
+  // onClose is kept in a ref so the window listeners register once, not per parent render.
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   useEffect(() => {
-    const close = () => onClose();
+    const close = () => closeRef.current();
     window.addEventListener("pointerdown", close);
     window.addEventListener("resize", close);
     window.addEventListener("blur", close);
@@ -231,7 +234,7 @@ function ChatMenu({
       window.removeEventListener("resize", close);
       window.removeEventListener("blur", close);
     };
-  }, [onClose]);
+  }, []);
 
   return createPortal(
     <div

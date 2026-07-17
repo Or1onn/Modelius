@@ -5,6 +5,7 @@ import { useEffect, useReducer } from "react";
 import type { Message } from "@/entities/model/model/registry";
 import { isTauri } from "@/shared/api/tauri";
 import { vaultEncrypt, vaultDecrypt } from "@/shared/api/secrets";
+import { lastOfRole } from "@/shared/lib/lastOfRole";
 
 // ---- Index (encrypted localStorage blob + in-RAM cache, reactive) ----
 
@@ -278,7 +279,7 @@ export function indexEntryFrom(
 ): ChatIndexEntry | null {
   const firstUser = messages.find((m) => m.role === "user");
   if (!firstUser) return null; // skip empty chats
-  const lastAsst = [...messages].reverse().find((m) => m.role === "assistant");
+  const lastAsst = lastOfRole(messages, "assistant");
   const firstMsg = firstUser.text.trim().replace(/\s+/g, " ").slice(0, 60);
   const fallback = (settled && firstMsg) || "New chat";
   return {

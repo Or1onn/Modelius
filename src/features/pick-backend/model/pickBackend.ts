@@ -236,50 +236,69 @@ const claudeFallbackModels = (): { id: string; name: string }[] =>
     name: `Claude ${f[0].toUpperCase()}${f.slice(1)}`,
   }));
 
+// One assembler for the async list and its sync cache mirror: the connection precedence
+// (ChatGPT OAuth over an OpenAI key; Claude OAuth over a key — matches streamClaude) lives
+// here once, the per-source model resolvers differ per variant.
+function assembleOptions(src: {
+  codexModels: () => { id: string; name: string }[];
+  openaiKeyModels: () => RemoteModel[];
+  claudeOauthModels: () => { id: string; name: string }[];
+  anthropicKeyModels: () => RemoteModel[];
+  keyProviderModels: (pid: (typeof KEY_PROVIDER_IDS)[number]) => RemoteModel[];
+  ollamaModels: () => RemoteModel[];
+}): ModelOption[] {
+  const out: ModelOption[] = [];
+  if (hasOpenAIOAuth()) out.push(...codexOptions(src.codexModels()));
+  else if (hasKey("openai")) out.push(...openaiOptions(src.openaiKeyModels()));
+  if (hasAnthropicOAuth()) out.push(...anthropicOptions(src.claudeOauthModels()));
+  else if (hasKey("anthropic")) out.push(...anthropicOptions(src.anthropicKeyModels()));
+  for (const pid of KEY_PROVIDER_IDS) if (hasKey(pid)) out.push(...keyProviderOptions(pid, src.keyProviderModels(pid)));
+  out.push(...ollamaOptions(src.ollamaModels()));
+  return out;
+}
+
 // User-pickable models by connection. ChatGPT account → curated Codex models (no
 // list endpoint); else a live list (sub via /v1/models, key via listModels).
 export async function listAvailableModels(): Promise<ModelOption[]> {
-  const out: ModelOption[] = [];
-
-  if (hasOpenAIOAuth()) {
-    const live = await listAppCodexModels().catch(() => [] as CodexModel[]);
-    out.push(...codexOptions(live.length ? live : CODEX_MODELS));
-  } else if (hasKey("openai")) out.push(...openaiOptions(await listModels("openai").catch(() => [] as RemoteModel[])));
-
-  // Prefer OAuth over key — matches streamClaude.
-  if (hasAnthropicOAuth()) {
-    const live = currentClaudeModels(await fetchClaudeSubscriptionModels().catch(() => [] as RemoteModel[]));
-    out.push(...anthropicOptions(live.length ? live : claudeFallbackModels()));
-  } else if (hasKey("anthropic")) {
-    out.push(...anthropicOptions(currentClaudeModels(await listModels("anthropic").catch(() => [] as RemoteModel[]))));
-  }
-
+  // Fetch up front, gated by the same connection checks the assembler applies, so an
+  // unconnected provider costs no network call.
+  const codex = hasOpenAIOAuth() ? await listAppCodexModels().catch(() => [] as CodexModel[]) : [];
+  const openaiKey = !hasOpenAIOAuth() && hasKey("openai") ? await listModels("openai").catch(() => [] as RemoteModel[]) : [];
+  const claude = hasAnthropicOAuth()
+    ? currentClaudeModels(await fetchClaudeSubscriptionModels().catch(() => [] as RemoteModel[]))
+    : [];
+  const anthropicKey =
+    !hasAnthropicOAuth() && hasKey("anthropic") ? await listModels("anthropic").catch(() => [] as RemoteModel[]) : [];
+  const keyed = new Map<string, RemoteModel[]>();
   for (const pid of KEY_PROVIDER_IDS)
-    if (hasKey(pid)) out.push(...keyProviderOptions(pid, await listKeyProviderModels(pid).catch(() => [] as RemoteModel[])));
-  out.push(...ollamaOptions(await listOllamaModels().catch(() => [] as RemoteModel[])));
-  return out;
+    if (hasKey(pid)) keyed.set(pid, await listKeyProviderModels(pid).catch(() => [] as RemoteModel[]));
+  const ollama = await listOllamaModels().catch(() => [] as RemoteModel[]);
+
+  return assembleOptions({
+    codexModels: () => (codex.length ? codex : CODEX_MODELS),
+    openaiKeyModels: () => openaiKey,
+    claudeOauthModels: () => (claude.length ? claude : claudeFallbackModels()),
+    anthropicKeyModels: () => currentClaudeModels(anthropicKey),
+    keyProviderModels: (pid) => keyed.get(pid) ?? [],
+    ollamaModels: () => ollama,
+  });
 }
 
 // Sync mirror of listAvailableModels from the cache — picker renders with no flash,
 // async revalidates. Cold entries fall back (current-gen for a Claude account) so a
 // connected provider never shows empty.
 export function peekAvailableModels(): ModelOption[] {
-  const out: ModelOption[] = [];
-
-  if (hasOpenAIOAuth()) out.push(...codexOptions(peekAppCodexModels() ?? CODEX_MODELS));
-  else if (hasKey("openai")) out.push(...openaiOptions(peekModels("openai") ?? []));
-
-  if (hasAnthropicOAuth()) {
-    const live = peekClaudeAccountModels();
-    out.push(...anthropicOptions(live?.length ? live : claudeFallbackModels()));
-  } else if (hasKey("anthropic")) {
-    out.push(...anthropicOptions(currentClaudeModels(peekModels("anthropic") ?? [])));
-  }
-
-  for (const pid of KEY_PROVIDER_IDS)
-    if (hasKey(pid)) out.push(...keyProviderOptions(pid, peekKeyProviderModels(pid) ?? []));
-  out.push(...ollamaOptions(peekOllamaModels() ?? []));
-  return out;
+  return assembleOptions({
+    codexModels: () => peekAppCodexModels() ?? CODEX_MODELS,
+    openaiKeyModels: () => peekModels("openai") ?? [],
+    claudeOauthModels: () => {
+      const live = peekClaudeAccountModels();
+      return live?.length ? live : claudeFallbackModels();
+    },
+    anthropicKeyModels: () => currentClaudeModels(peekModels("anthropic") ?? []),
+    keyProviderModels: (pid) => peekKeyProviderModels(pid) ?? [],
+    ollamaModels: () => peekOllamaModels() ?? [],
+  });
 }
 
 // Prefer the chosen model's provider, else any connected one. "none" → nothing

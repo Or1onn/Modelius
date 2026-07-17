@@ -23,6 +23,19 @@ export function langFromPath(file?: string): string | undefined {
   return ext ? EXT_LANG[ext] : undefined;
 }
 
+// Canonical artifact lang id → hljs name (only where the id isn't already an hljs alias).
+const CANON_LANG: Record<string, string> = {
+  tsx: "typescript", jsx: "javascript", rs: "rust", kt: "kotlin", rb: "ruby", md: "markdown", html: "xml",
+};
+
+// Highlighted HTML for an artifact's canonical lang id, or null when the language isn't
+// registered (caller renders the plain text itself).
+export function highlightArtifact(code: string, lang: string): string | null {
+  const name = CANON_LANG[lang] ?? lang;
+  if (name && hljs.getLanguage(name)) return hljs.highlight(code, { language: name }).value;
+  return null;
+}
+
 // Highlighted HTML for `code` in `lang` (hljs token markup), or the escaped text when the
 // language is unknown/unregistered. Safe to inject via dangerouslySetInnerHTML.
 export function highlightHtml(code: string, lang?: string): string {

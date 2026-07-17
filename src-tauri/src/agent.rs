@@ -146,7 +146,6 @@ fn spawn(
     program: &std::path::Path,
     args: &[String],
     cwd: &str,
-    extra_env: &[(&str, &str)],
     routed: Option<(&EnvSpec, &str, &str, &str)>,
     codex_home: Option<&std::path::Path>,
     claude_token: Option<&str>,
@@ -154,9 +153,6 @@ fn spawn(
     stdin_piped: bool,
 ) -> std::io::Result<tokio::process::Child> {
     let mut cmd = Command::new(program);
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
     cmd.args(args)
         .current_dir(cwd)
         .stdout(Stdio::piped())
@@ -167,7 +163,7 @@ fn spawn(
         .kill_on_drop(true);
     if let Some((env, gateway_url, token, model)) = routed {
         for k in env.base_url {
-            cmd.env(k, format!("{}{}", gateway_url, env.base_url_suffix));
+            cmd.env(k, gateway_url);
         }
         for k in env.api_key {
             cmd.env(k, token);
@@ -192,6 +188,59 @@ fn spawn(
         cmd.env("PATH", path);
     }
     cmd.spawn()
+}
+
+// npm-shipped CLIs are Node programs. If the system Node is missing or broken, silently
+// provision the app's portable runtime (one-time download) so the CLI's `node` shim never
+// picks a bad install. A managed native binary needs no Node at all — skip the probe.
+async fn ensure_node_for(
+    app: &tauri::AppHandle,
+    spec: &HarnessSpec,
+    program: &std::path::Path,
+) -> Result<(), String> {
+    if matches!(spec.install, crate::harness::Install::Npm(_))
+        && !crate::installer::is_native_install(app, program)
+        && !crate::node_runtime::system_node_acceptable()
+    {
+        crate::node_runtime::ensure(app).await?;
+    }
+    Ok(())
+}
+
+// Start a session gateway for a routed run: returns the gateway + its loopback origin, or
+// (None, None) for a native-login run. `target` = (protocol, base_url, api_key).
+async fn start_gateway_for(
+    spec: &HarnessSpec,
+    target: Option<(&str, &str, &str)>,
+) -> Result<(Option<crate::gateway::Gateway>, Option<String>), String> {
+    let Some((protocol, base_url, api_key)) = target else { return Ok((None, None)) };
+    let outbound = match protocol {
+        "anthropic" => crate::gateway::Proto::Anthropic,
+        "openai" => crate::gateway::Proto::OpenAi,
+        other => return Err(format!("unknown target protocol: {}", other)),
+    };
+    let gw = crate::gateway::start(crate::gateway::GatewayConfig {
+        inbound: spec.protocol,
+        outbound,
+        target_base: base_url.to_string(),
+        api_key: api_key.to_string(),
+    })
+    .await
+    .map_err(|e| format!("failed to start gateway: {}", e))?;
+    let url = format!("http://127.0.0.1:{}", gw.port);
+    Ok((Some(gw), Some(url)))
+}
+
+// RAII for agent_run's per-turn gateway: shuts it down on every exit path (including panics),
+// mirroring StdinGuard. Warm sessions instead carry their gateway inside AgentSession.
+struct GatewayGuard(Option<crate::gateway::Gateway>);
+
+impl Drop for GatewayGuard {
+    fn drop(&mut self) {
+        if let Some(g) = &self.0 {
+            g.shutdown();
+        }
+    }
 }
 
 // ChatGPT (Codex) OAuth tokens forwarded from the app's Providers login, used to run the codex
@@ -251,75 +300,80 @@ fn write_codex_home(app: &tauri::AppHandle, auth: &CodexAuth) -> Result<std::pat
 // handshake, one request, kill. Kept off the warm session registry (session.rs) because the warm
 // pump only tracks thread/turn ids and discards other response bodies. Returns the raw
 // `{data:[…]}` result; the webview maps it to picker entries + effort tiers (codexModels.ts).
+// Shared model-discovery probe: spawn a THROWAWAY CLI process on its stdio protocol (native run,
+// no gateway/model/effort/resume — argv from build_argv), write the pipelined handshake lines
+// (probe-verified spawn_warm pattern), and return the result of the response with `want_id`.
+// Server-request lines (carrying "method") never end the probe. Bounded by a 15s timeout so a
+// hung process can't wedge the command. `probe` names the awaited request in error messages.
+async fn probe_app_server(
+    app: &tauri::AppHandle,
+    spec: &'static HarnessSpec,
+    cwd: &str,
+    codex_home: Option<&std::path::Path>,
+    handshake: Vec<String>,
+    want_id: u64,
+    probe: &str,
+) -> Result<serde_json::Value, String> {
+    let program = crate::installer::resolve_bin(app, spec.bin)
+        .ok_or_else(|| format!("'{}' not found — install it from the Environment picker.", spec.bin))?;
+    ensure_node_for(app, spec, &program).await?;
+    let path_env = crate::node_runtime::child_path_env(app);
+    let args = build_argv(spec, "", "", "", None, None);
+    let argv0 = args.first().cloned().unwrap_or_default();
+    let mut child = spawn(&program, &args, cwd, None, codex_home, None, path_env.as_deref(), true)
+        .map_err(|e| format!("failed to start '{}' {}: {}", spec.bin, argv0, e))?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| "no stdin".to_string())?;
+    let stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
+
+    let write = async {
+        for line in &handshake {
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+        }
+        stdin.flush().await
+    };
+    if let Err(e) = write.await {
+        let _ = child.start_kill();
+        return Err(format!("failed to query {}: {}", probe, e));
+    }
+
+    let mut lines = BufReader::new(stdout).lines();
+    let read = async {
+        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            if v.get("id").and_then(|i| i.as_u64()) != Some(want_id) || v.get("method").is_some() {
+                continue;
+            }
+            if let Some(err) = v.get("error") {
+                return Err(err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{} failed", probe)));
+            }
+            return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
+        }
+        Err(format!("{} {} closed before answering {}", spec.bin, argv0, probe))
+    };
+    let out = tokio::time::timeout(std::time::Duration::from_secs(15), read).await;
+    let _ = child.start_kill();
+    out.unwrap_or_else(|_| Err(format!("{} {} timed out", spec.bin, probe)))
+}
+
 #[tauri::command]
 pub async fn codex_list_models(
     app: tauri::AppHandle,
     codex_auth: CodexAuth,
 ) -> Result<serde_json::Value, String> {
     let spec = crate::harness::spec("codex").ok_or_else(|| "codex harness missing".to_string())?;
-    let program = crate::installer::resolve_bin(&app, spec.bin)
-        .ok_or_else(|| format!("'{}' not found — install it from the Environment picker.", spec.bin))?;
-    // npm-shipped CLI is a Node program — provision the portable runtime if the system Node is
-    // unusable, mirroring agent_run so a broken `node` can't make this fail silently.
-    if matches!(spec.install, crate::harness::Install::Npm(_))
-        && !crate::installer::is_native_install(&app, &program)
-        && !crate::node_runtime::system_node_acceptable()
-    {
-        crate::node_runtime::ensure(&app).await?;
-    }
-    let path_env = crate::node_runtime::child_path_env(&app);
     let codex_home = write_codex_home(&app, &codex_auth)?;
-    // Native app-server run (no gateway/model/effort/resume): argv = ["app-server", "-c", …].
-    let args = build_argv(spec, "", "", "", None, None);
-    let mut child = spawn(
-        &program,
-        &args,
-        &codex_home.to_string_lossy(),
-        spec.extra_env,
-        None,
-        Some(codex_home.as_path()),
-        None,
-        path_env.as_deref(),
-        true,
-    )
-    .map_err(|e| format!("failed to start '{}' app-server: {}", spec.bin, e))?;
-
-    let mut stdin = child.stdin.take().ok_or_else(|| "no stdin".to_string())?;
-    let stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
-
-    // Handshake + model/list, pipelined without awaiting responses (probe-verified spawn_warm).
-    let write = async {
-        stdin.write_all(crate::codex_proto::initialize_line(1).as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.write_all(crate::codex_proto::initialized_line().as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.write_all(crate::codex_proto::model_list_line(2).as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await
-    };
-    if let Err(e) = write.await {
-        let _ = child.start_kill();
-        return Err(format!("failed to query model/list: {}", e));
-    }
-
-    // Read stdout until the id:2 response (or its error); bounded so a hung app-server can't wedge.
-    let mut lines = BufReader::new(stdout).lines();
-    let read = async {
-        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-            if v.get("id").and_then(|i| i.as_u64()) != Some(2) {
-                continue;
-            }
-            if let Some(err) = v.get("error") {
-                return Err(err.get("message").and_then(|m| m.as_str()).unwrap_or("model/list failed").to_string());
-            }
-            return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
-        }
-        Err("codex app-server closed before answering model/list".to_string())
-    };
-    let out = tokio::time::timeout(std::time::Duration::from_secs(15), read).await;
-    let _ = child.start_kill();
-    out.unwrap_or_else(|_| Err("codex model/list timed out".to_string()))
+    let handshake = vec![
+        crate::codex_proto::initialize_line(1),
+        crate::codex_proto::initialized_line(),
+        crate::codex_proto::model_list_line(2),
+    ];
+    probe_app_server(&app, spec, &codex_home.to_string_lossy(), Some(codex_home.as_path()), handshake, 2, "model/list").await
 }
 
 // List the Kimi models the signed-in account can run. ACP has no standalone model-list method
@@ -331,15 +385,6 @@ pub async fn codex_list_models(
 #[tauri::command]
 pub async fn kimi_list_models(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let spec = crate::harness::spec("kimi-code").ok_or_else(|| "kimi harness missing".to_string())?;
-    let program = crate::installer::resolve_bin(&app, spec.bin)
-        .ok_or_else(|| format!("'{}' not found — install it from the Environment picker.", spec.bin))?;
-    if matches!(spec.install, crate::harness::Install::Npm(_))
-        && !crate::installer::is_native_install(&app, &program)
-        && !crate::node_runtime::system_node_acceptable()
-    {
-        crate::node_runtime::ensure(&app).await?;
-    }
-    let path_env = crate::node_runtime::child_path_env(&app);
     // session/new needs an existing cwd; the user's home dir always is.
     let cwd = {
         use tauri::Manager;
@@ -349,44 +394,11 @@ pub async fn kimi_list_models(app: tauri::AppHandle) -> Result<serde_json::Value
             .to_string_lossy()
             .into_owned()
     };
-    let args = build_argv(spec, "", "", "", None, None); // = ["acp"]
-    let mut child = spawn(&program, &args, &cwd, spec.extra_env, None, None, None, path_env.as_deref(), true)
-        .map_err(|e| format!("failed to start '{}' acp: {}", spec.bin, e))?;
-
-    let mut stdin = child.stdin.take().ok_or_else(|| "no stdin".to_string())?;
-    let stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
-
-    // Pipelined handshake + session open (probe-verified spawn_warm pattern).
-    let write = async {
-        stdin.write_all(crate::kimi_proto::initialize_line(1).as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.write_all(crate::kimi_proto::session_open_line(2, None, &cwd).as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await
-    };
-    if let Err(e) = write.await {
-        let _ = child.start_kill();
-        return Err(format!("failed to query kimi models: {}", e));
-    }
-
-    // Read stdout until the id:2 response (or its error); bounded so a hung acp can't wedge.
-    let mut lines = BufReader::new(stdout).lines();
-    let read = async {
-        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-            if v.get("id").and_then(|i| i.as_u64()) != Some(2) || v.get("method").is_some() {
-                continue;
-            }
-            if let Some(err) = v.get("error") {
-                return Err(err.get("message").and_then(|m| m.as_str()).unwrap_or("session/new failed").to_string());
-            }
-            return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
-        }
-        Err("kimi acp closed before answering session/new".to_string())
-    };
-    let out = tokio::time::timeout(std::time::Duration::from_secs(15), read).await;
-    let _ = child.start_kill();
-    out.unwrap_or_else(|_| Err("kimi model discovery timed out".to_string()))
+    let handshake = vec![
+        crate::kimi_proto::initialize_line(1),
+        crate::kimi_proto::session_open_line(2, None, &cwd),
+    ];
+    probe_app_server(&app, spec, &cwd, None, handshake, 2, "session/new").await
 }
 
 // Run a harness turn: stream the CLI's stdout as agent events, honor cancellation. `target`
@@ -420,17 +432,9 @@ pub async fn agent_run(
             return Err(msg);
         }
     };
-    // npm-shipped CLIs are Node programs. If the system Node is missing or broken, silently
-    // provision the app's portable runtime (one-time download) so the CLI's `node` shim never
-    // picks a bad install. A managed native binary needs no Node at all — skip the probe.
-    if matches!(spec.install, crate::harness::Install::Npm(_))
-        && !crate::installer::is_native_install(&app, &program)
-        && !crate::node_runtime::system_node_acceptable()
-    {
-        if let Err(e) = crate::node_runtime::ensure(&app).await {
-            let _ = on_event.send(PipeEvent::Error(e.clone()));
-            return Err(e);
-        }
+    if let Err(e) = ensure_node_for(&app, spec, &program).await {
+        let _ = on_event.send(PipeEvent::Error(e.clone()));
+        return Err(e);
     }
     let path_env = crate::node_runtime::child_path_env(&app);
 
@@ -479,29 +483,12 @@ pub async fn agent_run(
         Some(a) => Some(write_codex_home(&app, a)?),
         None => None,
     };
-    let gateway = match &target {
-        Some(t) => {
-            let outbound = match t.protocol.as_str() {
-                "anthropic" => crate::gateway::Proto::Anthropic,
-                "openai" => crate::gateway::Proto::OpenAi,
-                other => return Err(format!("unknown target protocol: {}", other)),
-            };
-            Some(
-                crate::gateway::start(crate::gateway::GatewayConfig {
-                    inbound: spec.protocol,
-                    outbound,
-                    target_base: t.base_url.clone(),
-                    api_key: t.api_key.clone(),
-                })
-                .await
-                .map_err(|e| format!("failed to start gateway: {}", e))?,
-            )
-        }
-        None => None,
-    };
-
-    let gateway_url = gateway.as_ref().map(|g| format!("http://127.0.0.1:{}", g.port));
+    let target_ref = target.as_ref().map(|t| (t.protocol.as_str(), t.base_url.as_str(), t.api_key.as_str()));
+    let (gw, gateway_url) = start_gateway_for(spec, target_ref).await?;
+    // The guard shuts the gateway down on every exit path below (including panics).
+    let gateway = GatewayGuard(gw);
     let routed = gateway
+        .0
         .as_ref()
         .zip(gateway_url.as_deref())
         .map(|(g, url)| (&spec.env, url, g.token.as_str(), model.as_str()));
@@ -509,12 +496,9 @@ pub async fn agent_run(
     // Built here (not before the gateway) so Arg::RouteArgs can embed the gateway origin.
     let args = build_argv(spec, &model, &permission_mode, &effort, gateway_url.as_deref(), resume.as_deref());
 
-    let mut child = match spawn(&program, &args, &cwd, spec.extra_env, routed, codex_home.as_deref(), claude_token.as_deref(), path_env.as_deref(), true) {
+    let mut child = match spawn(&program, &args, &cwd, routed, codex_home.as_deref(), claude_token.as_deref(), path_env.as_deref(), true) {
         Ok(c) => c,
         Err(e) => {
-            if let Some(g) = &gateway {
-                g.shutdown();
-            }
             let msg = format!("failed to start '{}': {} (is it installed and on PATH?)", spec.bin, e);
             let _ = on_event.send(PipeEvent::Error(msg.clone()));
             return Err(msg);
@@ -531,9 +515,6 @@ pub async fn agent_run(
             Some(s) => s,
             None => {
                 let _ = child.start_kill();
-                if let Some(g) = &gateway {
-                    g.shutdown();
-                }
                 return Err("no stdin".to_string());
             }
         };
@@ -550,9 +531,6 @@ pub async fn agent_run(
         .await;
         if let Err(e) = wrote {
             let _ = child.start_kill();
-            if let Some(g) = &gateway {
-                g.shutdown();
-            }
             let msg = format!("failed to send prompt to '{}': {}", spec.bin, e);
             let _ = on_event.send(PipeEvent::Error(msg.clone()));
             return Err(msg);
@@ -565,12 +543,7 @@ pub async fn agent_run(
 
     let stdout = match child.stdout.take() {
         Some(s) => s,
-        None => {
-            if let Some(g) = &gateway {
-                g.shutdown();
-            }
-            return Err("no stdout".to_string());
-        }
+        None => return Err("no stdout".to_string()),
     };
     let mut lines = BufReader::new(stdout).lines();
 
@@ -632,9 +605,6 @@ pub async fn agent_run(
         }
     }
 
-    if let Some(g) = &gateway {
-        g.shutdown();
-    }
     let _ = on_event.send(PipeEvent::Done);
     Ok(())
 }
@@ -762,27 +732,12 @@ async fn spawn_warm(
     program: &std::path::Path,
     run: &WarmRun,
 ) -> Result<Arc<crate::session::AgentSession>, String> {
-    let gateway = match &run.fingerprint.target {
-        Some((protocol, base_url, api_key)) => {
-            let outbound = match protocol.as_str() {
-                "anthropic" => crate::gateway::Proto::Anthropic,
-                "openai" => crate::gateway::Proto::OpenAi,
-                other => return Err(format!("unknown target protocol: {}", other)),
-            };
-            Some(
-                crate::gateway::start(crate::gateway::GatewayConfig {
-                    inbound: spec.protocol,
-                    outbound,
-                    target_base: base_url.clone(),
-                    api_key: api_key.clone(),
-                })
-                .await
-                .map_err(|e| format!("failed to start gateway: {}", e))?,
-            )
-        }
-        None => None,
-    };
-    let gateway_url = gateway.as_ref().map(|g| format!("http://127.0.0.1:{}", g.port));
+    let target_ref = run
+        .fingerprint
+        .target
+        .as_ref()
+        .map(|(p, b, k)| (p.as_str(), b.as_str(), k.as_str()));
+    let (gateway, gateway_url) = start_gateway_for(spec, target_ref).await?;
     let routed = gateway
         .as_ref()
         .zip(gateway_url.as_deref())
@@ -801,7 +756,6 @@ async fn spawn_warm(
         program,
         &args,
         &run.fingerprint.cwd,
-        spec.extra_env,
         routed,
         run.codex_home.as_deref(),
         run.fingerprint.claude_token.as_deref(),

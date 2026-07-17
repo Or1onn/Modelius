@@ -8,7 +8,7 @@ import { classifyRequest } from "@/features/route-request/model/classifyRequest"
 import { SYSTEM_PROMPT, SUMMARY_PROMPT, MEMORY_EXTRACT_PROMPT, TITLE_PROMPT } from "@/shared/config/prompts";
 import { getCustomInstructions } from "@/entities/settings/model/settings";
 import { estimateTokens, ctxTokens } from "@/shared/lib/tokens";
-import { costOf, priceSource as priceSource_ } from "@/entities/model/lib/pricing";
+import { costOf, priceSource } from "@/entities/model/lib/pricing";
 import type { Message, Decision, PolicyId, ImageRef } from "@/entities/model/model/registry";
 import { providerKeyForBackend, type ChatMsg, type Delta, type Backend, type ModelOption } from "@/entities/model/model/backend";
 import { addSpend, setChatProvider } from "@/entities/session/model/usageLimits";
@@ -16,6 +16,7 @@ import { CODEX_MODELS, ctxForBackend, effortForDifficulty, type EffortLevel } fr
 import { peekAppCodexModels } from "@/entities/session/api/codexModels";
 import { pickBackend, pickSummarizerBackend, liveRoutingPool, modelAllowsWeb } from "@/features/pick-backend/model/pickBackend";
 import { streamLLM } from "@/features/stream-completion/model/streamLLM";
+import { collectText } from "@/features/stream-completion/lib/collectText";
 import { memoryBlock, getMemories, applyMemoryOps, hydrateMemory } from "@/entities/memory/model/memory";
 import { extractMemories } from "@/pages/chat/model/extractMemories";
 import { generateTitle } from "@/pages/chat/model/generateTitle";
@@ -40,7 +41,7 @@ const MEMORY_EVERY = 3; // extract memory on every Nth finished turn (1st, 4th, 
 const MAX_TOKEN_STOPS = new Set(["max_tokens", "length", "max_output_tokens", "model_length"]);
 const isMaxTokens = (r: string): boolean => MAX_TOKEN_STOPS.has(r);
 
-// Immutable view the component subscribes to (re-created per commit).
+// Re-created per commit — subscribers get an immutable snapshot.
 export interface SessionView {
   messages: Message[];
   phase: Phase;
@@ -311,6 +312,78 @@ const finalizeFields = (acc: string, reason: string, genImgs: string[]) => ({
   streaming: false,
 });
 
+// Everything a completion stream accumulates; shared by realSend and continueSend.
+interface StreamAcc {
+  acc: string;
+  reason: string;
+  stopReason: string;
+  genImgs: string[];
+  usage?: Extract<Delta, { kind: "usage" }>;
+}
+
+// Coalesce per-delta view commits to ~50ms ticks: tokens can arrive every few milliseconds and
+// each commit re-snapshots the view and re-renders the whole thread. Leading edge renders the
+// first token immediately; `flush` runs any pending update synchronously (called before every
+// finalize path so the last partial text is never dropped).
+function throttledUpdate(update: () => void, ms = 50): { tick: () => void; flush: () => void } {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let last = 0;
+  const run = () => {
+    last = Date.now();
+    update();
+  };
+  return {
+    tick: () => {
+      if (timer != null) return;
+      const wait = ms - (Date.now() - last);
+      if (wait <= 0) {
+        run();
+        return;
+      }
+      timer = setTimeout(() => {
+        timer = null;
+        run();
+      }, wait);
+    },
+    flush: () => {
+      if (timer != null) {
+        clearTimeout(timer);
+        timer = null;
+        run();
+      }
+    },
+  };
+}
+
+// Drain a completion stream into the accumulator, ticking the throttled `update` after every
+// delta (and `onFirst` before the first one, when provided). Flushes on every exit — normal
+// end AND a thrown stream error — so no partial text is stuck behind the throttle window.
+async function consumeStream(
+  st: StreamAcc,
+  stream: AsyncGenerator<Delta>,
+  update: () => void,
+  onFirst?: () => void
+): Promise<void> {
+  const throttled = throttledUpdate(update);
+  let first = true;
+  try {
+    for await (const delta of stream) {
+      if (first) {
+        first = false;
+        onFirst?.();
+      }
+      if (delta.kind === "usage") st.usage = delta;
+      else if (delta.kind === "thinking") st.reason += delta.text;
+      else if (delta.kind === "stop") st.stopReason = delta.reason;
+      else if (delta.kind === "image") st.genImgs.push(delta.dataUrl);
+      else st.acc += delta.text;
+      throttled.tick();
+    }
+  } finally {
+    throttled.flush();
+  }
+}
+
 // Name the model that actually answered, not the routed pick (pickBackend may run an
 // OpenAI route on a ChatGPT account or fall back). Override only when they diverge.
 function backendBadge(backend: Backend, decision: Decision): { label: string; provider: string } | undefined {
@@ -329,15 +402,11 @@ async function summarize(prior: string, stale: Message[]): Promise<string> {
   if (sb.kind === "none") return "";
   const transcript = stale.map((m) => `${m.role}: ${redactCode(m.text).text}`).join("\n");
   const prompt = SUMMARY_PROMPT + (prior ? `Previous summary:\n${prior}\n\n` : "") + transcript;
-  let out = "";
   try {
-    for await (const d of streamLLM(sb, [{ role: "user", content: prompt }])) {
-      if (d.kind === "text") out += d.text;
-    }
+    return (await collectText(sb, prompt)).trim();
   } catch {
     return "";
   }
-  return out.trim();
 }
 
 // Summarize off the critical path: this turn sends current history; result is ready for the next.
@@ -470,37 +539,26 @@ async function continueSend(s: Session, p: Omit<SendParams, "fullText" | "images
   const controller = new AbortController();
   s.abort = controller;
   setPhase(s, "streaming");
-  let acc = last.text;
-  let reason = last.reasoning ?? "";
-  let stopReason = "";
-  const genImgs = [...(last.genImages ?? [])];
-  let usage: Extract<Delta, { kind: "usage" }> | undefined;
-  patchAt(s, idx, { streaming: true, shown: acc, truncated: undefined });
-  const update = () => patchAt(s, idx, streamFields(acc, reason, genImgs));
+  const st: StreamAcc = { acc: last.text, reason: last.reasoning ?? "", stopReason: "", genImgs: [...(last.genImages ?? [])] };
+  patchAt(s, idx, { streaming: true, shown: st.acc, truncated: undefined });
+  const update = () => patchAt(s, idx, streamFields(st.acc, st.reason, st.genImgs));
 
   try {
-    for await (const delta of streamLLM(backend, apiMessages, p.thinking, eff, p.web, controller.signal)) {
-      if (delta.kind === "usage") usage = delta;
-      else if (delta.kind === "thinking") reason += delta.text;
-      else if (delta.kind === "stop") stopReason = delta.reason;
-      else if (delta.kind === "image") genImgs.push(delta.dataUrl);
-      else acc += delta.text;
-      update();
-    }
+    await consumeStream(st, streamLLM(backend, apiMessages, p.thinking, eff, p.web, controller.signal), update);
     if (controller.signal.aborted) {
-      patchAt(s, idx, { ...finalizeFields(acc, reason, genImgs), truncated: true });
+      patchAt(s, idx, { ...finalizeFields(st.acc, st.reason, st.genImgs), truncated: true });
       return;
     }
     // Fold the continuation's output tokens into the existing usage (input was billed already).
     const prev = last.usage;
-    const u = usage
-      ? { inputTokens: prev?.inputTokens ?? usage.inputTokens, outputTokens: (prev?.outputTokens ?? 0) + usage.outputTokens, cacheRead: prev?.cacheRead, cacheWrite: prev?.cacheWrite, reasoningTokens: prev?.reasoningTokens }
+    const u = st.usage
+      ? { inputTokens: prev?.inputTokens ?? st.usage.inputTokens, outputTokens: (prev?.outputTokens ?? 0) + st.usage.outputTokens, cacheRead: prev?.cacheRead, cacheWrite: prev?.cacheWrite, reasoningTokens: prev?.reasoningTokens }
       : prev;
-    patchAt(s, idx, { ...finalizeFields(acc, reason, genImgs), usage: u, truncated: isMaxTokens(stopReason) || undefined });
-    if (acc.trim()) void extractAndSave(acc);
+    patchAt(s, idx, { ...finalizeFields(st.acc, st.reason, st.genImgs), usage: u, truncated: isMaxTokens(st.stopReason) || undefined });
+    if (st.acc.trim()) void extractAndSave(st.acc);
   } catch {
     // Keep the partial and leave "Continue" available; don't clobber with a ⚠️ error bubble.
-    patchAt(s, idx, { ...finalizeFields(acc, reason, genImgs), truncated: true });
+    patchAt(s, idx, { ...finalizeFields(st.acc, st.reason, st.genImgs), truncated: true });
   } finally {
     if (s.abort === controller) s.abort = null;
     setPhase(s, "idle");
@@ -546,29 +604,13 @@ export function stopStream(chatId: string): void {
   sessions.get(chatId)?.abort?.abort();
 }
 
-// Build the windowed request and stream a real completion. Stays in "routing" until
-// the first token, then streams into the assistant message.
-async function realSend(
-  s: Session,
-  decision: Decision,
-  history: Message[],
-  backend: Backend,
-  manual: { label: string; provider: string } | undefined,
-  reasoningOn: boolean,
-  effortLevel: EffortLevel | "auto",
-  fullText: string,
-  imgs: ImageRef[],
-  isManual: boolean,
-  web: boolean
-): Promise<void> {
-  await hydrateMemory(); // ensure the decrypted memory cache is ready before building the prompt
-  // Keep inside the window, budgeting by the routed pick's ctx (a stable proxy).
-  // Soft (50%) → compact in background for next turn; hard (85%) → compact synchronously now.
+// Keep the request inside the model window: hard pressure (85%) compacts synchronously now,
+// soft pressure (50%) compacts in the background for the next turn. Returns the summary text +
+// covered count the prompt should be built with.
+async function budgetWindow(s: Session, history: Message[], win: number): Promise<{ sumText: string; cov: number }> {
   let sumText = s.summary;
   let cov = s.covered;
   const KEEP = 6; // last messages always sent verbatim
-  // On a manual switch the active model's window can differ from the routed pick.
-  const win = ctxTokens(isManual ? ctxForBackend(backend) : decision.chosen.ctx);
   const used = history.reduce((n, m) => n + estimateTokens(m.text), estimateTokens(sumText));
   const canCompact = history.length - KEEP > cov;
   if (used > win * 0.85 && canCompact) {
@@ -583,10 +625,12 @@ async function realSend(
   } else if (used > win * 0.5 && canCompact && !s.compacting) {
     compactInBackground(s, history, cov, sumText, KEEP);
   }
+  return { sumText, cov };
+}
 
-  // Re-inject verbatim only artifacts the summary references and not already in the recent
-  // window. Bounded by a token cap; dropped (oldest-first) ids logged.
-  const recent = toChatMsgs(history.slice(cov));
+// Re-inject verbatim only artifacts the summary references and not already in the recent
+// window. Bounded by a token cap; dropped (oldest-first) ids logged. "" when nothing applies.
+async function buildCodeAppendix(sumText: string, recent: ChatMsg[], win: number): Promise<string> {
   const inRecent = new Set(recent.flatMap((m) => largeBlockIds(m.content)));
   const wanted = [...new Set(referencedIds(sumText))].filter((id) => !inRecent.has(id));
   let codeBudget = win * 0.3;
@@ -603,9 +647,68 @@ async function realSend(
     codeBudget -= t;
     blocks.push(block);
   }
-  const codeAppendix = blocks.length
-    ? `\n\nReferenced code artifacts (verbatim, do not summarize):\n${blocks.join("\n\n")}`
-    : "";
+  return blocks.length ? `\n\nReferenced code artifacts (verbatim, do not summarize):\n${blocks.join("\n\n")}` : "";
+}
+
+// Finalize a streamed turn: resolve usage (estimated when the provider didn't report), price it
+// ($ only for metered turns, preferring the exact billed cost), track the billing account, and
+// patch the assistant message into its final shape. Returns the message's index.
+function finalizeTurn(s: Session, backend: Backend, st: StreamAcc, apiMessages: ChatMsg[], latencyMs: number): number {
+  const u = st.usage
+    ? { inputTokens: st.usage.inputTokens, outputTokens: st.usage.outputTokens, cacheRead: st.usage.cacheRead, cacheWrite: st.usage.cacheWrite, reasoningTokens: st.usage.reasoningTokens }
+    : { inputTokens: estimateTokens(apiMessages.map((mm) => mm.content).join("\n")), outputTokens: estimateTokens(st.acc) };
+  const exact = st.usage?.cost;
+  const cost = st.usage?.metered
+    ? exact != null && Number.isFinite(exact)
+      ? exact
+      : costOf(backend.model, u)
+    : undefined;
+  const priceSrc = cost != null ? (exact != null ? "live" : priceSource(backend.model) ?? undefined) : undefined;
+  // Track the account this chat bills against (for the usage meter) and accumulate key spend.
+  const provKey = providerKeyForBackend(backend);
+  setChatProvider(s.chatId, provKey);
+  if (cost != null) addSpend(provKey, cost);
+  const asstIndex = s.messages.length - 1; // this turn's assistant message; stable (append-only)
+  patchAt(s, asstIndex, { ...finalizeFields(st.acc, st.reason, st.genImgs), usage: u, latencyMs, cost, priceSource: priceSrc, truncated: isMaxTokens(st.stopReason) || undefined });
+  return asstIndex;
+}
+
+// Reconcile durable user facts off the critical path, throttled to every MEMORY_EVERY-th turn
+// (1st, 4th, …) to cut cost/noise. Ops add/update/delete against known facts; tag the message
+// with what actually changed.
+function maybeExtractMemory(s: Session, fullText: string, acc: string, asstIndex: number): void {
+  if (!acc.trim() || ++s.memoryTurns % MEMORY_EVERY !== 1) return;
+  void extractMemories(fullText, acc, getMemories(), pickSummarizerBackend(route(MEMORY_EXTRACT_PROMPT, "cost")))
+    .then((ops) => {
+      const changed = applyMemoryOps(ops);
+      if (changed.length) patchAt(s, asstIndex, { memory: changed });
+    })
+    .catch(() => {});
+}
+
+// Build the windowed request and stream a real completion. Stays in "routing" until
+// the first token, then streams into the assistant message.
+async function realSend(
+  s: Session,
+  decision: Decision,
+  history: Message[],
+  backend: Backend,
+  manual: { label: string; provider: string } | undefined,
+  reasoningOn: boolean,
+  effortLevel: EffortLevel | "auto",
+  fullText: string,
+  imgs: ImageRef[],
+  isManual: boolean,
+  web: boolean
+): Promise<void> {
+  await hydrateMemory(); // ensure the decrypted memory cache is ready before building the prompt
+  // Budget by the routed pick's ctx (a stable proxy) — but on a manual switch the active
+  // model's window can differ from the routed pick.
+  const win = ctxTokens(isManual ? ctxForBackend(backend) : decision.chosen.ctx);
+  const { sumText, cov } = await budgetWindow(s, history, win);
+
+  const recent = toChatMsgs(history.slice(cov));
+  const codeAppendix = await buildCodeAppendix(sumText, recent, win);
 
   const sysContent = buildSystemPrompt(s, sumText, codeAppendix);
   const userMsg: ChatMsg = {
@@ -618,11 +721,7 @@ async function realSend(
   const controller = new AbortController();
   s.abort = controller;
 
-  let acc = "";
-  let reason = "";
-  let stopReason = "";
-  const genImgs: string[] = [];
-  let usage: Extract<Delta, { kind: "usage" }> | undefined;
+  const st: StreamAcc = { acc: "", reason: "", stopReason: "", genImgs: [] };
   const t0 = performance.now();
   let started = false;
   const begin = () => {
@@ -638,59 +737,23 @@ async function realSend(
       modelProvider: manual?.provider,
     });
   };
-  const update = () => patchLastStreaming(s, streamFields(acc, reason, genImgs));
+  const update = () => patchLastStreaming(s, streamFields(st.acc, st.reason, st.genImgs));
 
   try {
-    for await (const delta of streamLLM(backend, apiMessages, reasoningOn, effortLevel, web, controller.signal)) {
-      if (!started) begin();
-      if (delta.kind === "usage") usage = delta;
-      else if (delta.kind === "thinking") reason += delta.text;
-      else if (delta.kind === "stop") stopReason = delta.reason;
-      else if (delta.kind === "image") genImgs.push(delta.dataUrl);
-      else acc += delta.text;
-      update();
-    }
+    await consumeStream(st, streamLLM(backend, apiMessages, reasoningOn, effortLevel, web, controller.signal), update, begin);
     // User stopped: keep whatever streamed, skip usage/cost/memory for this partial turn.
     if (controller.signal.aborted) {
-      if (started) patchLastStreaming(s, finalizeFields(acc, reason, genImgs));
+      if (started) patchLastStreaming(s, finalizeFields(st.acc, st.reason, st.genImgs));
       return;
     }
     if (!started) begin(); // empty completion — still show a turn
-    const latencyMs = performance.now() - t0;
-    const u = usage
-      ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, reasoningTokens: usage.reasoningTokens }
-      : { inputTokens: estimateTokens(apiMessages.map((mm) => mm.content).join("\n")), outputTokens: estimateTokens(acc) };
-    // $ only for metered turns. Prefer the exact cost the API billed (OpenRouter); otherwise
-    // compute it from token usage × current per-token rates.
-    const exact = usage?.cost;
-    const cost = usage?.metered
-      ? exact != null && Number.isFinite(exact)
-        ? exact
-        : costOf(backend.model, u)
-      : undefined;
-    const priceSource = cost != null ? (exact != null ? "live" : priceSource_(backend.model) ?? undefined) : undefined;
-    // Track the account this chat bills against (for the usage meter) and accumulate key spend.
-    const provKey = providerKeyForBackend(backend);
-    setChatProvider(s.chatId, provKey);
-    if (cost != null) addSpend(provKey, cost);
-    const asstIndex = s.messages.length - 1; // this turn's assistant message; stable (append-only)
-    patchAt(s, asstIndex, { ...finalizeFields(acc, reason, genImgs), usage: u, latencyMs, cost, priceSource, truncated: isMaxTokens(stopReason) || undefined });
-    if (acc.trim()) void extractAndSave(acc); // persist large code the model returned
-    // Reconcile durable user facts off the critical path, throttled to every MEMORY_EVERY-th
-    // turn (1st, 4th, …) to cut cost/noise. Ops add/update/delete against known facts; tag the
-    // message with what actually changed.
-    if (acc.trim() && ++s.memoryTurns % MEMORY_EVERY === 1) {
-      void extractMemories(fullText, acc, getMemories(), pickSummarizerBackend(route(MEMORY_EXTRACT_PROMPT, "cost")))
-        .then((ops) => {
-          const changed = applyMemoryOps(ops);
-          if (changed.length) patchAt(s, asstIndex, { memory: changed });
-        })
-        .catch(() => {});
-    }
+    const asstIndex = finalizeTurn(s, backend, st, apiMessages, performance.now() - t0);
+    if (st.acc.trim()) void extractAndSave(st.acc); // persist large code the model returned
+    maybeExtractMemory(s, fullText, st.acc, asstIndex);
   } catch (err) {
     // Abort surfaces as a fetch error on the browser paths — finalize the partial, not an error.
     if (controller.signal.aborted) {
-      if (started) patchLastStreaming(s, finalizeFields(acc, reason, genImgs));
+      if (started) patchLastStreaming(s, finalizeFields(st.acc, st.reason, st.genImgs));
     } else {
       const msg = `⚠️ ${humanizeError(err instanceof Error ? err.message : "Request failed")}`;
       if (!started) begin();

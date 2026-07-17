@@ -51,17 +51,61 @@ pub(crate) enum SessionProto {
     Kimi(KimiRuntime),
 }
 
+// JSON-RPC open-state shared by the codex (app-server thread) and kimi (ACP session) runtimes:
+// the opened unit's id, the client request-id counter (1 = initialize, 2 = open — spawn_warm;
+// turns/interrupts continue from 3), and the oneshot the first turn blocks on until the pump
+// consumes the open response.
+pub(crate) struct RpcOpen {
+    // Set by the pump from the open response — or pre-set when the id is known up front
+    // (kimi resume: session/resume responses carry no sessionId; the resume id IS the id).
+    id: Mutex<Option<String>>,
+    next_id: std::sync::atomic::AtomicU64,
+    open_req: u64,
+    ready_tx: Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>,
+    ready_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Result<String, String>>>>,
+}
+
+impl RpcOpen {
+    fn new(preset: Option<String>) -> Self {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        RpcOpen {
+            id: Mutex::new(preset.filter(|s| !s.is_empty())),
+            next_id: std::sync::atomic::AtomicU64::new(3),
+            open_req: 2,
+            ready_tx: Mutex::new(Some(tx)),
+            ready_rx: tokio::sync::Mutex::new(Some(rx)),
+        }
+    }
+
+    fn take_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    // The known id, or wait (bounded 20s) for the pump to consume the open response and fire the
+    // oneshot. `what` names the protocol's unit in error messages ("thread" / "session").
+    // (The guard is dropped before the await — no lock lives across it.)
+    async fn await_open(&self, what: &str) -> std::io::Result<String> {
+        let known = self.id.lock().unwrap().clone();
+        match known {
+            Some(t) => Ok(t),
+            None => {
+                let rx = self.ready_rx.lock().await.take().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!("{} never opened", what))
+                })?;
+                let opened = tokio::time::timeout(Duration::from_secs(20), rx)
+                    .await
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{} open timed out", what)))?
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session died"))?;
+                opened.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            }
+        }
+    }
+}
+
 pub(crate) struct CodexRuntime {
-    // Set by the pump from the thread/start | thread/resume response.
-    thread_id: Mutex<Option<String>>,
+    open: RpcOpen, // thread id + request ids + the first-turn waiter
     // Set by the pump from turn/started; consumed by interrupt (turn/interrupt needs both ids).
     turn_id: Mutex<Option<String>>,
-    // Client request ids. 1 = initialize, 2 = thread open (spawn_warm); turns/interrupts continue.
-    next_id: std::sync::atomic::AtomicU64,
-    // The pending thread-open request id + the waiter begin_turn blocks on (fresh spawns only).
-    thread_open_req: u64,
-    thread_ready_tx: Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>,
-    thread_ready_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Result<String, String>>>>,
     // The in-flight turn/start request id — an RpcError for it must fail the turn (no
     // turn/completed will follow).
     turn_req: Mutex<Option<u64>>,
@@ -69,35 +113,18 @@ pub(crate) struct CodexRuntime {
 
 impl CodexRuntime {
     pub fn new() -> Self {
-        let (tx, rx) = tokio::sync::oneshot::channel();
         CodexRuntime {
-            thread_id: Mutex::new(None),
+            open: RpcOpen::new(None),
             turn_id: Mutex::new(None),
-            next_id: std::sync::atomic::AtomicU64::new(3),
-            thread_open_req: 2,
-            thread_ready_tx: Mutex::new(Some(tx)),
-            thread_ready_rx: tokio::sync::Mutex::new(Some(rx)),
             turn_req: Mutex::new(None),
         }
-    }
-
-    fn take_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 }
 
 // Simpler than CodexRuntime: an ACP turn is bounded by the RESPONSE to our session/prompt
 // request (not a notification), and session/cancel needs no turn id.
 pub(crate) struct KimiRuntime {
-    // From the session/new response — or pre-set when resuming (session/resume responses carry
-    // no sessionId; the resume id IS the session id, so begin_turn never has to wait for it).
-    session_id: Mutex<Option<String>>,
-    // Client request ids. 1 = initialize, 2 = session open (spawn_warm); turns continue.
-    next_id: std::sync::atomic::AtomicU64,
-    session_open_req: u64,
-    // The waiter begin_turn blocks on for a fresh session/new (resume paths skip it).
-    session_ready_tx: Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>,
-    session_ready_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Result<String, String>>>>,
+    open: RpcOpen, // session id + request ids + the first-turn waiter (resume paths pre-set the id)
     // The in-flight session/prompt request id — its response ends the turn; an error for any
     // request while it is set fails the turn (set_model/set_mode are pipelined ahead of it).
     prompt_req: Mutex<Option<u64>>,
@@ -112,21 +139,12 @@ pub(crate) struct KimiRuntime {
 
 impl KimiRuntime {
     pub fn new(resume: Option<String>) -> Self {
-        let (tx, rx) = tokio::sync::oneshot::channel();
         KimiRuntime {
-            session_id: Mutex::new(resume.filter(|s| !s.is_empty())),
-            next_id: std::sync::atomic::AtomicU64::new(3),
-            session_open_req: 2,
-            session_ready_tx: Mutex::new(Some(tx)),
-            session_ready_rx: tokio::sync::Mutex::new(Some(rx)),
+            open: RpcOpen::new(resume),
             prompt_req: Mutex::new(None),
             model_sent: Mutex::new(None),
             forwarding: AtomicBool::new(false),
         }
-    }
-
-    fn take_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 }
 
@@ -271,23 +289,9 @@ impl AgentSession {
             }
             SessionProto::Codex(rt) => {
                 // Fresh spawn: wait for the thread/start | thread/resume response (the pump fires
-                // the oneshot). Reused session: thread_id is already set, no wait.
-                // (Guard extracted before the match — a temporary would live across the await.)
-                let known = rt.thread_id.lock().unwrap().clone();
-                let thread_id = match known {
-                    Some(t) => t,
-                    None => {
-                        let rx = rt.thread_ready_rx.lock().await.take().ok_or_else(|| {
-                            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "thread never opened")
-                        })?;
-                        let opened = tokio::time::timeout(Duration::from_secs(20), rx)
-                            .await
-                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "thread open timed out"))?
-                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session died"))?;
-                        opened.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-                    }
-                };
-                let id = rt.take_id();
+                // the oneshot). Reused session: the id is already set, no wait.
+                let thread_id = rt.open.await_open("thread").await?;
+                let id = rt.open.take_id();
                 *rt.turn_req.lock().unwrap() = Some(id);
                 *rt.turn_id.lock().unwrap() = None;
                 self.write_line(&crate::codex_proto::turn_start_line(id, &thread_id, prompt, model, effort, mode))
@@ -297,25 +301,12 @@ impl AgentSession {
                 let _ = effort; // no effort surface in ACP — thinking variants are model aliases
                 // Fresh session/new: wait for the pump to consume the response (it carries the
                 // session id). Resume/reused sessions have the id already.
-                let known = rt.session_id.lock().unwrap().clone();
-                let session_id = match known {
-                    Some(s) => s,
-                    None => {
-                        let rx = rt.session_ready_rx.lock().await.take().ok_or_else(|| {
-                            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session never opened")
-                        })?;
-                        let opened = tokio::time::timeout(Duration::from_secs(20), rx)
-                            .await
-                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "session open timed out"))?
-                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session died"))?;
-                        opened.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-                    }
-                };
+                let session_id = rt.open.await_open("session").await?;
                 // Arm the turn BEFORE the pipelined config writes: a rejected set_mode/set_model
                 // must fail this turn deterministically (live-verified: an account whose login
                 // populated no model catalog rejects set_model; racing the prompt write would
                 // otherwise sometimes swallow the error into a silent empty turn).
-                let id = rt.take_id();
+                let id = rt.open.take_id();
                 *rt.prompt_req.lock().unwrap() = Some(id);
                 // A fresh acp session always boots in "default" mode (argv knobs don't bind —
                 // probe P8), so spawn_warm registers it as "default" and the first turn
@@ -323,7 +314,7 @@ impl AgentSession {
                 // is in flight fail the turn.
                 if !mode.is_empty() && *self.permission_mode.lock().unwrap() != mode {
                     self.write_line(&crate::kimi_proto::set_mode_line(
-                        rt.take_id(),
+                        rt.open.take_id(),
                         &session_id,
                         crate::kimi_proto::kimi_mode(mode),
                     ))
@@ -333,7 +324,7 @@ impl AgentSession {
                 // Model is pinned per process (fingerprint) but has no spawn-time flag — apply it
                 // in-session once.
                 if !model.is_empty() && rt.model_sent.lock().unwrap().as_deref() != Some(model) {
-                    self.write_line(&crate::kimi_proto::set_model_line(rt.take_id(), &session_id, model))
+                    self.write_line(&crate::kimi_proto::set_model_line(rt.open.take_id(), &session_id, model))
                         .await?;
                     *rt.model_sent.lock().unwrap() = Some(model.to_string());
                 }
@@ -361,7 +352,7 @@ impl AgentSession {
             }
             SessionProto::Codex(rt) => {
                 let (thread_id, turn_id) = {
-                    let t = rt.thread_id.lock().unwrap().clone();
+                    let t = rt.open.id.lock().unwrap().clone();
                     let u = rt.turn_id.lock().unwrap().clone();
                     match (t, u) {
                         (Some(t), Some(u)) => (t, u),
@@ -373,11 +364,11 @@ impl AgentSession {
                         }
                     }
                 };
-                self.write_line(&crate::codex_proto::turn_interrupt_line(rt.take_id(), &thread_id, &turn_id))
+                self.write_line(&crate::codex_proto::turn_interrupt_line(rt.open.take_id(), &thread_id, &turn_id))
                     .await
             }
             SessionProto::Kimi(rt) => {
-                let session_id = rt.session_id.lock().unwrap().clone();
+                let session_id = rt.open.id.lock().unwrap().clone();
                 match session_id {
                     Some(sid) => self.write_line(&crate::kimi_proto::cancel_line(&sid)).await,
                     None => Err(std::io::Error::new(
@@ -564,22 +555,22 @@ fn spawn_pump(key: String, session: Arc<AgentSession>, stdout: tokio::process::C
 fn pump_codex_line(rt: &CodexRuntime, line: &str) -> (bool, Option<String>) {
     use crate::codex_proto::{classify, CodexLine};
     match classify(line) {
-        CodexLine::RpcResponse { id, thread_id } if id == rt.thread_open_req => {
+        CodexLine::RpcResponse { id, thread_id } if id == rt.open.open_req => {
             let outcome = match thread_id {
                 Some(t) => {
-                    *rt.thread_id.lock().unwrap() = Some(t.clone());
+                    *rt.open.id.lock().unwrap() = Some(t.clone());
                     Ok(t)
                 }
                 None => Err("thread open response carried no thread id".to_string()),
             };
-            if let Some(tx) = rt.thread_ready_tx.lock().unwrap().take() {
+            if let Some(tx) = rt.open.ready_tx.lock().unwrap().take() {
                 let _ = tx.send(outcome);
             }
             (false, None)
         }
         CodexLine::RpcError { id, message } => {
-            if id == rt.thread_open_req {
-                if let Some(tx) = rt.thread_ready_tx.lock().unwrap().take() {
+            if id == rt.open.open_req {
+                if let Some(tx) = rt.open.ready_tx.lock().unwrap().take() {
                     let _ = tx.send(Err(message));
                 }
                 (false, None)
@@ -594,13 +585,13 @@ fn pump_codex_line(rt: &CodexRuntime, line: &str) -> (bool, Option<String>) {
             }
         }
         CodexLine::TurnStarted { thread_id, turn_id } => {
-            if rt.thread_id.lock().unwrap().as_deref() == Some(thread_id.as_str()) {
+            if rt.open.id.lock().unwrap().as_deref() == Some(thread_id.as_str()) {
                 *rt.turn_id.lock().unwrap() = Some(turn_id);
             }
             (false, None)
         }
         CodexLine::TurnCompleted { thread_id } => {
-            let ours = rt.thread_id.lock().unwrap().as_deref() == Some(thread_id.as_str());
+            let ours = rt.open.id.lock().unwrap().as_deref() == Some(thread_id.as_str());
             if ours {
                 *rt.turn_id.lock().unwrap() = None;
                 *rt.turn_req.lock().unwrap() = None;
@@ -620,17 +611,17 @@ fn pump_codex_line(rt: &CodexRuntime, line: &str) -> (bool, Option<String>) {
 fn pump_kimi_line(rt: &KimiRuntime, line: &str) -> (bool, Option<String>, bool) {
     use crate::kimi_proto::{classify, KimiLine};
     match classify(line) {
-        KimiLine::Response { id, session_id } if id == rt.session_open_req => {
+        KimiLine::Response { id, session_id } if id == rt.open.open_req => {
             if let Some(sid) = session_id {
                 // session/new carries the id; session/resume doesn't (it was pre-set).
-                *rt.session_id.lock().unwrap() = Some(sid);
+                *rt.open.id.lock().unwrap() = Some(sid);
             }
-            let outcome = match rt.session_id.lock().unwrap().clone() {
+            let outcome = match rt.open.id.lock().unwrap().clone() {
                 Some(sid) => Ok(sid),
                 None => Err("session open response carried no session id".to_string()),
             };
             rt.forwarding.store(true, Ordering::SeqCst);
-            if let Some(tx) = rt.session_ready_tx.lock().unwrap().take() {
+            if let Some(tx) = rt.open.ready_tx.lock().unwrap().take() {
                 let _ = tx.send(outcome);
             }
             (false, None, false)
@@ -651,8 +642,8 @@ fn pump_kimi_line(rt: &KimiRuntime, line: &str) -> (bool, Option<String>, bool) 
             } else {
                 message
             };
-            if id == rt.session_open_req {
-                if let Some(tx) = rt.session_ready_tx.lock().unwrap().take() {
+            if id == rt.open.open_req {
+                if let Some(tx) = rt.open.ready_tx.lock().unwrap().take() {
                     let _ = tx.send(Err(msg));
                     return (false, None, false);
                 }
@@ -696,7 +687,7 @@ fn spawn_stderr_drain(session: Arc<AgentSession>, stderr: tokio::process::ChildS
                 if t.len() > 4000 {
                     let cut = t.len() - 2000;
                     let cut = t.char_indices().map(|(i, _)| i).find(|&i| i >= cut).unwrap_or(0);
-                    *t = t[cut..].to_string();
+                    t.drain(..cut);
                 }
             }
             if let Some(t) = session.active.lock().unwrap().as_ref() {
@@ -797,8 +788,8 @@ mod tests {
         // thread open response (id 2) → thread id learned + begin_turn's waiter fired
         let (end, fail) = pump_codex_line(&rt, r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"gpt-5.5"}}"#);
         assert_eq!((end, fail.is_none()), (false, true));
-        assert_eq!(rt.thread_id.lock().unwrap().as_deref(), Some("th-1"));
-        assert!(rt.thread_ready_tx.lock().unwrap().is_none()); // oneshot consumed
+        assert_eq!(rt.open.id.lock().unwrap().as_deref(), Some("th-1"));
+        assert!(rt.open.ready_tx.lock().unwrap().is_none()); // oneshot consumed
 
         // turn/started on our thread → interrupt target captured
         let started = r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#;
@@ -838,8 +829,8 @@ mod tests {
         // session/new response (id 2) → session id learned, gate opened, waiter fired, NOT forwarded
         let open = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1","configOptions":[]}}"#;
         assert_eq!(pump_kimi_line(&rt, open), (false, None, false));
-        assert_eq!(rt.session_id.lock().unwrap().as_deref(), Some("s1"));
-        assert!(rt.session_ready_tx.lock().unwrap().is_none()); // oneshot consumed
+        assert_eq!(rt.open.id.lock().unwrap().as_deref(), Some("s1"));
+        assert!(rt.open.ready_tx.lock().unwrap().is_none()); // oneshot consumed
 
         // notification after ready → forwarded
         assert_eq!(pump_kimi_line(&rt, note), (false, None, true));
@@ -862,14 +853,14 @@ mod tests {
         let rt = KimiRuntime::new(None);
         let auth_err = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}}"#;
         assert_eq!(pump_kimi_line(&rt, auth_err), (false, None, false));
-        let rx = rt.session_ready_rx.try_lock().unwrap().take().unwrap();
+        let rx = rt.open.ready_rx.try_lock().unwrap().take().unwrap();
         let err = rx.blocking_recv().unwrap().unwrap_err();
         assert!(err.contains("kimi login"), "hint missing: {}", err);
 
         // Resume path (session id pre-set, waiter unused): an error while the prompt is in
         // flight fails the turn instead
         let rt = KimiRuntime::new(Some("s1".into()));
-        rt.session_ready_tx.lock().unwrap().take(); // waiter already consumed by a prior turn
+        rt.open.ready_tx.lock().unwrap().take(); // waiter already consumed by a prior turn
         *rt.prompt_req.lock().unwrap() = Some(4);
         let (end, fail, _) = pump_kimi_line(&rt, r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required"}}"#);
         assert_eq!(end, false);
@@ -878,7 +869,7 @@ mod tests {
 
         // an error with no turn in flight is swallowed
         let rt = KimiRuntime::new(Some("s1".into()));
-        rt.session_ready_tx.lock().unwrap().take();
+        rt.open.ready_tx.lock().unwrap().take();
         assert_eq!(
             pump_kimi_line(&rt, r#"{"jsonrpc":"2.0","id":9,"error":{"code":-1,"message":"nope"}}"#),
             (false, None, false)
@@ -888,14 +879,14 @@ mod tests {
     #[test]
     fn kimi_runtime_presets_the_session_id_on_resume() {
         let rt = KimiRuntime::new(Some("session_prev".into()));
-        assert_eq!(rt.session_id.lock().unwrap().as_deref(), Some("session_prev"));
+        assert_eq!(rt.open.id.lock().unwrap().as_deref(), Some("session_prev"));
         // resume responses carry no sessionId — the pre-set id must survive the open response
         let open = r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#;
         pump_kimi_line(&rt, open);
-        assert_eq!(rt.session_id.lock().unwrap().as_deref(), Some("session_prev"));
+        assert_eq!(rt.open.id.lock().unwrap().as_deref(), Some("session_prev"));
         assert!(rt.forwarding.load(Ordering::SeqCst));
         // empty resume string = fresh session
-        assert!(KimiRuntime::new(Some(String::new())).session_id.lock().unwrap().is_none());
+        assert!(KimiRuntime::new(Some(String::new())).open.id.lock().unwrap().is_none());
     }
 
     #[test]

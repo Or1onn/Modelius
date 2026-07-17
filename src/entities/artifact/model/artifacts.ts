@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { isTauri } from "@/shared/api/tauri";
 import { vaultEncrypt, vaultDecrypt } from "@/shared/api/secrets";
+import { createVaultStore } from "@/shared/lib/vaultStore";
 
 // Dynamic-length fence (\1 closes the open run) so code containing ``` round-trips.
 const FENCE = /(`{3,})([^\n`]*)\n([\s\S]*?)\n\1/g;
@@ -19,55 +20,23 @@ const TITLE_CAP = 500;
 // Titles are user content (filenames) → persisted as a vault-encrypted blob, loaded into
 // the in-RAM Map once at startup. Reads stay synchronous; writes persist async.
 const titleOf = new Map<string, string>();
-let titlesHydrated = false;
-let titlesHydrating: Promise<void> | null = null;
+const titleStore = createVaultStore({
+  key: TITLES_KEY,
+  apply: (plain) => {
+    const obj = JSON.parse(plain) as Record<string, string>;
+    for (const [k, v] of Object.entries(obj)) titleOf.set(k, v);
+  },
+  snapshot: () => JSON.stringify(Object.fromEntries(titleOf)),
+});
 
-export function hydrateTitles(): Promise<void> {
-  if (titlesHydrated) return Promise.resolve();
-  if (!titlesHydrating)
-    titlesHydrating = (async () => {
-      const raw = localStorage.getItem(TITLES_KEY);
-      if (raw) {
-        let plain: string;
-        try {
-          plain = await vaultDecrypt(raw);
-        } catch {
-          // Vault unavailable — DON'T latch, or persistTitles would clobber real titles. Allow a retry.
-          titlesHydrating = null;
-          return;
-        }
-        try {
-          const obj = JSON.parse(plain) as Record<string, string>;
-          for (const [k, v] of Object.entries(obj)) titleOf.set(k, v);
-        } catch {
-          /* decrypt succeeded but content is corrupt — start empty, latch below */
-        }
-      }
-      titlesHydrated = true;
-    })();
-  return titlesHydrating;
-}
-
-function persistTitles(): void {
-  if (!titlesHydrated) {
-    void hydrateTitles(); // load failed earlier — retry rather than persist over real titles
-    return;
-  }
-  void (async () => {
-    try {
-      localStorage.setItem(TITLES_KEY, await vaultEncrypt(JSON.stringify(Object.fromEntries(titleOf))));
-    } catch {
-      /* quota/full — names just won't survive reload */
-    }
-  })();
-}
+export const hydrateTitles = titleStore.hydrate;
 
 export function rememberArtifactTitle(id: string, title: string): void {
   if (titleOf.get(id) === title) return; // unchanged
   titleOf.delete(id); // re-insert → most-recent (Map keeps insertion order)
   titleOf.set(id, title);
   while (titleOf.size > TITLE_CAP) titleOf.delete(titleOf.keys().next().value as string);
-  persistTitles();
+  titleStore.persist();
 }
 
 // djb2 → 8 hex chars. Deterministic, no Date.now/random.
@@ -98,18 +67,22 @@ const longestBacktickRun = (s: string) => {
 };
 // CommonMark fence: ≥3 backticks AND longer than any run inside the code.
 export const fenceFor = (code: string) => "`".repeat(Math.max(3, longestBacktickRun(code) + 1));
-// Wrap code as a fenced block whose fence won't collide with inner backticks.
 export const wrapFence = (lang: string, code: string) => {
   const f = fenceFor(code);
   return `${f}${lang}\n${code}\n${f}`;
 };
 
+// Cheap byte-size threshold: UTF-8 is 1–3 bytes per UTF-16 unit, so the string length bounds
+// the byte count from both sides — only mid-range strings pay the exact TextEncoder pass
+// (this runs in the chat render path for every code segment).
+const atLeastBytes = (s: string, n: number) => s.length >= n || (s.length * 3 >= n && byteSize(s) >= n);
+
 // Large = many lines OR large byte size (e.g. minified JSON); else stays inline.
 export const isLargeBlock = (code: string) =>
-  code.split("\n").length >= 15 || byteSize(code) >= ARTIFACT_MIN_BYTES;
+  code.split("\n").length >= 15 || atLeastBytes(code, ARTIFACT_MIN_BYTES);
 
 // A pasted blob is turned into an artifact purely by size (≥4 KB).
-export const isLargePaste = (text: string) => byteSize(text) >= ARTIFACT_MIN_BYTES;
+export const isLargePaste = (text: string) => atLeastBytes(text, ARTIFACT_MIN_BYTES);
 
 // A large block surfaced as an artifact card + viewer panel.
 export interface Artifact {

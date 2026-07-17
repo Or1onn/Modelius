@@ -45,3 +45,71 @@ export function classifyRefreshError(msg: string): RefreshFailure {
   }
   return "transient";
 }
+
+// ---- shared refresh machinery over a provider's token store ----
+
+interface RefreshableToken {
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number; // epoch ms
+}
+
+export interface OAuthStore<T extends RefreshableToken> {
+  read(): Promise<T | null>;
+  write(token: T | null): Promise<void>;
+  // The provider's refresh grant: exchange the rotating refresh token for a fresh token set.
+  // Throws on failure; the message is classified by classifyRefreshError.
+  refreshGrant(token: T): Promise<T>;
+}
+
+export type RefreshResult<T> = { ok: T } | { fail: RefreshFailure };
+
+// Single-flight refresh + expiry-gated access + 401 handling, identical across providers.
+// Refresh tokens rotate (the old one is invalidated once the grant succeeds), so two concurrent
+// callers racing the same token would make the loser get invalid_grant — sharing one in-flight
+// promise prevents that rotation race.
+export function createOAuthRefresher<T extends RefreshableToken>(store: OAuthStore<T>) {
+  let refreshing: Promise<RefreshResult<T>> | null = null;
+
+  async function refresh(token: T): Promise<RefreshResult<T>> {
+    if (!token.refreshToken) return { fail: "auth_failed" };
+    if (refreshing) return refreshing;
+    refreshing = (async () => {
+      try {
+        const next = await store.refreshGrant(token);
+        await store.write(next);
+        return { ok: next } as RefreshResult<T>;
+      } catch (e) {
+        return { fail: classifyRefreshError(e instanceof Error ? e.message : String(e)) } as RefreshResult<T>;
+      } finally {
+        refreshing = null;
+      }
+    })();
+    return refreshing;
+  }
+
+  // Usable token, refreshing first if near-expiry. auth_failed drops the login (UI flips to
+  // disconnected); a transient failure keeps the stored tokens and just fails this call.
+  async function getFresh(): Promise<T | null> {
+    const token = await store.read();
+    if (!token) return null;
+    if (oauthExpiringSoon(token.expiresAt)) {
+      const r = await refresh(token);
+      if ("ok" in r) return r.ok;
+      if (r.fail === "auth_failed") await store.write(null);
+      return null;
+    }
+    return token;
+  }
+
+  // A 401 on a stream can be a transient/rotation-race blip, not a revoked session. Try a
+  // refresh; only drop the login if the refresh is definitively rejected.
+  async function handleUnauthorized(): Promise<void> {
+    const token = await store.read();
+    if (!token) return;
+    const r = await refresh(token);
+    if ("fail" in r && r.fail === "auth_failed") await store.write(null);
+  }
+
+  return { refresh, getFresh, handleUnauthorized };
+}

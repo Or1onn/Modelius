@@ -3,7 +3,7 @@
 // an in-RAM cache keeps reads synchronous for the UI and the prompt builder.
 import { useEffect, useReducer } from "react";
 import { estimateTokens } from "@/shared/lib/tokens";
-import { vaultEncrypt, vaultDecrypt } from "@/shared/api/secrets";
+import { createVaultStore } from "@/shared/lib/vaultStore";
 
 const STORAGE_KEY = "modelius.memory";
 const EVT = "modelius-memory-changed";
@@ -31,37 +31,19 @@ const isMemory = (m: unknown): m is Memory =>
   !!m && typeof (m as Memory).text === "string" && VALID_KINDS.has((m as Memory).kind);
 
 let cache: Memory[] = [];
-let hydrated = false;
-let hydrating: Promise<void> | null = null;
+
+const store = createVaultStore({
+  key: STORAGE_KEY,
+  apply: (plain) => {
+    const arr = JSON.parse(plain);
+    if (Array.isArray(arr)) cache = arr.filter(isMemory);
+  },
+  snapshot: () => JSON.stringify(cache),
+  onHydrated: () => window.dispatchEvent(new Event(EVT)),
+});
 
 // Decrypt + load memory into RAM once. Idempotent. Tolerant of legacy plaintext.
-export function hydrateMemory(): Promise<void> {
-  if (hydrated) return Promise.resolve();
-  if (!hydrating)
-    hydrating = (async () => {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        let plain: string;
-        try {
-          plain = await vaultDecrypt(raw);
-        } catch {
-          // Vault unavailable — DON'T latch hydrated, or save() would clobber real memory with an
-          // empty list. Allow a retry.
-          hydrating = null;
-          return;
-        }
-        try {
-          const arr = JSON.parse(plain);
-          if (Array.isArray(arr)) cache = arr.filter(isMemory);
-        } catch {
-          /* decrypt succeeded but content is corrupt — keep empty, latch below */
-        }
-      }
-      hydrated = true;
-      window.dispatchEvent(new Event(EVT));
-    })();
-  return hydrating;
-}
+export const hydrateMemory = store.hydrate;
 
 export function getMemories(): Memory[] {
   return cache.slice();
@@ -70,17 +52,7 @@ export function getMemories(): Memory[] {
 function save(list: Memory[]): void {
   cache = list;
   window.dispatchEvent(new Event(EVT));
-  if (!hydrated) {
-    void hydrateMemory(); // load failed earlier — retry rather than persist an empty list over real data
-    return;
-  }
-  void (async () => {
-    try {
-      localStorage.setItem(STORAGE_KEY, await vaultEncrypt(JSON.stringify(list)));
-    } catch {
-      /* ignore */
-    }
-  })();
+  store.persist(); // pre-hydration this retries the load instead of clobbering real data
 }
 
 // Normalized text for case/space-insensitive dedup.

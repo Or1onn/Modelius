@@ -60,7 +60,6 @@ pub(crate) enum PromptChannel {
 // `remove` lists real-credential vars that must never leak into a routed run.
 pub(crate) struct EnvSpec {
     pub base_url: &'static [&'static str],
-    pub base_url_suffix: &'static str, // appended to http://127.0.0.1:{port}
     pub api_key: &'static [&'static str],
     pub model_pins: &'static [&'static str],
     pub remove: &'static [&'static str],
@@ -80,15 +79,6 @@ pub(crate) struct HarnessSpec {
     // Home-relative credential files the CLI's own login writes — best-effort "already signed in"
     // detection (installer.rs harness_logged_in). Empty = no native login modeled.
     pub login_marker: &'static [&'static str],
-    // Argv that exits 0 only when signed in (keyring-backed logins leave no file to check).
-    // Empty = use login_marker.
-    pub login_probe: &'static [&'static str],
-    // Static env always set on the spawned CLI (headless quirks, e.g. workspace-trust opt-ins).
-    pub extra_env: &'static [(&'static str, &'static str)],
-    // Home-relative dirs where the vendor installer drops `bin` — checked by resolve_bin so a
-    // fresh install works even though this process's PATH snapshot predates it. Empty for npm
-    // installs (resolved via the agents prefix / PATH).
-    pub bin_hint: &'static [&'static str],
     pub protocol: Proto, // gateway inbound side when the run is routed
     // How the prompt reaches the CLI (and whether it can run warm — see PromptChannel).
     pub channel: PromptChannel,
@@ -120,9 +110,6 @@ static HARNESSES: &[HarnessSpec] = &[
             version: "2.1.206",
         }),
         login_marker: &[".claude/.credentials.json"],
-        login_probe: &[],
-        extra_env: &[],
-        bin_hint: &[],
         protocol: Proto::Anthropic,
         channel: PromptChannel::ClaudeStream,
         argv: &[
@@ -150,7 +137,6 @@ static HARNESSES: &[HarnessSpec] = &[
         resume_args: &["--resume", "{id}"],
         env: EnvSpec {
             base_url: &["ANTHROPIC_BASE_URL"],
-            base_url_suffix: "",
             api_key: &["ANTHROPIC_AUTH_TOKEN"],
             // With the base URL overridden, the CLI's background small-model calls would 404 on
             // the gateway — pin every internal model to the selected one.
@@ -173,9 +159,6 @@ static HARNESSES: &[HarnessSpec] = &[
         install: Install::Npm("@openai/codex"),
         native_dist: None,
         login_marker: &[".codex/auth.json"],
-        login_probe: &[],
-        extra_env: &[],
-        bin_hint: &[],
         protocol: Proto::OpenAi,
         channel: PromptChannel::CodexRpc,
         argv: &[
@@ -190,7 +173,6 @@ static HARNESSES: &[HarnessSpec] = &[
         resume_args: &[],
         env: EnvSpec {
             base_url: &[], // provider base is carried in route_args (-c …base_url), not an env var
-            base_url_suffix: "",
             api_key: &["MODELIUS_GATEWAY_KEY"], // the provider's env_key ← gateway token
             model_pins: &[],
             remove: &["OPENAI_API_KEY"], // don't leak an inherited key into the routed provider
@@ -220,9 +202,6 @@ static HARNESSES: &[HarnessSpec] = &[
         install: Install::Npm("@moonshot-ai/kimi-code"),
         native_dist: None,
         login_marker: &[".kimi-code/credentials/kimi-code.json"],
-        login_probe: &[],
-        extra_env: &[],
-        bin_hint: &[],
         protocol: Proto::OpenAi, // unused while routable:false (Moonshot's API is OpenAI-compatible)
         channel: PromptChannel::KimiAcp,
         argv: &[Arg::Lit("acp")],
@@ -230,7 +209,6 @@ static HARNESSES: &[HarnessSpec] = &[
         resume_args: &[],
         env: EnvSpec {
             base_url: &[],
-            base_url_suffix: "",
             api_key: &[],
             model_pins: &[],
             remove: &[],

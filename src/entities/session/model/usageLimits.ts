@@ -49,12 +49,20 @@ const subscribe = (cb: () => void) => {
   listeners.add(cb);
   return () => void listeners.delete(cb);
 };
+// Debounced (trailing 1s): rate_limit headers ride every stream, and a stringify +
+// localStorage write per event is waste. A hard kill inside the window loses at most the
+// newest snapshot — the next stream refreshes it.
+let limitsTimer: ReturnType<typeof setTimeout> | null = null;
 const persistLimits = () => {
-  try {
-    localStorage.setItem(LIMITS_KEY, JSON.stringify(Object.fromEntries(limits)));
-  } catch {
-    /* quota / private mode — the RAM copy still works this session */
-  }
+  if (limitsTimer != null) return;
+  limitsTimer = setTimeout(() => {
+    limitsTimer = null;
+    try {
+      localStorage.setItem(LIMITS_KEY, JSON.stringify(Object.fromEntries(limits)));
+    } catch {
+      /* quota / private mode — the RAM copy still works this session */
+    }
+  }, 1000);
 };
 const persistSpend = () => {
   try {
@@ -200,9 +208,6 @@ export function setChatProvider(chatId: string, key: ProviderKey): void {
   if (chatProvider.get(chatId) === key) return;
   chatProvider.set(chatId, key);
   emit();
-}
-export function getChatProvider(chatId: string): ProviderKey | undefined {
-  return chatProvider.get(chatId);
 }
 
 // Refresh a provider's usage when the meter opens: OpenRouter → real $ balance; Claude/Codex

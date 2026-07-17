@@ -12,6 +12,7 @@ import { diffLines } from "@/shared/lib/diff";
 import { langFromPath, highlightHtml } from "@/shared/lib/highlight";
 import { allowPermission, denyPermission, type PermissionRequestData } from "@/features/run-agent/lib/permission";
 import { setCodeConfig } from "@/features/run-agent/lib/codeChatRegistry";
+import { basename } from "@/shared/lib/paths";
 
 export type DiffRow = { n?: number; t: "ctx" | "add" | "del"; c: string };
 export type ToolItem = {
@@ -27,7 +28,6 @@ export type ToolItem = {
   isError?: boolean;
 };
 
-const basename = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 const SHELL_VERBS = new Set(["Bash", "PowerShell", "Ran"]);
 const EXPLORING = new Set(["Read", "Grep", "Glob", "WebSearch", "WebFetch"]);
 

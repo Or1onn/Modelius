@@ -133,16 +133,19 @@ where
             return Ok(());
         }
         buf.extend_from_slice(&bytes);
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            // Parse the line in place, then drain it — avoids a Vec allocation per SSE line.
-            let line = String::from_utf8_lossy(&buf[..pos]);
+        // Lines are parsed in place behind a cursor; consumed bytes are drained once per chunk
+        // (a per-line drain would memmove the whole remaining buffer for every line).
+        let mut cursor = 0;
+        while let Some(rel) = buf[cursor..].iter().position(|&b| b == b'\n') {
+            let pos = cursor + rel;
+            let line = String::from_utf8_lossy(&buf[cursor..pos]);
             let data = line.trim().strip_prefix("data:").map(str::trim).unwrap_or("");
-            let brk = !data.is_empty() && on_data(data).is_break();
-            buf.drain(..=pos);
-            if brk {
+            cursor = pos + 1;
+            if !data.is_empty() && on_data(data).is_break() {
                 return Ok(());
             }
         }
+        buf.drain(..cursor);
     }
     Ok(())
 }
@@ -171,5 +174,81 @@ mod tests {
         assert_eq!(err_prefix("Anthropic", 429, &h), "Anthropic 429 (retry-after: 30s)");
         h.insert("retry-after", "soon".parse().unwrap()); // non-numeric → ignored
         assert_eq!(err_prefix("OpenAI", 429, &h), "OpenAI 429");
+    }
+
+    // One-shot SSE upstream: answers the request head, then writes each body piece separately
+    // (with a small delay) so pump_sse sees them as distinct chunks.
+    async fn serve_chunks(chunks: Vec<Vec<u8>>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 2048];
+            let _ = sock.read(&mut head).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            sock.flush().await.unwrap();
+            for c in chunks {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                sock.write_all(&c).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+        port
+    }
+
+    async fn get(port: u16) -> Response {
+        http_client().get(format!("http://127.0.0.1:{}", port)).send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn pump_sse_reassembles_lines_split_across_chunks() {
+        // A CRLF line split mid-line, and a multibyte word split mid-character.
+        let word = "привет".as_bytes();
+        let mut c2 = b"lo\r\n\r\ndata: ".to_vec();
+        c2.extend_from_slice(&word[..3]); // ends inside 'р'
+        let mut c3 = word[3..].to_vec();
+        c3.extend_from_slice(b"\n\n");
+        let port = serve_chunks(vec![b"data: hel".to_vec(), c2, c3]).await;
+
+        let mut seen: Vec<String> = Vec::new();
+        let cancel = AtomicBool::new(false);
+        pump_sse(get(port).await, &cancel, |d| {
+            seen.push(d.to_string());
+            ControlFlow::Continue(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen, vec!["hello", "привет"]);
+    }
+
+    #[tokio::test]
+    async fn pump_sse_stops_on_break_and_skips_the_rest() {
+        let port = serve_chunks(vec![b"data: a\n\ndata: stop\n\ndata: never\n\n".to_vec()]).await;
+        let mut seen: Vec<String> = Vec::new();
+        let cancel = AtomicBool::new(false);
+        pump_sse(get(port).await, &cancel, |d| {
+            seen.push(d.to_string());
+            if d == "stop" { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen, vec!["a", "stop"]);
+    }
+
+    #[tokio::test]
+    async fn pump_sse_returns_early_when_cancelled() {
+        let port = serve_chunks(vec![b"data: x\n\n".to_vec()]).await;
+        let mut seen: Vec<String> = Vec::new();
+        let cancel = AtomicBool::new(true);
+        pump_sse(get(port).await, &cancel, |d| {
+            seen.push(d.to_string());
+            ControlFlow::Continue(())
+        })
+        .await
+        .unwrap();
+        assert!(seen.is_empty(), "cancelled pump must not dispatch: {seen:?}");
     }
 }

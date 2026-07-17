@@ -5,7 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { clearModelCache } from "@/shared/lib/modelCache";
 import { secretGet, secretSet, secretDelete } from "@/shared/api/secrets";
-import { readOAuthMeta, oauthPresent, oauthExpiringSoon, classifyRefreshError, type OAuthPresenceMeta, type RefreshFailure } from "@/entities/session/model/oauthShared";
+import { readOAuthMeta, oauthPresent, oauthExpiringSoon, createOAuthRefresher, type OAuthPresenceMeta } from "@/entities/session/model/oauthShared";
 
 // OAuth client/flow constants — shared with the connect feature.
 export const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -120,36 +120,22 @@ export async function disconnectOpenAIOAuth(): Promise<void> {
   clearModelCache();
 }
 
-type RefreshResult = { ok: OpenAIToken } | { fail: RefreshFailure };
-
-// Single-flight the refresh — refresh tokens rotate, so concurrent callers racing the same token
-// would make the loser get invalid_grant. See anthropicSession for the same guard.
-let refreshing: Promise<RefreshResult> | null = null;
-
-async function refresh(token: OpenAIToken): Promise<RefreshResult> {
-  if (!token.refreshToken) return { fail: "auth_failed" };
-  if (refreshing) return refreshing;
-  refreshing = (async () => {
-    try {
-      const data = await invoke<TokenResponse>("openai_oauth_token", {
-        form: {
-          grant_type: "refresh_token",
-          refresh_token: token.refreshToken,
-          client_id: CLIENT_ID,
-          scope: SCOPES,
-        },
-      });
-      const next = fromResponse(data, token);
-      await write(next);
-      return { ok: next } as RefreshResult;
-    } catch (e) {
-      return { fail: classifyRefreshError(e instanceof Error ? e.message : String(e)) } as RefreshResult;
-    } finally {
-      refreshing = null;
-    }
-  })();
-  return refreshing;
-}
+// Single-flight refresh / expiry gate / 401 handling shared with the Anthropic store (oauthShared).
+const oauth = createOAuthRefresher<OpenAIToken>({
+  read,
+  write,
+  refreshGrant: async (token) => {
+    const data = await invoke<TokenResponse>("openai_oauth_token", {
+      form: {
+        grant_type: "refresh_token",
+        refresh_token: token.refreshToken,
+        client_id: CLIENT_ID,
+        scope: SCOPES,
+      },
+    });
+    return fromResponse(data, token);
+  },
+});
 
 // Full token set for the codex CLI's auth.json (agent runs on the connected ChatGPT account).
 // Refreshes when near-expiry — or when id_token is missing (logins saved before it was stored),
@@ -166,7 +152,7 @@ export async function getCodexAuth(): Promise<CodexAuth | null> {
   if (!token) return null;
   const expiringSoon = oauthExpiringSoon(token.expiresAt);
   if (expiringSoon || !token.idToken) {
-    const r = await refresh(token);
+    const r = await oauth.refresh(token);
     if ("ok" in r) token = r.ok;
     else if (expiringSoon) return null; // keep stored state; getOpenAIAuth owns the drop-on-fail path
   }
@@ -181,22 +167,10 @@ export async function getCodexAuth(): Promise<CodexAuth | null> {
 
 // Usable access token + account id, refreshing first if near-expiry.
 export async function getOpenAIAuth(): Promise<{ token: string; accountId: string } | null> {
-  const token = await read();
-  if (!token) return null;
-  if (oauthExpiringSoon(token.expiresAt)) {
-    const r = await refresh(token);
-    if ("ok" in r) return { token: r.ok.accessToken, accountId: r.ok.accountId };
-    if (r.fail === "auth_failed") await write(null); // token truly dead → drop, UI flips to disconnected
-    return null; // transient → keep the stored tokens; just fail this call
-  }
-  return { token: token.accessToken, accountId: token.accountId };
+  const token = await oauth.getFresh();
+  return token ? { token: token.accessToken, accountId: token.accountId } : null;
 }
 
-// A 401 on a stream can be a transient/rotation-race blip, not a revoked session. Try a refresh;
-// only drop the login if the refresh is definitively rejected (auth_failed / no refresh token).
 export async function handleOpenAIUnauthorized(): Promise<void> {
-  const token = await read();
-  if (!token) return;
-  const r = await refresh(token);
-  if ("fail" in r && r.fail === "auth_failed") await write(null);
+  return oauth.handleUnauthorized();
 }

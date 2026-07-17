@@ -1,10 +1,11 @@
 // markdown.tsx — GFM rendering + the fenced-block splitter shared by the chat thread.
-import { useState, isValidElement, type MouseEvent, type ReactNode } from "react";
+import { isValidElement, memo, type MouseEvent, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Icon } from "@/shared/ui/Icon";
+import { useCopyButton } from "@/shared/lib/useCopyButton";
 
 // Open links in the system browser, not the webview.
 export function openExternal(e: MouseEvent<HTMLAnchorElement>, href?: string) {
@@ -64,27 +65,17 @@ export const codeSegs = (text: string) =>
 // Fenced code block: lang label + copy button; overrides react-markdown's `pre`.
 // Only small/inline blocks reach here — large/streaming ones become cards upstream.
 function CodeBlock({ children }: { children?: ReactNode }) {
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyButton();
   const codeEl = isValidElement<{ className?: string; children?: ReactNode }>(children) ? children : null;
   const className = codeEl?.props.className ?? "";
   const lang = /language-(\w+)/.exec(className)?.[1] ?? "text";
   const inner = codeEl ? codeEl.props.children : children;
 
-  function copy() {
-    navigator.clipboard?.writeText(nodeText(inner).replace(/\n$/, "")).then(
-      () => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1400);
-      },
-      () => {}
-    );
-  }
-
   return (
     <div className="code-block">
       <div className="code-head">
         <span className="code-lang">{lang}</span>
-        <button className="code-copy" onClick={copy} title="Copy code">
+        <button className="code-copy" onClick={() => copy(nodeText(inner).replace(/\n$/, ""))} title="Copy code">
           <Icon name={copied ? "check" : "copy"} size={12} />
           {copied ? "Copied" : "Copy"}
         </button>
@@ -106,10 +97,11 @@ const MD_COMPONENTS: Components = {
 };
 
 // GFM rendering for assistant messages; tolerant of partial markdown mid-stream.
-export function Markdown({ text }: { text: string }) {
+// Memoized — parsing is the expensive part, and only the actively streaming text changes.
+export const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
     <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[[rehypeHighlight, { detect: false, ignoreMissing: true }]]} components={MD_COMPONENTS}>
       {text}
     </ReactMarkdown>
   );
-}
+});

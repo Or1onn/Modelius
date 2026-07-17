@@ -38,16 +38,6 @@ pub(crate) fn resolve_bin(app: &tauri::AppHandle, bin: &str) -> Option<PathBuf> 
             return Some(p);
         }
     }
-    if let Some(spec) = spec {
-        use tauri::Manager;
-        if let Ok(home) = app.path().home_dir() {
-            for hint in spec.bin_hint {
-                if let Some(p) = bin_in_dir(&home.join(hint), bin) {
-                    return Some(p);
-                }
-            }
-        }
-    }
     which::which(bin).ok()
 }
 
@@ -189,25 +179,13 @@ pub async fn harness_status(app: tauri::AppHandle) -> Vec<HarnessStatus> {
         .collect()
 }
 
-// Best-effort "already signed in via the CLI's own login" check. Preferred signal is the spec's
-// login_probe (a CLI command that exits 0 only when authenticated — keyring-backed logins leave
-// no file); fallback is the presence of the spec's credential files. False negatives are possible
-// (e.g. macOS keychain-backed logins), so callers should offer a bypass rather than hard-block.
+// Best-effort "already signed in via the CLI's own login" check: presence of the spec's
+// credential files. False negatives are possible (e.g. macOS keychain-backed logins), so
+// callers should offer a bypass rather than hard-block.
 #[tauri::command]
 pub async fn harness_logged_in(app: tauri::AppHandle, harness: String) -> Result<bool, String> {
     use tauri::Manager;
     let spec = harness::spec(&harness).ok_or_else(|| format!("unknown harness: {harness}"))?;
-    if !spec.login_probe.is_empty() {
-        let Some(bin) = resolve_bin(&app, spec.bin) else { return Ok(false) };
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.args(spec.login_probe)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let st = tokio::time::timeout(Duration::from_secs(20), cmd.status()).await;
-        return Ok(matches!(st, Ok(Ok(s)) if s.success()));
-    }
     let home = app.path().home_dir().map_err(|e| format!("no home dir: {e}"))?;
     Ok(spec.login_marker.iter().any(|m| home.join(m).exists()))
 }

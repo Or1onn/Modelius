@@ -1,4 +1,5 @@
 import type { UIMessageChunk } from "./uiMessageChunk";
+import { finishTurn, startGate } from "./baseTransformer";
 
 // Codex `app-server` JSON-RPC notifications → AI SDK UIMessageChunk. The warm per-chat process
 // (session.rs) forwards every stdout line raw; this decodes the v2 thread/turn surface
@@ -8,8 +9,7 @@ import type { UIMessageChunk } from "./uiMessageChunk";
 // so the shared renderer treats Claude and Codex uniformly. Approval server requests never reach
 // here — codeTransport intercepts them into data-permission parts.
 export function createCodexAppServerTransformer() {
-  let started = false;
-  let startTime: number | null = null;
+  const gate = startGate();
   let threadId: string | undefined;
   const openText = new Set<string>(); // agentMessage item ids with a text-start emitted
   const openReasoning = new Set<string>(); // reasoning item ids with a reasoning-start emitted
@@ -47,7 +47,7 @@ export function createCodexAppServerTransformer() {
       cacheReadInputTokens: totals.cachedInputTokens - turnBase.cachedInputTokens,
       outputTokens: totals.outputTokens - turnBase.outputTokens,
       totalTokens: totals.totalTokens - turnBase.totalTokens,
-      durationMs: durationMs ?? (startTime ? Date.now() - startTime : undefined),
+      durationMs: durationMs ?? gate.elapsed(),
     };
   }
 
@@ -162,12 +162,7 @@ export function createCodexAppServerTransformer() {
     if (typeof p.threadId === "string") threadId = p.threadId;
     if (typeof p.thread?.id === "string") threadId = p.thread.id;
 
-    if (!started) {
-      started = true;
-      startTime = Date.now();
-      yield { type: "start" };
-      yield { type: "start-step" };
-    }
+    yield* gate.ensure();
 
     switch (method) {
       case "turn/started":
@@ -213,10 +208,7 @@ export function createCodexAppServerTransformer() {
         if (status === "failed") {
           yield { type: "error", errorText: turn.error?.message ?? "turn failed" };
         }
-        const m = meta(status === "completed" ? "success" : status, turn.durationMs ?? undefined);
-        yield { type: "message-metadata", messageMetadata: m };
-        yield { type: "finish-step" };
-        yield { type: "finish", messageMetadata: m };
+        yield* finishTurn(meta(status === "completed" ? "success" : status, turn.durationMs ?? undefined));
         return;
       }
 

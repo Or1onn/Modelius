@@ -1,7 +1,7 @@
 // extractMemories.ts — reconcile long-term memory against a finished turn via a cheap backend.
 // Best-effort: any failure → no ops. In the page because it drives streamLLM.
 import { MEMORY_EXTRACT_PROMPT } from "@/shared/config/prompts";
-import { streamLLM } from "@/features/stream-completion/model/streamLLM";
+import { collectText } from "@/features/stream-completion/lib/collectText";
 import { parseMemoryOps } from "@/features/extract-memory/lib/parse";
 import type { Backend } from "@/entities/model/model/backend";
 import type { Memory, MemoryOp } from "@/entities/memory/model/memory";
@@ -21,9 +21,7 @@ export async function extractMemories(
     MEMORY_EXTRACT_PROMPT + `Known facts:\n${known}\n\nLatest exchange:\nUser: ${lastUser}\nAssistant: ${lastAssistant}`;
   let out = "";
   try {
-    for await (const d of streamLLM(backend, [{ role: "user", content: prompt }])) {
-      if (d.kind === "text") out += d.text;
-    }
+    out = await collectText(backend, prompt);
   } catch {
     return [];
   }

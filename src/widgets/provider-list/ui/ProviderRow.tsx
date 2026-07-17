@@ -1,6 +1,7 @@
 // ProviderRow.tsx — provider settings row + inline connect/manage panels (real keys/OAuth/live models).
-import { useEffect, useRef, useState, type UIEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Icon } from "@/shared/ui/Icon";
+import { usePagedScroll } from "@/shared/lib/usePagedScroll";
 import { MODELS, PROVIDERS } from "@/entities/model/model/registry";
 import { ProviderLogo } from "@/entities/model/ui/ProviderLogo";
 import { useKeyStore, validateKey, keyHint, maskKey } from "@/entities/session/model/keys";
@@ -16,7 +17,6 @@ import { useOpenAIAuth } from "@/features/connect-openai/model/openaiAuth";
 // Reachability of the local daemon (Ollama): unknown until probed, then up/down.
 export type LocalStatus = "checking" | "up" | "down";
 
-const OAUTH = new Set(["anthropic", "openai"]); // have account sign-in
 const LIVE = new Set(["openai", "anthropic"]); // key can fetch a live model list
 const KEY_LIVE = new Set(["google", "groq", "openrouter"]); // key fetches a live list over the OpenAI-compat endpoint
 
@@ -99,14 +99,143 @@ function CostNode({ pid }: { pid: string }) {
   );
 }
 
-// ---------- inline connect ----------
-function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => void }) {
-  const p = PROVIDERS[pid];
-  const { setKey } = useKeyStore();
-  // OAuth hooks called unconditionally (rules of hooks); only the relevant one is used.
-  const { beginAnthropicLogin, completeAnthropicLogin } = useAnthropicAuth();
-  const { connectOpenAI } = useOpenAIAuth();
+// ---------- inline connect (one component per flow) ----------
 
+// Brand chip shown on the OAuth buttons.
+function OAuthChip({ pid }: { pid: string }) {
+  const p = PROVIDERS[pid];
+  return (
+    <span className="pv-oauth-chip" style={{ background: p.color }}>
+      <ProviderLogo pid={pid} short={p.short} />
+    </span>
+  );
+}
+
+function OAuthError({ err }: { err: string | null }) {
+  if (!err) return null;
+  return (
+    <div className="key-hint err">
+      <Icon name="alert" size={13} />
+      {err}
+    </div>
+  );
+}
+
+// Anthropic OAuth: open the browser, then paste the authorization code shown on the page.
+function AnthropicConnect({ onConnected }: { onConnected: () => void }) {
+  const { beginAnthropicLogin, completeAnthropicLogin } = useAnthropicAuth();
+  const [stage, setStage] = useState<"idle" | "awaiting" | "exchanging">("idle");
+  const [code, setCode] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  async function start() {
+    setErr(null);
+    try {
+      await beginAnthropicLogin();
+      setStage("awaiting");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Couldn't open the login page.");
+    }
+  }
+  async function finish() {
+    if (!code.trim()) return;
+    setStage("exchanging");
+    setErr(null);
+    try {
+      await completeAnthropicLogin(code);
+      onConnected();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Couldn't complete sign-in.");
+      setStage("awaiting");
+    }
+  }
+
+  return (
+    <>
+      {stage === "idle" ? (
+        <button className="pv-oauth" onClick={start}>
+          <OAuthChip pid="anthropic" />
+          Connect Claude account
+        </button>
+      ) : (
+        <div>
+          <div className="field-label">
+            <Icon name="key" size={13} />
+            Authorization code
+          </div>
+          <div className="key-input">
+            <input
+              autoFocus
+              spellCheck={false}
+              placeholder="Paste authorization code"
+              value={code}
+              disabled={stage === "exchanging"}
+              onChange={(e) => setCode(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && finish()}
+            />
+          </div>
+          <div className="key-hint">
+            <Icon name="lock" size={13} />
+            Authorize in your browser, then paste the code shown on the page.
+          </div>
+          <button
+            className="prov-cta primary"
+            style={{ alignSelf: "flex-start", marginTop: 10 }}
+            disabled={!code.trim() || stage === "exchanging"}
+            onClick={finish}
+          >
+            {stage === "exchanging" ? (
+              <>
+                <span className="mini-spin" />
+                Finishing…
+              </>
+            ) : (
+              <>
+                <Icon name="check" size={15} />
+                Finish sign-in
+              </>
+            )}
+          </button>
+        </div>
+      )}
+      <OAuthError err={err} />
+    </>
+  );
+}
+
+// OpenAI OAuth: one-click loopback sign-in through the system browser.
+function OpenAIConnect({ onConnected }: { onConnected: () => void }) {
+  const { connectOpenAI } = useOpenAIAuth();
+  const [connecting, setConnecting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function start() {
+    setErr(null);
+    setConnecting(true);
+    try {
+      await connectOpenAI();
+      onConnected();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Sign-in failed.");
+    } finally {
+      setConnecting(false);
+    }
+  }
+
+  return (
+    <>
+      <button className="pv-oauth" disabled={connecting} onClick={start}>
+        {connecting ? <span className="mini-spin" /> : <OAuthChip pid="openai" />}
+        {connecting ? "Waiting for browser…" : "Sign in with ChatGPT"}
+      </button>
+      <OAuthError err={err} />
+    </>
+  );
+}
+
+// API-key entry with validate → keychain store → success flash.
+function KeyConnect({ pid, onConnected }: { pid: string; onConnected: () => void }) {
+  const { setKey } = useKeyStore();
   const [val, setVal] = useState("");
   const [show, setShow] = useState(false);
   const [state, setState] = useState<"idle" | "error" | "success">("idle");
@@ -115,12 +244,6 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
   useEffect(() => {
     ref.current?.focus();
   }, []);
-
-  // OAuth state (anthropic = paste-code step; openai = one-click loopback).
-  const [anthStage, setAnthStage] = useState<"idle" | "awaiting" | "exchanging">("idle");
-  const [code, setCode] = useState("");
-  const [connecting, setConnecting] = useState(false);
-  const [oauthErr, setOauthErr] = useState<string | null>(null);
 
   function fail() {
     setState("error");
@@ -140,118 +263,10 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
     setState("success");
     setTimeout(onConnected, 520);
   }
-
-  async function startAnth() {
-    setOauthErr(null);
-    try {
-      await beginAnthropicLogin();
-      setAnthStage("awaiting");
-    } catch (e) {
-      setOauthErr(e instanceof Error ? e.message : "Couldn't open the login page.");
-    }
-  }
-  async function finishAnth() {
-    if (!code.trim()) return;
-    setAnthStage("exchanging");
-    setOauthErr(null);
-    try {
-      await completeAnthropicLogin(code);
-      onConnected();
-    } catch (e) {
-      setOauthErr(e instanceof Error ? e.message : "Couldn't complete sign-in.");
-      setAnthStage("awaiting");
-    }
-  }
-  async function startOai() {
-    setOauthErr(null);
-    setConnecting(true);
-    try {
-      await connectOpenAI();
-      onConnected();
-    } catch (e) {
-      setOauthErr(e instanceof Error ? e.message : "Sign-in failed.");
-    } finally {
-      setConnecting(false);
-    }
-  }
   const success = state === "success";
 
   return (
-    <div className="pv-keyform">
-      {OAUTH.has(pid) && (
-        <>
-          {pid === "anthropic" ? (
-            anthStage === "idle" ? (
-              <button className="pv-oauth" onClick={startAnth}>
-                <span className="pv-oauth-chip" style={{ background: p.color }}>
-                  <ProviderLogo pid={pid} short={p.short} />
-                </span>
-                Connect Claude account
-              </button>
-            ) : (
-              <div>
-                <div className="field-label">
-                  <Icon name="key" size={13} />
-                  Authorization code
-                </div>
-                <div className="key-input">
-                  <input
-                    autoFocus
-                    spellCheck={false}
-                    placeholder="Paste authorization code"
-                    value={code}
-                    disabled={anthStage === "exchanging"}
-                    onChange={(e) => setCode(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && finishAnth()}
-                  />
-                </div>
-                <div className="key-hint">
-                  <Icon name="lock" size={13} />
-                  Authorize in your browser, then paste the code shown on the page.
-                </div>
-                <button
-                  className="prov-cta primary"
-                  style={{ alignSelf: "flex-start", marginTop: 10 }}
-                  disabled={!code.trim() || anthStage === "exchanging"}
-                  onClick={finishAnth}
-                >
-                  {anthStage === "exchanging" ? (
-                    <>
-                      <span className="mini-spin" />
-                      Finishing…
-                    </>
-                  ) : (
-                    <>
-                      <Icon name="check" size={15} />
-                      Finish sign-in
-                    </>
-                  )}
-                </button>
-              </div>
-            )
-          ) : (
-            <button className="pv-oauth" disabled={connecting} onClick={startOai}>
-              {connecting ? (
-                <span className="mini-spin" />
-              ) : (
-                <span className="pv-oauth-chip" style={{ background: p.color }}>
-                  <ProviderLogo pid={pid} short={p.short} />
-                </span>
-              )}
-              {connecting ? "Waiting for browser…" : "Sign in with ChatGPT"}
-            </button>
-          )}
-          {oauthErr && (
-            <div className="key-hint err">
-              <Icon name="alert" size={13} />
-              {oauthErr}
-            </div>
-          )}
-        </>
-      )}
-
-      {!OAUTH.has(pid) && (
-        <>
+    <>
       <div>
         <div className="field-label">
           <Icon name="key" size={13} />
@@ -311,10 +326,61 @@ function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => v
           </>
         )}
       </button>
-        </>
+    </>
+  );
+}
+
+function ConnectInline({ pid, onConnected }: { pid: string; onConnected: () => void }) {
+  return (
+    <div className="pv-keyform">
+      {pid === "anthropic" ? (
+        <AnthropicConnect onConnected={onConnected} />
+      ) : pid === "openai" ? (
+        <OpenAIConnect onConnected={onConnected} />
+      ) : (
+        <KeyConnect pid={pid} onConnected={onConnected} />
       )}
     </div>
   );
+}
+
+// Live model list + connection kind for a provider row: seeded from the cache for an instant
+// render (null = cold → loading), revalidated once on mount. `keepOnError` keeps the seeded
+// value on a failed fetch (the count fallback); default empties it (the manage list's "down"
+// state). Shared by ManageInline (full list) and ProviderRow (count only).
+function useProviderModels(
+  pid: string,
+  opts?: { keepOnError?: boolean; onFetched?: (ok: boolean) => void }
+) {
+  const local = PROVIDERS[pid].local;
+  const { hasKey } = useKeyStore();
+  const { connected: anthConnected } = useAnthropicAuth();
+  const { connected: oaiConnected } = useOpenAIAuth();
+  const viaKey = !local && hasKey(pid);
+  const viaOAuth = (pid === "anthropic" && anthConnected) || (pid === "openai" && oaiConnected);
+  const src = providerModelSource(pid, viaKey, viaOAuth);
+  const [live, setLive] = useState<RemoteModel[] | null>(() => (src ? src.peek() : []));
+  useEffect(() => {
+    if (!src) return;
+    let alive = true;
+    src
+      .fetch()
+      .then((ms) => {
+        if (!alive) return;
+        setLive(ms);
+        opts?.onFetched?.(true);
+      })
+      .catch(() => {
+        if (!alive) return;
+        if (!opts?.keepOnError) setLive([]);
+        opts?.onFetched?.(false);
+      });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return { live, setLive, viaKey, viaOAuth, hasSource: !!src };
 }
 
 // ---------- inline manage ----------
@@ -329,12 +395,9 @@ function ManageInline({
 }) {
   const p = PROVIDERS[pid];
   const local = p.local;
-  const { getKey, hasKey, clearKey } = useKeyStore();
+  const { getKey, clearKey } = useKeyStore();
   const { connected: anthConnected, disconnectAnthropicOAuth } = useAnthropicAuth();
   const { connected: oaiConnected, disconnectOpenAIOAuth } = useOpenAIAuth();
-
-  const viaKey = !local && hasKey(pid);
-  const viaOAuth = (pid === "anthropic" && anthConnected) || (pid === "openai" && oaiConnected);
 
   const [show, setShow] = useState(false);
   const [confirm, setConfirm] = useState(false);
@@ -343,6 +406,12 @@ function ManageInline({
     if (local) setReachable(s === "up");
     onStatus?.(s);
   };
+
+  const { live, setLive, viaKey, viaOAuth } = useProviderModels(pid, {
+    onFetched: (ok) => {
+      if (local) report(ok ? "up" : "down"); // daemon answered → reachable (even with zero models)
+    },
+  });
 
   // Key value is in the keychain (async); load it for the masked/revealed display.
   const [keyVal, setKeyVal] = useState("");
@@ -356,31 +425,6 @@ function ManageInline({
       alive = false;
     };
   }, [viaKey, viaOAuth, pid, getKey]);
-
-  // Live model list: installed models for Ollama, account models for OAuth, key's real list for live keys, else registry.
-  const src = providerModelSource(pid, viaKey, viaOAuth);
-  // Seed from cache for instant render (no loading flash); effect revalidates. null = cold → loading.
-  const [live, setLive] = useState<RemoteModel[] | null>(() => (src ? src.peek() : []));
-  useEffect(() => {
-    if (!src) return;
-    let alive = true;
-    src
-      .fetch()
-      .then((ms) => {
-        if (!alive) return;
-        setLive(ms);
-        if (local) report("up"); // daemon answered → reachable (even with zero models)
-      })
-      .catch(() => {
-        if (!alive) return;
-        setLive([]);
-        if (local) report("down"); // daemon unreachable → not running / not installed
-      });
-    return () => {
-      alive = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   async function recheckOllama() {
     setLive(null);
@@ -405,17 +449,11 @@ function ManageInline({
   const useLive = !!live && live.length > 0;
 
   // Reveal the live list in pages (the full catalog is cached; large providers like OpenRouter
-  // have 300+). Render the first PAGE, then grow by PAGE as the list is scrolled to its end.
+  // have 300+). New data restarts from the first page.
   const PAGE = 40;
-  const [shown, setShown] = useState(PAGE);
-  useEffect(() => setShown(PAGE), [live]);
   const total = live?.length ?? 0;
-  const onModelsScroll = (e: UIEvent<HTMLDivElement>) => {
-    const el = e.currentTarget;
-    if (el.scrollHeight - el.scrollTop - el.clientHeight < 32) {
-      setShown((n) => (n < total ? n + PAGE : n));
-    }
-  };
+  const { shown, setShown, onScroll: onModelsScroll } = usePagedScroll(total, PAGE);
+  useEffect(() => setShown(PAGE), [live, setShown]);
 
   return (
     <div className="pv-manage">
@@ -537,6 +575,38 @@ function ManageInline({
 }
 
 // ---------- provider row ----------
+
+// Status dot + expand toggle on the right of a row (connected/local variants).
+function RowStatus({
+  dot,
+  label,
+  expanded,
+  onToggle,
+}: {
+  dot: string;
+  label: string;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <>
+      <span className={"pv-dot " + dot} />
+      <button
+        className="pv-config"
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggle();
+        }}
+      >
+        {label}
+        <span className={"pv-chev" + (expanded ? " open" : "")}>
+          <Icon name="chevron" size={13} />
+        </span>
+      </button>
+    </>
+  );
+}
+
 export function ProviderRow({
   pid,
   configured,
@@ -556,31 +626,10 @@ export function ProviderRow({
   const local = p.local;
 
   // Real model count: live list for providers that fetch one (Ollama, OAuth accounts, key-live
-  // catalogs like OpenRouter), the static registry otherwise. Seed from cache, then revalidate.
-  const { hasKey } = useKeyStore();
-  const { connected: anthConnected } = useAnthropicAuth();
-  const { connected: oaiConnected } = useOpenAIAuth();
-  const viaKey = !local && hasKey(pid);
-  const viaOAuth = (pid === "anthropic" && anthConnected) || (pid === "openai" && oaiConnected);
-  const src = providerModelSource(pid, viaKey, viaOAuth);
-
-  const [liveCount, setLiveCount] = useState<number | null>(() => (src ? src.peek()?.length ?? null : null));
-  useEffect(() => {
-    if (!src) return;
-    let alive = true;
-    src
-      .fetch()
-      .then((ms) => alive && setLiveCount(ms.length))
-      .catch(() => {
-        /* keep the registry fallback */
-      });
-    return () => {
-      alive = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const count = liveCount ?? modelsOf(pid).length;
+  // catalogs like OpenRouter), the static registry otherwise. keepOnError keeps the seeded
+  // cache value (registry fallback) on a failed fetch.
+  const { live, hasSource } = useProviderModels(pid, { keepOnError: true });
+  const count = hasSource && live ? live.length : modelsOf(pid).length;
 
   return (
     <div className="pv-rowblock">
@@ -600,39 +649,14 @@ export function ProviderRow({
         </div>
         <div className="pv-rowright">
           {local ? (
-            <>
-              <span
-                className={"pv-dot " + (localStatus === "up" ? "green" : localStatus === "down" ? "warn" : "muted")}
-              />
-              <button
-                className="pv-config"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onToggle();
-                }}
-              >
-                {localStatus === "up" ? "Connected" : localStatus === "down" ? "Not running" : "Checking…"}
-                <span className={"pv-chev" + (expanded ? " open" : "")}>
-                  <Icon name="chevron" size={13} />
-                </span>
-              </button>
-            </>
+            <RowStatus
+              dot={localStatus === "up" ? "green" : localStatus === "down" ? "warn" : "muted"}
+              label={localStatus === "up" ? "Connected" : localStatus === "down" ? "Not running" : "Checking…"}
+              expanded={expanded}
+              onToggle={onToggle}
+            />
           ) : configured ? (
-            <>
-              <span className="pv-dot green" />
-              <button
-                className="pv-config"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onToggle();
-                }}
-              >
-                Connected
-                <span className={"pv-chev" + (expanded ? " open" : "")}>
-                  <Icon name="chevron" size={13} />
-                </span>
-              </button>
-            </>
+            <RowStatus dot="green" label="Connected" expanded={expanded} onToggle={onToggle} />
           ) : (
             <button
               className="pv-connect"

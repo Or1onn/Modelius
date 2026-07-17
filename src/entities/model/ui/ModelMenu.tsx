@@ -2,9 +2,10 @@
 // menu with a search filter, provider group headers, brand logos, and a paged scroll list (large
 // catalogs like OpenRouter are 300+). Presentational: the caller supplies flat items and reacts
 // to onSelect. Reuses the .model-pick / .model-menu styles ChatScreen introduced.
-import { Fragment, useEffect, useRef, useState, type ReactNode, type UIEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { Icon } from "@/shared/ui/Icon";
 import { useOutsideClick } from "@/shared/lib/useOutsideClick";
+import { usePagedScroll } from "@/shared/lib/usePagedScroll";
 import { PROVIDERS } from "@/entities/model/model/registry";
 import { ProviderLogo } from "@/entities/model/ui/ProviderLogo";
 
@@ -60,7 +61,6 @@ export function ModelMenu({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [refreshing, setRefreshing] = useState(false);
-  const [shown, setShown] = useState(PAGE);
   const wrapRef = useRef<HTMLDivElement>(null);
   const scrollPending = useRef(false);
 
@@ -79,6 +79,8 @@ export function ModelMenu({
     : items;
   const lead = renderLeading?.(q) ?? null; // leading rows (e.g. "Auto") — also suppresses the "no models" message
 
+  const { shown, setShown, onScroll } = usePagedScroll(filtered.length, PAGE);
+
   // On open with no search, page far enough to include the selection and scroll it into view;
   // while searching, restart paging from the top.
   useEffect(() => {
@@ -93,13 +95,6 @@ export function ModelMenu({
     setShown(PAGE);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, q]);
-
-  const onScroll = (e: UIEvent<HTMLDivElement>) => {
-    const el = e.currentTarget;
-    if (el.scrollHeight - el.scrollTop - el.clientHeight < 32) {
-      setShown((n) => (n < filtered.length ? n + PAGE : n));
-    }
-  };
 
   function pick(key: string) {
     onSelect(key);

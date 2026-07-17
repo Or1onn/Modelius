@@ -26,6 +26,7 @@ import { ShortcutsModal } from "@/widgets/shortcuts-modal/ui/ShortcutsModal";
 import { Sidebar } from "@/app/ui/Sidebar";
 import { WindowControls } from "@/app/ui/WindowControls";
 import { Icon } from "@/shared/ui/Icon";
+import { dragResize, persistWidth, restoreWidth } from "@/shared/lib/dragResize";
 import type { ScreenId } from "@/app/ui/ChatGroup";
 
 // Fixed theme (baked-in defaults).
@@ -44,6 +45,40 @@ const NAV_MIN = 200;
 const NAV_MAX = 460;
 const clampNav = (w: number) => Math.max(NAV_MIN, Math.min(w, NAV_MAX));
 
+// One "active + pending-new slot" pair per workspace mode (chat and code mirror each other).
+// The pending slot id is stable across visits to existing chats so its unsent draft survives;
+// a fresh id is minted only once the slot actually has messages.
+function useChatSlots(isEmpty: (id: string) => boolean, onDelete: (id: string) => void) {
+  const [activeId, setActiveId] = useState<string>(() => crypto.randomUUID());
+  const [newId, setNewId] = useState(activeId);
+
+  const gotoNew = (): string => {
+    let id = newId;
+    if (!isEmpty(id)) {
+      id = crypto.randomUUID();
+      setNewId(id);
+    }
+    setActiveId(id);
+    return id;
+  };
+
+  const remove = (id: string) => {
+    onDelete(id);
+    if (id !== activeId) return;
+    // Deleting the chat we're viewing: land on a fresh new-chat slot. If the deleted chat *was*
+    // the slot, mint a new id so the screen actually remounts clean (same id wouldn't).
+    if (id === newId) {
+      const fresh = crypto.randomUUID();
+      setNewId(fresh);
+      setActiveId(fresh);
+    } else {
+      gotoNew();
+    }
+  };
+
+  return { activeId, setActiveId, gotoNew, remove };
+}
+
 export default function App() {
   const [screen, setScreen] = useState<ScreenId>("chat");
   // Workspace mode (Chat vs Code) — sticky. Providers/Memory/Settings are overlay screens that
@@ -61,109 +96,58 @@ export default function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [navCollapsed, setNavCollapsed] = useState(false);
-  const [navWidth, setNavWidth] = useState(() => {
-    const saved = Number(localStorage.getItem(NAV_KEY));
-    return saved >= NAV_MIN ? clampNav(saved) : 252;
-  });
+  const [navWidth, setNavWidth] = useState(() => restoreWidth(NAV_KEY, NAV_MIN, 252, clampNav));
   const [navResizing, setNavResizing] = useState(false); // disables the grid transition mid-drag
 
-  // Drag the sidebar/stage boundary to resize. clientX is screen px → divide by zoom for layout px.
+  // Drag the sidebar/stage boundary to resize.
   const startNavResize = (e: React.MouseEvent) => {
     e.preventDefault();
-    const startX = e.clientX;
-    const startW = navWidth;
     setNavResizing(true); // follow the cursor 1:1, no .28s grid easing
-    document.body.style.userSelect = "none";
-    document.body.style.cursor = "col-resize";
-    const onMove = (ev: MouseEvent) => setNavWidth(clampNav(startW + (ev.clientX - startX) / zoom));
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.userSelect = "";
-      document.body.style.cursor = "";
-      setNavResizing(false);
-      setNavWidth((w) => {
-        localStorage.setItem(NAV_KEY, String(w));
-        return w;
-      });
-    };
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
+    dragResize({
+      startX: e.clientX,
+      startW: navWidth,
+      zoom,
+      dir: 1,
+      clamp: clampNav,
+      onWidth: setNavWidth,
+      onDone: () => {
+        setNavResizing(false);
+        setNavWidth((w) => {
+          persistWidth(NAV_KEY, w);
+          return w;
+        });
+      },
+    });
   };
 
-  // activeChatId keys ChatScreen, so switching/opening remounts it with that chat's state.
-  const [activeChatId, setActiveChatId] = useState<string>(() => crypto.randomUUID());
-  const startupChatId = useRef(activeChatId); // demo thread only seeds this chat
-  // The pending "new chat" slot, stable across visits to existing chats so its unsent draft survives.
-  const [newChatId, setNewChatId] = useState(activeChatId);
-
-  // Switch to the pending new chat, spinning a fresh one only once the current slot has messages.
-  const gotoNewChat = (): string => {
-    let id = newChatId;
-    if (!isEmptySession(id)) {
-      id = crypto.randomUUID();
-      setNewChatId(id);
-    }
-    setActiveChatId(id);
-    return id;
-  };
-
-  const newChat = () => {
-    gotoNewChat();
-    setScreen("chat");
-  };
-  const openChat = (id: string) => {
-    setActiveChatId(id);
-    setScreen("chat");
-    setSearchOpen(false);
-  };
-  const removeChat = (id: string) => {
+  // activeId keys ChatScreen / CodeScreen, so switching/opening remounts with that chat's state.
+  const chatSlots = useChatSlots(isEmptySession, (id) => {
     deleteChat(id);
     dropSession(id); // drop live session so a stray commit can't resurrect the chat
     clearDraft(id);
-    if (id !== activeChatId) return;
-    // Deleting the chat we're viewing: land on a fresh new-chat slot. If the deleted chat *was*
-    // the slot, mint a new id so ChatScreen actually remounts clean (same id wouldn't).
-    if (id === newChatId) {
-      const fresh = crypto.randomUUID();
-      setNewChatId(fresh);
-      setActiveChatId(fresh);
-    } else {
-      gotoNewChat();
-    }
-  };
+  });
+  const codeSlots = useChatSlots(isEmptyCodeChat, (id) => {
+    deleteCodeChat(id);
+    dropCodeChat(id);
+  });
+  const startupChatId = useRef(chatSlots.activeId); // demo thread only seeds this chat
 
-  // Code mode has its own chats — mirror the activeChatId / new-slot pattern above.
-  const [activeCodeChatId, setActiveCodeChatId] = useState<string>(() => crypto.randomUUID());
-  const [newCodeChatId, setNewCodeChatId] = useState(activeCodeChatId);
-  const gotoNewCode = (): string => {
-    let id = newCodeChatId;
-    if (!isEmptyCodeChat(id)) {
-      id = crypto.randomUUID();
-      setNewCodeChatId(id);
-    }
-    setActiveCodeChatId(id);
-    return id;
+  const newChat = () => {
+    chatSlots.gotoNew();
+    setScreen("chat");
+  };
+  const openChat = (id: string) => {
+    chatSlots.setActiveId(id);
+    setScreen("chat");
+    setSearchOpen(false);
   };
   const newCode = () => {
-    gotoNewCode();
+    codeSlots.gotoNew();
     setScreen("code");
   };
   const openCode = (id: string) => {
-    setActiveCodeChatId(id);
+    codeSlots.setActiveId(id);
     setScreen("code");
-  };
-  const removeCode = (id: string) => {
-    deleteCodeChat(id);
-    dropCodeChat(id);
-    if (id !== activeCodeChatId) return;
-    if (id === newCodeChatId) {
-      const fresh = crypto.randomUUID();
-      setNewCodeChatId(fresh);
-      setActiveCodeChatId(fresh);
-    } else {
-      gotoNewCode();
-    }
   };
 
   // "New" and Cmd+N are mode-aware: create a code session in Code mode, else a chat.
@@ -252,16 +236,8 @@ export default function App() {
         onNewChat={newInMode}
         onOpenSearch={() => setSearchOpen(true)}
         onCollapse={() => setNavCollapsed(true)}
-        activeChatId={activeChatId}
-        onOpenChat={openChat}
-        onDeleteChat={removeChat}
-        onPinChat={pinChat}
-        onRenameChat={renameChat}
-        activeCodeChatId={activeCodeChatId}
-        onOpenCode={openCode}
-        onDeleteCode={removeCode}
-        onPinCode={pinCodeChat}
-        onRenameCode={renameCodeChat}
+        chat={{ activeId: chatSlots.activeId, open: openChat, remove: chatSlots.remove, pin: pinChat, rename: renameChat }}
+        code={{ activeId: codeSlots.activeId, open: openCode, remove: codeSlots.remove, pin: pinCodeChat, rename: renameCodeChat }}
       />
       {!navCollapsed && (
         <div className="nav-resize" style={{ left: navWidth }} onMouseDown={startNavResize} title="Drag to resize" />
@@ -278,14 +254,14 @@ export default function App() {
         <div className="stage-swap" key={screen}>
           {screen === "chat" && (
             <ChatScreen
-              key={activeChatId}
-              chatId={activeChatId}
-              showDemo={activeChatId === startupChatId.current}
+              key={chatSlots.activeId}
+              chatId={chatSlots.activeId}
+              showDemo={chatSlots.activeId === startupChatId.current}
               policy={policy}
               onConnectModel={() => setScreen("providers")}
             />
           )}
-          {screen === "code" && <CodeScreen key={activeCodeChatId} chatId={activeCodeChatId} />}
+          {screen === "code" && <CodeScreen key={codeSlots.activeId} chatId={codeSlots.activeId} />}
           {screen === "providers" && <ProvidersScreen />}
           {screen === "memory" && <MemoryScreen />}
           {screen === "settings" && <SettingsScreen />}

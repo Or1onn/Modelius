@@ -1,7 +1,7 @@
 // generateTitle.ts — name a new chat from its first exchange via a cheap backend.
 // Best-effort: failure/offline → "" (caller keeps first-message fallback). In the page: drives streamLLM.
 import { TITLE_PROMPT } from "@/shared/config/prompts";
-import { streamLLM } from "@/features/stream-completion/model/streamLLM";
+import { collectText } from "@/features/stream-completion/lib/collectText";
 import type { Backend } from "@/entities/model/model/backend";
 
 export async function generateTitle(firstUser: string, firstAssistant: string, backend: Backend): Promise<string> {
@@ -9,9 +9,7 @@ export async function generateTitle(firstUser: string, firstAssistant: string, b
   const prompt = TITLE_PROMPT + `User: ${firstUser}\nAssistant: ${firstAssistant}`;
   let out = "";
   try {
-    for await (const d of streamLLM(backend, [{ role: "user", content: prompt }])) {
-      if (d.kind === "text") out += d.text;
-    }
+    out = await collectText(backend, prompt);
   } catch {
     return "";
   }

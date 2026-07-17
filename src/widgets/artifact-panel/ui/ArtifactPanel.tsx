@@ -1,22 +1,12 @@
 // ArtifactPanel.tsx — right-side viewer for a code artifact opened from the chat.
 import { useEffect, useMemo, useRef, useState } from "react";
-import hljs from "highlight.js";
 import { Icon } from "@/shared/ui/Icon";
 import { formatBytes, type Artifact } from "@/entities/artifact/model/artifacts";
 import { diffLines } from "@/shared/lib/diff";
+import { highlightArtifact } from "@/shared/lib/highlight";
+import { useCopyButton } from "@/shared/lib/useCopyButton";
+import { dragResize, persistWidth, restoreWidth } from "@/shared/lib/dragResize";
 import { getZoom } from "@/entities/settings/model/settings";
-
-// Canonical artifact lang id → highlight.js name (only where it differs from an hljs alias).
-const HLJS_LANG: Record<string, string> = {
-  tsx: "typescript", jsx: "javascript", rs: "rust", kt: "kotlin", rb: "ruby", md: "markdown", html: "xml",
-};
-
-// Highlighted HTML for the code view, or null when the language isn't registered (render plain).
-function highlightCode(code: string, lang: string): string | null {
-  const name = HLJS_LANG[lang] ?? lang;
-  if (name && hljs.getLanguage(name)) return hljs.highlight(code, { language: name }).value;
-  return null;
-}
 
 // Persisted panel width (px). Clamped to [MIN_WIDTH, avail-MIN_REST] so the chat stays usable.
 const WIDTH_KEY = "modelius.artifactPanelWidth";
@@ -38,12 +28,9 @@ export function ArtifactPanel({
   versions?: Artifact[]; // version chain for this file (by title), in thread order
   versionIndex?: number; // index of `artifact` within `versions` (-1 if not part of a chain)
 }) {
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyButton();
   const [view, setView] = useState<"code" | "diff">("code");
-  const [width, setWidth] = useState(() => {
-    const saved = Number(localStorage.getItem(WIDTH_KEY));
-    return saved >= MIN_WIDTH ? saved : 420;
-  });
+  const [width, setWidth] = useState(() => restoreWidth(WIDTH_KEY, MIN_WIDTH, 420));
   const bodyRef = useRef<HTMLDivElement>(null);
   const asideRef = useRef<HTMLElement>(null);
   const pinnedRef = useRef(true); // following the stream; scrolling up unpins
@@ -58,27 +45,20 @@ export function ArtifactPanel({
   // so it's independent of how the rest of the layout is anchored.
   function startResize(e: React.MouseEvent) {
     e.preventDefault();
-    const startX = e.clientX;
-    const startW = width;
     // Container = chat area (panel's parent); its width caps how wide the panel may grow.
     const avail = (e.currentTarget.parentElement?.parentElement?.clientWidth ?? window.innerWidth);
-    document.body.style.userSelect = "none";
-    document.body.style.cursor = "col-resize";
-    // clientX is screen px; the shell's zoom scales rendered size, so divide the delta back out.
-    const z = getZoom();
-    const onMove = (ev: MouseEvent) => setWidth(clampWidth(startW + (startX - ev.clientX) / z, avail));
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.userSelect = "";
-      document.body.style.cursor = "";
-      setWidth((w) => {
-        localStorage.setItem(WIDTH_KEY, String(w));
+    dragResize({
+      startX: e.clientX,
+      startW: width,
+      zoom: getZoom(),
+      dir: -1,
+      clamp: (w) => clampWidth(w, avail),
+      onWidth: setWidth,
+      onDone: () => setWidth((w) => {
+        persistWidth(WIDTH_KEY, w);
         return w;
-      });
-    };
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
+      }),
+    });
   }
 
   const hasPrev = versionIndex > 0;
@@ -89,7 +69,12 @@ export function ArtifactPanel({
     () => (showDiff ? diffLines(versions[versionIndex - 1].code, artifact.code) : []),
     [showDiff, versions, versionIndex, artifact.code]
   );
-  const highlighted = useMemo(() => highlightCode(artifact.code, artifact.lang), [artifact.code, artifact.lang]);
+  // Skip hljs while the artifact is still streaming — re-highlighting the whole growing file on
+  // every chunk is O(n²) over the stream; the plain <code> branch renders until completion.
+  const highlighted = useMemo(
+    () => (generating ? null : highlightArtifact(artifact.code, artifact.lang)),
+    [artifact.code, artifact.lang, generating]
+  );
   const gutter = useMemo(
     () => Array.from({ length: artifact.code.split("\n").length }, (_, i) => i + 1).join("\n"),
     [artifact.code]
@@ -100,16 +85,6 @@ export function ArtifactPanel({
     const el = bodyRef.current;
     if (generating && el && pinnedRef.current) el.scrollTop = el.scrollHeight;
   }, [artifact.code, generating]);
-
-  function copy() {
-    navigator.clipboard?.writeText(artifact.code).then(
-      () => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1400);
-      },
-      () => {}
-    );
-  }
 
   return (
     <aside ref={asideRef} className="routing-panel artifact-panel" style={{ width }}>
@@ -152,7 +127,7 @@ export function ArtifactPanel({
             </button>
           </div>
         )}
-        <button className="ap-copy" onClick={copy} title="Copy code">
+        <button className="ap-copy" onClick={() => copy(artifact.code)} title="Copy code">
           <Icon name={copied ? "check" : "copy"} size={12} />
           {copied ? "Copied" : "Copy"}
         </button>

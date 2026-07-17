@@ -49,6 +49,15 @@ function ModeToggle({ mode, setScreen }: { mode: ScreenId; setScreen: (s: Screen
   );
 }
 
+// The chat-list handlers one workspace mode's history needs (App passes a chat and a code set).
+export interface ChatListActions {
+  activeId: string;
+  open: (id: string) => void;
+  remove: (id: string) => void;
+  pin: (id: string, pinned: boolean) => void;
+  rename: (id: string, title: string) => void;
+}
+
 export function Sidebar({
   screen,
   mode,
@@ -56,16 +65,8 @@ export function Sidebar({
   onNewChat,
   onOpenSearch,
   onCollapse,
-  activeChatId,
-  onOpenChat,
-  onDeleteChat,
-  onPinChat,
-  onRenameChat,
-  activeCodeChatId,
-  onOpenCode,
-  onDeleteCode,
-  onPinCode,
-  onRenameCode,
+  chat,
+  code,
 }: {
   screen: ScreenId;
   mode: ScreenId;
@@ -73,16 +74,8 @@ export function Sidebar({
   onNewChat: () => void;
   onOpenSearch: () => void;
   onCollapse: () => void;
-  activeChatId: string;
-  onOpenChat: (id: string) => void;
-  onDeleteChat: (id: string) => void;
-  onPinChat: (id: string, pinned: boolean) => void;
-  onRenameChat: (id: string, title: string) => void;
-  activeCodeChatId: string;
-  onOpenCode: (id: string) => void;
-  onDeleteCode: (id: string) => void;
-  onPinCode: (id: string, pinned: boolean) => void;
-  onRenameCode: (id: string, title: string) => void;
+  chat: ChatListActions;
+  code: ChatListActions;
 }) {
   const { getChats } = useChatStore();
   const { getCodeChats } = useCodeChatStore();
@@ -90,11 +83,7 @@ export function Sidebar({
   // Keyed off the sticky mode (not screen) so browsing Providers/Memory keeps the Code workspace.
   const isCode = mode === "code";
   const chats = isCode ? getCodeChats() : getChats();
-  const recentsActiveId = isCode ? activeCodeChatId : activeChatId;
-  const onOpen = isCode ? onOpenCode : onOpenChat;
-  const onDelete = isCode ? onDeleteCode : onDeleteChat;
-  const onPin = isCode ? onPinCode : onPinChat;
-  const onRename = isCode ? onRenameCode : onRenameChat;
+  const acts = isCode ? code : chat;
   return (
     <nav className="sidebar">
       <div className="sb-logo" data-tauri-drag-region>
@@ -148,12 +137,12 @@ export function Sidebar({
             <ChatGroup
               key={g.id}
               group={g}
-              activeChatId={recentsActiveId}
+              activeChatId={acts.activeId}
               screen={screen}
-              onOpenChat={onOpen}
-              onDeleteChat={onDelete}
-              onPinChat={onPin}
-              onRenameChat={onRename}
+              onOpenChat={acts.open}
+              onDeleteChat={acts.remove}
+              onPinChat={acts.pin}
+              onRenameChat={acts.rename}
             />
           ))}
         </div>

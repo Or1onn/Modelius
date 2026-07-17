@@ -11,7 +11,7 @@ import { useOutsideClick } from "@/shared/lib/useOutsideClick";
 import { refreshUsage, useUsageLimits, useUsageFetching, useSpend } from "@/entities/session/model/usageLimits";
 import { fmtReset, fmtUsd, winUsedPct } from "@/widgets/usage-meter/lib/format";
 import { useAutosize } from "@/shared/lib/useAutosize";
-import { anthropicEffortTier, EFFORT_LEVELS, resolveEffort, CODEX_EFFORT_LEVELS, CODEX_EFFORT_DEFAULT, type EffortLevel } from "@/entities/model/model/apiIds";
+import type { EffortLevel } from "@/entities/model/model/apiIds";
 import { HARNESSES, HARNESS_BY_ID, PERMISSION_MODES, PERMISSION_LABEL, type NativeKind } from "@/entities/agent/model/harnesses";
 import { useHarnessStatuses, refreshHarnessStatuses, installHarness, cliLoggedIn } from "@/entities/agent/model/harnessStatus";
 import { hasAnthropicOAuth } from "@/entities/session/model/anthropicSession";
@@ -20,20 +20,20 @@ import { AuthModal } from "@/pages/code/ui/AuthModal";
 import { choiceKey, codeContextTokens, defaultModelForHarness, type CodeModelChoice } from "@/entities/agent/model/codeModel";
 import { ModelMenu, type ModelMenuItem } from "@/entities/model/ui/ModelMenu";
 import { peekCodeModelGroups, listCodeModelGroups, type CodeModelGroup } from "@/entities/agent/model/codeModels";
-import { peekAppCodexModels } from "@/entities/session/api/codexModels";
 import { clearModelCache } from "@/shared/lib/modelCache";
 import { useGateways } from "@/entities/agent/model/gateways";
 import { GatewayModal } from "@/pages/code/ui/GatewayModal";
 import { listBranches, checkoutBranch } from "@/entities/agent/model/git";
-import { getCodeChat, getCodeConfig, setCodeConfig, subscribeCodeConfig, isEmptyCodeChat } from "@/features/run-agent/lib/codeChatRegistry";
+import { getCodeChat, getCodeConfig, setCodeConfig, subscribeCodeConfig, isEmptyCodeChat, codeEffortInfo } from "@/features/run-agent/lib/codeChatRegistry";
+import { fmtTokens } from "@/pages/code/model/codeUsage";
 import { getTurnStatus, subscribeTurnStatus } from "@/features/run-agent/lib/turnStatus";
 import { AssistantMessage } from "@/pages/code/ui/messageParts";
 import { CodeStats, PLogo } from "@/pages/code/ui/CodeStats";
 import { TerminalPanel } from "@/pages/code/ui/TerminalPanel";
 import { useSettings } from "@/entities/settings/model/settings";
 import { getRecentFolders, pushRecentFolder, getFolderBranch, setFolderBranch } from "@/pages/code/model/recentFolders";
-
-const basename = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
+import { basename } from "@/shared/lib/paths";
+import { lastOfRole } from "@/shared/lib/lastOfRole";
 
 const EFFORT_LABEL: Record<EffortLevel, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "X-high", max: "Max", ultra: "Ultra" };
 
@@ -119,9 +119,6 @@ function Picker({ label, logo, items, onSelect, onOpen, down, btnClass, menuHead
     </div>
   );
 }
-
-const fmtTokens = (n: number): string =>
-  n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "K" : String(n);
 
 // The account key this code chat's model bills against (for the usage meter). Native CLI logins map
 // to their subscription account; a connected key uses its provider id. Others (gateway/Ollama) have
@@ -267,20 +264,9 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const gateways = useGateways();
   const harnessStatuses = useHarnessStatuses();
   const harness = HARNESS_BY_ID[harnessId];
-  // Effort picker for native picks whose harness supports it (mirrors resolvedEffort in the
-  // registry): Anthropic models that gate --effort, and codex models (rides turn/start).
-  const effortTier = model.kind === "anthropic" ? anthropicEffortTier(model.id) : null;
-  // Codex efforts are per-model (5.6 adds max/ultra; Sol defaults to low) — from the live
-  // model/list when connected, else the static fallback.
-  const codexLive = model.kind === "codex" ? peekAppCodexModels()?.find((m) => m.id === model.id) : undefined;
-  const effortLevels = effortTier
-    ? EFFORT_LEVELS[effortTier]
-    : model.kind === "codex"
-      ? codexLive?.efforts.length
-        ? codexLive.efforts
-        : CODEX_EFFORT_LEVELS
-      : null;
-  const effortDefault = effortTier ? resolveEffort(effortTier, "auto") : codexLive?.defaultEffort ?? CODEX_EFFORT_DEFAULT;
+  // Effort picker for native picks whose harness supports it — the level list + default come
+  // from the same helper the registry's resolvedEffort uses, so UI and CLI can't drift.
+  const { levels: effortLevels, dflt: effortDefault } = codeEffortInfo(model);
   // Effective level shown/checked: an explicit pick, else the model default ("auto" tracks it).
   const activeEffort = effort !== "auto" && effortLevels?.includes(effort) ? effort : effortDefault;
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -307,7 +293,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const workNote = busy ? (turnStatus.note ?? (silentMs > 15_000 ? "waiting for the model…" : null)) : null;
 
   // Prompt-token fill + cost from the last assistant turn's metadata.
-  const lastMeta = [...messages].reverse().find((m) => m.role === "assistant")?.metadata as RunMeta | undefined;
+  const lastMeta = lastOfRole(messages, "assistant")?.metadata as RunMeta | undefined;
   const contextTokens = lastMeta
     ? (lastMeta.inputTokens ?? 0) + (lastMeta.cacheReadInputTokens ?? 0) + (lastMeta.cacheCreationInputTokens ?? 0)
     : 0;
@@ -315,18 +301,23 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const active = messages.length > 0; // a started session: fold the folder strip into a top bar
   const chatTitle = active ? userText(messages.find((m) => m.role === "user") as any) : "";
 
+  // Reconcile a stale codex/kimi pick against a freshly-loaded list: the hardcoded fallback
+  // default may lead with a model (e.g. plan-locked gpt-5.6-sol, or a renamed kimi alias) that
+  // the live list hides — reset to the live default so the selection isn't a model missing from
+  // the dropdown.
+  const reconcilePick = (g: CodeModelGroup[]) => {
+    if ((model.kind === "codex" || model.kind === "kimi") && !g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(model)))) {
+      setCodeConfig(chatId, { model: defaultModelForHarness(harnessId) });
+    }
+  };
+
   useEffect(() => {
     setModelGroups(peekCodeModelGroups(harnessId));
     let alive = true;
     void listCodeModelGroups(harnessId).then((g) => {
       if (!alive) return;
       setModelGroups(g);
-      // Reconcile a stale codex/kimi pick: the hardcoded fallback default may lead with a model
-      // (e.g. plan-locked gpt-5.6-sol, or a renamed kimi alias) that the freshly-loaded live list
-      // hides — reset to the live default so the selection isn't a model missing from the dropdown.
-      if ((model.kind === "codex" || model.kind === "kimi") && !g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(model)))) {
-        setCodeConfig(chatId, { model: defaultModelForHarness(harnessId) });
-      }
+      reconcilePick(g);
     });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -401,33 +392,33 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     checkoutBranch(cwd, next).catch(() => setBranch(prev));
   }
 
-  // Native picks run on the CLI's own account: gate the send behind sign-in when neither the app's
-  // Providers login nor the CLI's credentials exist. `force` = user chose "continue anyway".
+  // Native picks run on the CLI's own account: true when the send must wait for a login step
+  // (a modal, or kimi's terminal flow). The CLI-login check is best-effort and never hard-blocks.
+  async function needsLoginGate(): Promise<boolean> {
+    const kind = harness?.native?.kind;
+    if (!kind || model.kind !== kind) return false;
+    // Kimi has no app-side OAuth — its gate rests entirely on the CLI's own credentials.
+    const connected = kind === "anthropic" ? hasAnthropicOAuth() : kind === "codex" ? hasOpenAIOAuth() : false;
+    if (connected || (await cliLoggedIn(harnessId))) return false;
+    if (kind === "kimi") {
+      // No modal for kimi — its login IS a terminal flow, so go straight there. A second send
+      // with the login terminal already up means "send anyway".
+      if (termOpen && termCmd === "kimi login") return false;
+      setTermCmd("kimi login");
+      setTermOpen(true);
+      return true;
+    }
+    setAuthNeed(kind);
+    return true;
+  }
+
+  // `force` = user chose "continue anyway" in the sign-in gate.
   async function send(force = false) {
     const text = input.trim();
     if (busy) return;
     if (!cwd) { pokeFolder(); return; }
     if (!text) return;
-    const kind = harness?.native?.kind;
-    if (!force && kind && model.kind === kind) {
-      // Kimi has no app-side OAuth — its gate rests entirely on the CLI's own credentials.
-      const connected = kind === "anthropic" ? hasAnthropicOAuth() : kind === "codex" ? hasOpenAIOAuth() : false;
-      if (!connected && !(await cliLoggedIn(harnessId))) {
-        if (kind === "kimi") {
-          // No modal for kimi — its login IS a terminal flow, so go straight there. A second
-          // send with the login terminal already up means "send anyway" (the CLI-login check is
-          // best-effort and must never hard-block).
-          if (!(termOpen && termCmd === "kimi login")) {
-            setTermCmd("kimi login");
-            setTermOpen(true);
-            return;
-          }
-        } else {
-          setAuthNeed(kind);
-          return;
-        }
-      }
-    }
+    if (!force && (await needsLoginGate())) return;
     setInput("");
     setTimeout(() => { if (taRef.current) taRef.current.style.height = "auto"; }, 0);
     void sendMessage({ text });
@@ -578,9 +569,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
                 clearModelCache();
                 const g = await listCodeModelGroups(harnessId);
                 setModelGroups(g);
-                if ((model.kind === "codex" || model.kind === "kimi") && !g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(model)))) {
-                  setCodeConfig(chatId, { model: defaultModelForHarness(harnessId) });
-                }
+                reconcilePick(g);
               }}
             />
             <Picker

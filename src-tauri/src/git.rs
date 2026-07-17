@@ -28,7 +28,7 @@ async fn run(cwd: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-// List local branches + the current one. Errors (non-repo, git missing) become an empty list.
+// Non-repo / missing git degrade to an empty list rather than an error.
 #[tauri::command]
 pub async fn git_branches(cwd: String) -> Result<GitInfo, String> {
     if cwd.is_empty() {

@@ -3,7 +3,7 @@
 // preferred, sampled + timed-out). Best-effort: any failure falls back to the heuristic.
 import { classify, classificationFor, route } from "./route";
 import { ROUTE_CLASSIFY_PROMPT } from "@/shared/config/prompts";
-import { streamLLM } from "@/features/stream-completion/model/streamLLM";
+import { collectText } from "@/features/stream-completion/lib/collectText";
 import { pickSummarizerBackend } from "@/features/pick-backend/model/pickBackend";
 import type { Classification, Model } from "@/entities/model/model/registry";
 
@@ -26,10 +26,7 @@ export async function classifyRequest(text: string, opts?: { pool?: Model[] }): 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    let out = "";
-    for await (const d of streamLLM(backend, [{ role: "user", content: ROUTE_CLASSIFY_PROMPT + sample(text) }], false, "low", false, ctrl.signal)) {
-      if (d.kind === "text") out += d.text;
-    }
+    const out = await collectText(backend, ROUTE_CLASSIFY_PROMPT + sample(text), { effort: "low", signal: ctrl.signal });
     const parsed = parse(out);
     if (parsed) {
       cache.set(key, parsed);

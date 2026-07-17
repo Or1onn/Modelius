@@ -1,4 +1,5 @@
 import type { UIMessageChunk } from "./uiMessageChunk";
+import { finishTurn, startGate } from "./baseTransformer";
 
 // Kimi `acp` (Agent Client Protocol) JSONL → AI SDK UIMessageChunk. The warm per-chat process
 // (session.rs) forwards session/update notifications and the turn-terminating session/prompt
@@ -66,8 +67,7 @@ export function kimiToolInput(update: { rawInput?: unknown; content?: unknown; t
 }
 
 export function createKimiAcpTransformer() {
-  let started = false;
-  let startTime: number | null = null;
+  const gate = startGate();
   let sessionId: string | undefined;
   let openTextId: string | null = null; // ACP chunks carry no item ids — one open block at a time
   let openThoughtId: string | null = null;
@@ -182,25 +182,18 @@ export function createKimiAcpTransformer() {
     // unlike codex, id-carrying lines are transcript content, not just lifecycle traffic.
     if (msg?.id !== undefined && msg?.method === undefined) {
       const stopReason: string = typeof msg?.result?.stopReason === "string" ? msg.result.stopReason : "end_turn";
-      if (!started) {
-        // A turn can end without any content update (e.g. an instant refusal) — the SDK still
-        // needs the start frame before finish.
-        started = true;
-        yield { type: "start" };
-        yield { type: "start-step" };
-      }
+      // A turn can end without any content update (e.g. an instant refusal) — the SDK still
+      // needs the start frame before finish; no clock means no bogus 0ms duration.
+      yield* gate.ensure({ clock: false });
       yield* closeBlocks();
       if (stopReason === "refusal") {
         yield { type: "error", errorText: "The model refused to continue this turn." };
       }
-      const meta = {
+      yield* finishTurn({
         sessionId,
         resultSubtype: stopReason === "end_turn" ? "success" : stopReason,
-        durationMs: startTime ? Date.now() - startTime : undefined,
-      };
-      yield { type: "message-metadata", messageMetadata: meta };
-      yield { type: "finish-step" };
-      yield { type: "finish", messageMetadata: meta };
+        durationMs: gate.elapsed(),
+      });
       return;
     }
     if (msg?.method !== "session/update") return;
@@ -208,12 +201,7 @@ export function createKimiAcpTransformer() {
     // The ACP session id doubles as the resume id (metadata.sessionId → session/resume next spawn).
     if (typeof p.sessionId === "string") sessionId = p.sessionId;
 
-    if (!started) {
-      started = true;
-      startTime = Date.now();
-      yield { type: "start" };
-      yield { type: "start-step" };
-    }
+    yield* gate.ensure();
 
     yield* emitUpdate(p.update);
   };

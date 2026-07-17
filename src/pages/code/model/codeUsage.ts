@@ -109,7 +109,8 @@ function streaks(days: Set<string>): { current: number; longest: number } {
 }
 
 const fmtInt = (n: number) => n.toLocaleString();
-const fmtTokens = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "K" : String(n));
+export const fmtTokens = (n: number): string =>
+  n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "K" : String(n);
 const fmtHour = (h: number) => { const am = h < 12; const h12 = h % 12 || 12; return `${h12} ${am ? "AM" : "PM"}`; };
 
 export interface HeroStats {

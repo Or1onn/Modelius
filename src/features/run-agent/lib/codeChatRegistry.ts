@@ -13,11 +13,12 @@ import {
   defaultModelForHarness,
   type CodeModelChoice,
 } from "@/entities/agent/model/codeModel";
-import { anthropicEffortTier, resolveEffort, CODEX_EFFORT_LEVELS, type EffortLevel } from "@/entities/model/model/apiIds";
+import { anthropicEffortTier, resolveEffort, EFFORT_LEVELS, CODEX_EFFORT_LEVELS, CODEX_EFFORT_DEFAULT, type EffortLevel } from "@/entities/model/model/apiIds";
 import { getGateways, gatewaySecretKey } from "@/entities/agent/model/gateways";
 import { OLLAMA_HOST } from "@/entities/session/model/ollamaSession";
 import { getCodexAuth } from "@/entities/session/model/openaiSession";
 import { peekAppCodexModels } from "@/entities/session/api/codexModels";
+import { lastOfRole } from "@/shared/lib/lastOfRole";
 import { getAnthropicAccessToken } from "@/entities/session/model/anthropicSession";
 import { getKey } from "@/entities/session/model/keys";
 import { KEY_PROVIDER_BASE } from "@/entities/session/model/keyProviders";
@@ -43,12 +44,9 @@ interface Entry {
   createdAt: number;
 }
 
-// Preserve the registry across Vite HMR. Without this, a hot update replaces this module with a
-// fresh (empty) `entries` map, orphaning live Chat instances mid-turn. On the next render `ensure`
-// recreates each chat empty and `load` repopulates it from disk — but the async `persist` of the
-// latest turn may not have flushed yet, so the live transcript gets clobbered back to the previous
-// turn. Reusing the same map across HMR keeps the in-memory Chats (and in-flight turns) intact.
-// Dev-only; `import.meta.hot` is undefined in a production build, so this is a plain new Map there.
+// Dev-only HMR guard: a hot update would swap in a fresh empty map, orphaning live Chats mid-turn
+// (reload-from-disk races the not-yet-flushed async persist and clobbers the latest turn). Stashing
+// the map in import.meta.hot.data keeps in-flight chats intact; in prod hot is undefined → new Map.
 const entries: Map<string, Entry> =
   (import.meta.hot?.data as { entries?: Map<string, Entry> } | undefined)?.entries ?? new Map<string, Entry>();
 if (import.meta.hot) {
@@ -103,16 +101,30 @@ async function resolveRouting(model: CodeModelChoice, harnessId: string): Promis
   return { protocol: "openai", baseUrl: base, apiKey: key };
 }
 
+// Per-model effort surface, shared with the CodeScreen picker: the pickable levels (null = no
+// effort knob) and the default level "auto" tracks. Anthropic models gate --effort by tier;
+// codex efforts are per-model (live model/list first — 5.6 adds max/ultra — static fallback).
+export function codeEffortInfo(model: CodeConfig["model"]): { levels: EffortLevel[] | null; dflt: EffortLevel } {
+  const tier = model.kind === "anthropic" ? anthropicEffortTier(model.id) : null;
+  if (tier) return { levels: EFFORT_LEVELS[tier], dflt: resolveEffort(tier, "auto") };
+  if (model.kind === "codex") {
+    const live = peekAppCodexModels()?.find((m) => m.id === model.id);
+    return {
+      levels: live?.efforts.length ? live.efforts : CODEX_EFFORT_LEVELS,
+      dflt: live?.defaultEffort ?? CODEX_EFFORT_DEFAULT,
+    };
+  }
+  return { levels: null, dflt: CODEX_EFFORT_DEFAULT };
+}
+
 // Concrete effort level for the CLI. Anthropic picks whose model gates it get a resolved level
 // (auto → the tier default, matching what the UI shows; rides --effort). Codex picks pass an
 // explicit pick through (rides turn/start), but "auto" stays "" — the CLI's own default, exactly
 // as if the user never touched the knob. Everything else → "" (no effort).
 function resolvedEffort(config: CodeConfig): string {
   if (config.model.kind === "codex") {
-    // Per-model efforts from the live model/list (5.6 adds max/ultra), static fallback.
-    const live = peekAppCodexModels()?.find((m) => m.id === config.model.id);
-    const levels = live?.efforts.length ? live.efforts : CODEX_EFFORT_LEVELS;
-    return config.effort !== "auto" && levels.includes(config.effort) ? config.effort : "";
+    const { levels } = codeEffortInfo(config.model);
+    return config.effort !== "auto" && levels?.includes(config.effort) ? config.effort : "";
   }
   if (config.model.kind !== "anthropic") return "";
   const tier = anthropicEffortTier(config.model.id);
@@ -122,8 +134,8 @@ function resolvedEffort(config: CodeConfig): string {
 // Turn the current message list + config into a concrete run (called by the transport per send).
 async function resolveSend(chatId: string, messages: UIMessage[]): Promise<ResolvedSend> {
   const { config } = ensure(chatId);
-  const prompt = textOf([...messages].reverse().find((m) => m.role === "user"));
-  const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+  const prompt = textOf(lastOfRole(messages, "user"));
+  const lastAssistant = lastOfRole(messages, "assistant");
   const resume = (lastAssistant?.metadata as { sessionId?: string } | undefined)?.sessionId;
 
   // Never hand a foreign model id to the harness CLI (codex only serves its own models).

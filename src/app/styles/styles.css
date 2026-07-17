@@ -213,12 +213,6 @@ input, textarea { font-family: inherit; }
 .sb-row.primary:hover .sb-ic { transform: scale(1.12); }
 .sb-row.on { background: rgba(var(--fg-rgb),0.07); color: var(--text-1); }
 .sb-row.on .sb-ic { color: var(--accent); }
-.sb-beta {
-  flex-shrink: 0; font-size: 9px; font-weight: 600; letter-spacing: 0.05em;
-  padding: 2px 6px; border-radius: var(--r-xs); color: var(--beta);
-  background: color-mix(in oklab, var(--beta) 15%, transparent);
-  border: 1px solid color-mix(in oklab, var(--beta) 28%, transparent);
-}
 
 .sb-divider { height: 1px; background: rgba(var(--fg-rgb),0.07); margin: 8px 6px; }
 
@@ -338,13 +332,6 @@ input, textarea { font-family: inherit; }
 }
 .btn-ghost:hover { border-color: color-mix(in oklab, var(--accent) 40%, transparent); color: var(--text-1); }
 
-/* KPI stat row (reference style) */
-.kpi-row { display: flex; gap: 56px; flex-wrap: wrap; margin-bottom: 36px; }
-.kpi { display: flex; flex-direction: column; gap: 9px; }
-.kpi-num { font-size: 32px; font-weight: 680; letter-spacing: -0.03em; line-height: 1; }
-.kpi-label { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-3); }
-.kpi-dot { display: grid; place-items: center; }
-
 /* ============ Chat ============ */
 .chat-wrap { flex: 1; min-width: 0; display: flex; }
 .chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
@@ -446,10 +433,6 @@ input, textarea { font-family: inherit; }
 .asst-head { display: flex; align-items: center; gap: 10px; }
 .asst-meta { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--text-4); }
 .asst-meta.mono { font-family: var(--font-mono); }
-/* Price-source tag next to the $ cost: live = OpenRouter catalog, table = static fallback. */
-.price-src { font-size: 9px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; padding: 1px 5px; border-radius: 99px; }
-.price-src.live { color: #2BB673; background: color-mix(in oklab, #2BB673 16%, transparent); }
-.price-src.table { color: var(--text-4); background: rgba(var(--fg-rgb),0.06); }
 .asst-foot { display: flex; align-items: center; gap: 4px; margin-top: 6px; }
 .asst-act { width: 30px; height: 30px; display: grid; place-items: center; border-radius: var(--r-xs); color: var(--text-4); transition: all .15s; }
 .asst-act:hover { background: var(--surface-2); color: var(--text-1); }
@@ -872,55 +855,6 @@ input, textarea { font-family: inherit; }
   display: flex; align-items: center; justify-content: space-between;
   padding: 0 18px; height: 52px; border-bottom: 1px solid var(--border); flex-shrink: 0;
 }
-.rp-live { width: 7px; height: 7px; border-radius: 99px; background: var(--text-4); transition: all .3s; }
-.rp-live.on { background: var(--accent); box-shadow: 0 0 9px var(--accent); animation: pulse 1.1s ease-in-out infinite; }
-.rp-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 16px; }
-
-.rp-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.09em; color: var(--text-4); font-weight: 560; }
-.rp-block { }
-.rp-chosen {
-  padding: 15px; border-radius: var(--radius);
-  background: linear-gradient(180deg, color-mix(in oklab, var(--accent) 8%, transparent), transparent 90%), var(--surface-2);
-  border: 1px solid color-mix(in oklab, var(--accent) 22%, transparent);
-}
-.rp-statrow { display: flex; gap: 10px; }
-.rp-stat { flex: 1; display: flex; flex-direction: column; gap: 2px; }
-.rp-stat-k { font-size: 10px; color: var(--text-4); text-transform: uppercase; letter-spacing: 0.05em; }
-.rp-stat-v { font-family: var(--font-mono); font-size: 13px; color: var(--text-1); }
-.rp-stat-v.accent { color: var(--accent); }
-
-.rp-reason {
-  display: flex; gap: 9px; padding: 12px 13px;
-  background: var(--surface-2); border: 1px solid var(--border);
-  border-left: 2px solid var(--accent); border-radius: var(--r-sm);
-}
-.rp-reason p { font-size: 12.5px; line-height: 1.5; color: var(--text-2); text-wrap: pretty; }
-
-.rp-cand { padding: 9px 10px; border-radius: var(--r-sm); border: 1px solid transparent; transition: all .2s; }
-.rp-cand.win { background: var(--surface-2); border-color: var(--border); }
-.rp-cand-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
-.rp-cand-bars { display: flex; align-items: center; gap: 8px; }
-
-.rp-session { padding: 14px; border-radius: var(--radius); background: var(--surface-2); border: 1px solid var(--border); display: flex; flex-direction: column; gap: 12px; }
-.rp-session-row { display: flex; align-items: center; justify-content: space-between; }
-.rp-saved { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; padding: 11px 12px; border-radius: var(--r-sm); background: color-mix(in oklab, var(--accent) 9%, transparent); border: 1px solid color-mix(in oklab, var(--accent) 20%, transparent); }
-.rp-saved-num { font-family: var(--font-mono); font-size: 22px; font-weight: 500; color: var(--accent); letter-spacing: -0.02em; line-height: 1; }
-.rp-saved-pct { font-family: var(--font-mono); font-size: 13px; color: var(--accent); padding: 3px 7px; border-radius: var(--r-xs); background: color-mix(in oklab, var(--accent) 14%, transparent); }
-.rp-session-foot { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-4); }
-
-.rp-policy { border-top: 1px solid var(--border); padding: 14px 18px; flex-shrink: 0; }
-.rp-policy-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
-.rp-policy-grid .policy-icon { justify-content: flex-start; border: 1px solid var(--border); }
-
-.rp-empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 50px 20px; text-align: center; }
-.rp-empty p { font-size: 12.5px; color: var(--text-4); line-height: 1.6; }
-
-.rp-think { padding: 6px 2px; }
-.rp-think-row { display: flex; align-items: center; gap: 9px; padding: 7px 0; opacity: 0; animation: thinkIn .5s forwards; }
-@keyframes thinkIn { to { opacity: 1; } }
-.rp-think-dot { width: 7px; height: 7px; border-radius: 99px; background: var(--accent); flex-shrink: 0; animation: pulse 0.9s ease-in-out infinite; }
-.rp-think-bar { height: 9px; border-radius: var(--r-xs); background: linear-gradient(90deg, var(--surface-3), var(--surface-2)); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
-@keyframes shimmer { to { background-position: -200% 0; } }
 
 /* ============ Providers ============ */
 /* Brand logo + per-model abbreviation (shared by the row + manage list) */
