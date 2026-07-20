@@ -13,11 +13,11 @@ import {
   defaultModelForHarness,
   type CodeModelChoice,
 } from "@/entities/agent/model/codeModel";
-import { anthropicEffortTier, resolveEffort, EFFORT_LEVELS, CODEX_EFFORT_LEVELS, CODEX_EFFORT_DEFAULT, type EffortLevel } from "@/entities/model/model/apiIds";
+import { CODEX_EFFORT_DEFAULT, type EffortLevel } from "@/entities/model/model/apiIds";
+import { effortSurface, pickEffort } from "@/entities/session/api/effortSurface";
 import { getGateways, gatewaySecretKey } from "@/entities/agent/model/gateways";
 import { OLLAMA_HOST } from "@/entities/session/model/ollamaSession";
 import { getCodexAuth } from "@/entities/session/model/openaiSession";
-import { peekAppCodexModels } from "@/entities/session/api/codexModels";
 import { lastOfRole } from "@/shared/lib/lastOfRole";
 import { getAnthropicAccessToken } from "@/entities/session/model/anthropicSession";
 import { getKey } from "@/entities/session/model/keys";
@@ -25,6 +25,10 @@ import { KEY_PROVIDER_BASE } from "@/entities/session/model/keyProviders";
 import { secretGet } from "@/shared/api/secrets";
 import { getCodeChats, loadCodeBody, saveCodeBody, upsertCodeChat, codeIndexEntryFrom } from "@/entities/agent/model/codeChats";
 import { invalidateCodeUsage } from "@/pages/code/model/codeUsage";
+import { generateTitle } from "@/pages/chat/model/generateTitle";
+import { pickSummarizerBackend } from "@/features/pick-backend/model/pickBackend";
+import { route } from "@/features/route-request/model/route";
+import { TITLE_PROMPT } from "@/shared/config/prompts";
 import { CodeChatTransport, type ResolvedSend, type RunConfig } from "./codeTransport";
 
 const DEFAULT_HARNESS = HARNESSES[0].id;
@@ -42,6 +46,8 @@ interface Entry {
   config: CodeConfig;
   listeners: Set<() => void>;
   createdAt: number;
+  title: string; // LLM-generated chat name (empty → sidebar falls back to the first-message snippet)
+  titleTried: boolean; // guard: generate the title at most once per warm chat
 }
 
 // Dev-only HMR guard: a hot update would swap in a fresh empty map, orphaning live Chats mid-turn
@@ -101,34 +107,33 @@ async function resolveRouting(model: CodeModelChoice, harnessId: string): Promis
   return { protocol: "openai", baseUrl: base, apiKey: key };
 }
 
-// Per-model effort surface, shared with the CodeScreen picker: the pickable levels (null = no
-// effort knob) and the default level "auto" tracks. Anthropic models gate --effort by tier;
-// codex efforts are per-model (live model/list first — 5.6 adds max/ultra — static fallback).
-export function codeEffortInfo(model: CodeConfig["model"]): { levels: EffortLevel[] | null; dflt: EffortLevel } {
-  const tier = model.kind === "anthropic" ? anthropicEffortTier(model.id) : null;
-  if (tier) return { levels: EFFORT_LEVELS[tier], dflt: resolveEffort(tier, "auto") };
-  if (model.kind === "codex") {
-    const live = peekAppCodexModels()?.find((m) => m.id === model.id);
-    return {
-      levels: live?.efforts.length ? live.efforts : CODEX_EFFORT_LEVELS,
-      dflt: live?.defaultEffort ?? CODEX_EFFORT_DEFAULT,
-    };
+// Which catalog answers for a pick. Native picks are their own kind; a routed pick is really the
+// provider behind the local proxy, so it answers as that provider (an OpenRouter key or an
+// OpenRouter-hosted gateway both map to "openrouter", whose reasoning the proxy translates).
+function effortProvider(model: CodeConfig["model"]): string {
+  if (model.kind === "connected") return model.providerId;
+  if (model.kind === "gateway") {
+    const g = getGateways().find((x) => x.id === model.gatewayId);
+    return g && /openrouter\.ai/i.test(g.baseUrl) ? "openrouter" : "";
   }
-  return { levels: null, dflt: CODEX_EFFORT_DEFAULT };
+  return model.kind;
 }
 
-// Concrete effort level for the CLI. Anthropic picks whose model gates it get a resolved level
-// (auto → the tier default, matching what the UI shows; rides --effort). Codex picks pass an
-// explicit pick through (rides turn/start), but "auto" stays "" — the CLI's own default, exactly
-// as if the user never touched the knob. Everything else → "" (no effort).
+// Effort surface for the CodeScreen picker: the pickable levels (null = no knob) and the level
+// "auto" tracks. Per-provider resolution lives in effortSurface, shared with Chat mode.
+export function codeEffortInfo(model: CodeConfig["model"]): { levels: EffortLevel[] | null; dflt: EffortLevel } {
+  return effortSurface(effortProvider(model), model.id) ?? { levels: null, dflt: CODEX_EFFORT_DEFAULT };
+}
+
+// Concrete effort level for the CLI. An Anthropic-login pick resolves auto → the level the picker
+// shows, since it promises a concrete one. Every other source passes an explicit pick through
+// (codex rides turn/start, routed picks ride --effort into the proxy) and leaves "auto" as "" —
+// the CLI's own default, exactly as if the user never touched the knob.
 function resolvedEffort(config: CodeConfig): string {
-  if (config.model.kind === "codex") {
-    const { levels } = codeEffortInfo(config.model);
-    return config.effort !== "auto" && levels?.includes(config.effort) ? config.effort : "";
-  }
-  if (config.model.kind !== "anthropic") return "";
-  const tier = anthropicEffortTier(config.model.id);
-  return tier ? resolveEffort(tier, config.effort) : "";
+  const surface = effortSurface(effortProvider(config.model), config.model.id);
+  if (!surface) return "";
+  if (config.model.kind === "anthropic") return pickEffort(surface, config.effort);
+  return config.effort !== "auto" && surface.levels.includes(config.effort) ? config.effort : "";
 }
 
 // Turn the current message list + config into a concrete run (called by the transport per send).
@@ -161,9 +166,12 @@ function ensure(chatId: string): Entry {
   const chat = new Chat<UIMessage>({
     id: chatId,
     transport: new CodeChatTransport(chatId, (messages) => resolveSend(chatId, messages)),
-    onFinish: () => void persist(chatId), // save the finished transcript + index it for the sidebar
+    onFinish: () => {
+      void persist(chatId); // save the finished transcript + index it for the sidebar
+      maybeGenerateTitle(chatId); // name the chat from its first exchange (like Chat mode)
+    },
   });
-  e = { chat, config: defaultConfig(), listeners: new Set(), createdAt: Date.now() };
+  e = { chat, config: defaultConfig(), listeners: new Set(), createdAt: Date.now(), title: "", titleTried: false };
   entries.set(chatId, e);
   void load(chatId);
   return e;
@@ -183,6 +191,10 @@ async function load(chatId: string): Promise<void> {
   if (!choiceFitsHarness(model, harness)) model = defaultModelForHarness(harness);
   e.config = { harness, model, cwd: body.cwd, permissionMode: body.permissionMode, effort: (body.effort as EffortLevel | "auto") ?? "auto" };
   e.chat.messages = body.messages;
+  if (body.title) {
+    e.title = body.title;
+    e.titleTried = true; // already named — don't regenerate
+  }
   e.listeners.forEach((fn) => fn());
 }
 
@@ -208,7 +220,7 @@ async function persistNow(chatId: string): Promise<void> {
   const e = entries.get(chatId);
   if (!e) return;
   const messages = e.chat.messages;
-  const entry = codeIndexEntryFrom(chatId, messages, e.createdAt, undefined, e.config.cwd);
+  const entry = codeIndexEntryFrom(chatId, messages, e.createdAt, e.title, e.config.cwd);
   if (!entry) return;
   await saveCodeBody(chatId, {
     messages,
@@ -218,10 +230,27 @@ async function persistNow(chatId: string): Promise<void> {
     model: e.config.model,
     permissionMode: e.config.permissionMode,
     effort: e.config.effort,
-    title: "",
+    title: e.title,
   });
   upsertCodeChat(entry);
   invalidateCodeUsage();
+}
+
+// Name a code chat from its first exchange via a cheap backend, once per chat (mirrors Chat mode's
+// maybeGenerateTitle). Best-effort: no backend / offline → "" → sidebar keeps the snippet fallback.
+function maybeGenerateTitle(chatId: string): void {
+  const e = entries.get(chatId);
+  if (!e || e.titleTried || e.title) return;
+  const firstUser = e.chat.messages.find((m) => m.role === "user");
+  const firstAsst = e.chat.messages.find((m) => m.role === "assistant" && textOf(m).trim());
+  if (!firstUser || !firstAsst) return;
+  e.titleTried = true;
+  generateTitle(textOf(firstUser), textOf(firstAsst), pickSummarizerBackend(route(TITLE_PROMPT, "cost"))).then((t) => {
+    if (!t) return;
+    e.title = t;
+    e.listeners.forEach((fn) => fn());
+    void persist(chatId); // re-index so the sidebar shows the generated name
+  });
 }
 
 export function getCodeChat(chatId: string): Chat<UIMessage> {
@@ -230,6 +259,12 @@ export function getCodeChat(chatId: string): Chat<UIMessage> {
 
 export function getCodeConfig(chatId: string): CodeConfig {
   return ensure(chatId).config;
+}
+
+// The generated chat name ("" until named). Reactive via subscribeCodeConfig — maybeGenerateTitle
+// notifies the same listener set, so a snapshot on this string re-renders when the title lands.
+export function getCodeTitle(chatId: string): string {
+  return ensure(chatId).title;
 }
 
 // Patch a chat's config (re-aligns the model when the harness family changes) and notify subscribers.

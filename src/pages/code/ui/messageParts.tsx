@@ -180,6 +180,7 @@ function PlanCard({ text, onApprove, onReject }: { text: string; onApprove?: () 
 // Only rendered while the turn streams — answered/stale requests vanish from history (toNodes).
 function PermissionCard({ data, chatId }: { data: PermissionRequestData; chatId?: string }) {
   const [answered, setAnswered] = useState<"allowed" | "denied" | null>(null);
+  const [open, setOpen] = useState(false); // re-expand an answered (collapsed) request
   const input = data.input as Record<string, unknown>;
   if (data.toolName === "ExitPlanMode") {
     const plan = typeof input?.plan === "string" ? input.plan : "";
@@ -200,14 +201,22 @@ function PermissionCard({ data, chatId }: { data: PermissionRequestData; chatId?
   }
   if (data.toolName === "AskUserQuestion") return <QuestionCard data={data} />;
   const summary = String(input?.command ?? input?.file_path ?? input?.path ?? input?.url ?? "");
+  // What the action does, from the tool's own self-description (Bash/PowerShell/Agent inputs carry
+  // one) — the bare title ("Allow Bash?") doesn't tell the user what they're approving.
+  const desc = typeof input?.description === "string" ? input.description : "";
+  // Answered requests collapse to the head line (big command bodies otherwise keep eating space
+  // for the rest of the turn); the head then toggles the body back open.
+  const collapsed = !!answered && !open;
   return (
     <div className="cd-perm">
-      <div className="cd-perm-head">
+      <button className="cd-perm-head" disabled={!answered || !summary} onClick={() => setOpen((v) => !v)}>
         <Icon name="shield" size={13} style={{ color: "var(--accent)" }} />
         <span>Allow {data.toolName}?</span>
+        {desc && <span className="cd-perm-desc" title={desc}>{desc}</span>}
         {answered && <span className="cd-perm-verdict">{answered}</span>}
-      </div>
-      {summary && <div className="cd-perm-cmd mono">{summary}</div>}
+        {answered && summary && <span className={"cd-tool-chev" + (open ? " open" : "")}><Icon name="chevronD" size={13} /></span>}
+      </button>
+      {summary && !collapsed && <div className="cd-perm-cmd mono">{summary}</div>}
       {!answered && (
         <div className="cd-perm-actions">
           <button className="cd-perm-btn deny" onClick={() => { setAnswered("denied"); void denyPermission(data, "User denied this action"); }}>Deny</button>
@@ -227,18 +236,29 @@ interface AgentQuestion {
 
 // AskUserQuestion: the agent asks the user a multiple-choice question mid-turn and blocks until
 // the permission answer carries `updatedInput.answers` ({question → chosen label, multiSelect
-// joined with ", "}). Deny = skip the question.
+// joined with ", "}). Every question also gets an "Other…" free-text answer (CLI parity — the
+// tool contract promises the user can always type a custom reply). Deny = skip the question.
 function QuestionCard({ data }: { data: PermissionRequestData }) {
   const [picked, setPicked] = useState<Record<string, string[]>>({});
+  const [custom, setCustom] = useState<Record<string, string>>({});
+  const [otherOn, setOtherOn] = useState<Record<string, boolean>>({});
   const [answered, setAnswered] = useState<"allowed" | "denied" | null>(null);
+  const [open, setOpen] = useState(false); // re-expand an answered (collapsed) card
   const questions = (Array.isArray((data.input as { questions?: unknown }).questions)
     ? (data.input as { questions: AgentQuestion[] }).questions
     : []
   ).filter((q) => q && typeof q.question === "string" && Array.isArray(q.options));
 
-  const submit = (answers: Record<string, string[]>) => {
+  // Chosen labels + the custom text (when its input is active) — the custom reply joins the
+  // answer like one more label. `other` is passed explicitly where state hasn't committed yet.
+  const answerOf = (q: AgentQuestion, answers: Record<string, string[]>, other: Record<string, boolean>) => {
+    const labels = answers[q.question] ?? [];
+    const c = other[q.question] ? (custom[q.question] ?? "").trim() : "";
+    return c ? [...labels, c] : labels;
+  };
+  const submit = (answers: Record<string, string[]>, other: Record<string, boolean> = otherOn) => {
     setAnswered("allowed");
-    const flat = Object.fromEntries(questions.map((q) => [q.question, (answers[q.question] ?? []).join(", ")]));
+    const flat = Object.fromEntries(questions.map((q) => [q.question, answerOf(q, answers, other).join(", ")]));
     void allowPermission(data, { updatedInput: { ...data.input, answers: flat } });
   };
   const pick = (q: AgentQuestion, label: string) => {
@@ -246,20 +266,37 @@ function QuestionCard({ data }: { data: PermissionRequestData }) {
     const next = q.multiSelect
       ? { ...picked, [q.question]: cur.includes(label) ? cur.filter((l) => l !== label) : [...cur, label] }
       : { ...picked, [q.question]: [label] };
+    // Single-select: a real option replaces an active custom answer.
+    const other = q.multiSelect ? otherOn : { ...otherOn, [q.question]: false };
     setPicked(next);
+    setOtherOn(other);
     // Fast path: a single single-select question answers on click, no extra Submit.
-    if (questions.length === 1 && !q.multiSelect) submit(next);
+    if (questions.length === 1 && !q.multiSelect) submit(next, other);
   };
-  const complete = questions.every((q) => (picked[q.question] ?? []).length > 0);
+  const toggleOther = (q: AgentQuestion) => {
+    const on = !otherOn[q.question];
+    setOtherOn({ ...otherOn, [q.question]: on });
+    if (on && !q.multiSelect) setPicked({ ...picked, [q.question]: [] });
+  };
+  const complete = questions.every((q) => answerOf(q, picked, otherOn).length > 0);
+  // The click-to-answer fast path can't fire while a custom reply is being typed — show Answer.
+  const needsSubmit = !(questions.length === 1 && !questions[0]?.multiSelect) || otherOn[questions[0]?.question ?? ""];
+  const collapsed = !!answered && !open;
 
   return (
     <div className="cd-perm">
-      <div className="cd-perm-head">
+      <button className="cd-perm-head" disabled={!answered} onClick={() => setOpen((v) => !v)}>
         <Icon name="shield" size={13} style={{ color: "var(--accent)" }} />
         <span>The agent has a question</span>
+        {collapsed && questions.length > 0 && (
+          <span className="cd-perm-desc" title={questions[0].question}>
+            {questions.length === 1 ? questions[0].question : `${questions.length} questions`}
+          </span>
+        )}
         {answered && <span className="cd-perm-verdict">{answered === "allowed" ? "answered" : "skipped"}</span>}
-      </div>
-      {questions.map((q) => (
+        {answered && <span className={"cd-tool-chev" + (open ? " open" : "")}><Icon name="chevronD" size={13} /></span>}
+      </button>
+      {!collapsed && questions.map((q) => (
         <div key={q.question} className="cd-q">
           <div className="cd-q-text">{q.question}</div>
           {q.options.map((o) => {
@@ -271,12 +308,26 @@ function QuestionCard({ data }: { data: PermissionRequestData }) {
               </button>
             );
           })}
+          <button className={"cd-q-opt" + (otherOn[q.question] ? " on" : "")} disabled={!!answered} onClick={() => toggleOther(q)}>
+            <span className="cd-q-opt-label">Other…</span>
+            <span className="cd-q-opt-desc">Type your own answer</span>
+          </button>
+          {otherOn[q.question] && !answered && (
+            <input
+              className="cd-q-other"
+              autoFocus
+              placeholder="Your answer…"
+              value={custom[q.question] ?? ""}
+              onChange={(e) => setCustom({ ...custom, [q.question]: e.target.value })}
+              onKeyDown={(e) => { if (e.key === "Enter" && complete) submit(picked); }}
+            />
+          )}
         </div>
       ))}
       {!answered && (
         <div className="cd-perm-actions">
           <button className="cd-perm-btn deny" onClick={() => { setAnswered("denied"); void denyPermission(data, "User skipped the question — proceed with your best judgment."); }}>Skip</button>
-          {!(questions.length === 1 && !questions[0]?.multiSelect) && (
+          {needsSubmit && (
             <button className="cd-perm-btn allow" disabled={!complete} onClick={() => submit(picked)}>Answer</button>
           )}
         </div>

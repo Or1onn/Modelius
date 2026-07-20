@@ -208,10 +208,13 @@ async fn ensure_node_for(
 }
 
 // Start a session gateway for a routed run: returns the gateway + its loopback origin, or
-// (None, None) for a native-login run. `target` = (protocol, base_url, api_key).
+// (None, None) for a native-login run. `target` = (protocol, base_url, api_key). `effort` is the
+// level picked in the app ("" = Auto) — the translation needs it because the CLI's own request
+// always carries a default effort and so can't express the user's choice.
 async fn start_gateway_for(
     spec: &HarnessSpec,
     target: Option<(&str, &str, &str)>,
+    effort: &str,
 ) -> Result<(Option<crate::gateway::Gateway>, Option<String>), String> {
     let Some((protocol, base_url, api_key)) = target else { return Ok((None, None)) };
     let outbound = match protocol {
@@ -224,6 +227,7 @@ async fn start_gateway_for(
         outbound,
         target_base: base_url.to_string(),
         api_key: api_key.to_string(),
+        effort: effort.to_string(),
     })
     .await
     .map_err(|e| format!("failed to start gateway: {}", e))?;
@@ -484,7 +488,7 @@ pub async fn agent_run(
         None => None,
     };
     let target_ref = target.as_ref().map(|t| (t.protocol.as_str(), t.base_url.as_str(), t.api_key.as_str()));
-    let (gw, gateway_url) = start_gateway_for(spec, target_ref).await?;
+    let (gw, gateway_url) = start_gateway_for(spec, target_ref, &effort).await?;
     // The guard shuts the gateway down on every exit path below (including panics).
     let gateway = GatewayGuard(gw);
     let routed = gateway
@@ -737,7 +741,10 @@ async fn spawn_warm(
         .target
         .as_ref()
         .map(|(p, b, k)| (p.as_str(), b.as_str(), k.as_str()));
-    let (gateway, gateway_url) = start_gateway_for(spec, target_ref).await?;
+    // Claude keeps effort in its fingerprint, so a change respawns the session and rebuilds this
+    // gateway with the new level. Codex carries effort per turn/start instead, but its runs are
+    // openai-inbound and never hit the translation that reads this field.
+    let (gateway, gateway_url) = start_gateway_for(spec, target_ref, &run.effort).await?;
     let routed = gateway
         .as_ref()
         .zip(gateway_url.as_deref())

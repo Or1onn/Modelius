@@ -3,10 +3,25 @@ import { invoke } from "@tauri-apps/api/core";
 import { getKey, keyLast6 } from "@/entities/session/model/keys";
 import { cached, peek } from "@/shared/lib/modelCache";
 import { isTauri } from "@/shared/api/tauri";
+import type { EffortLevel } from "@/entities/model/model/apiIds";
 
 export interface RemoteModel {
   id: string;
   name: string;
+  // Effort levels the provider advertises, when its model list carries capabilities (Anthropic
+  // /v1/models). Empty array = explicitly unsupported; absent = the provider doesn't say.
+  efforts?: EffortLevel[];
+}
+
+// capabilities.effort → the levels flagged supported, in menu order (probe-verified against
+// /v1/models: `{supported, low:{supported}, medium:{…}, …}`). Ordering comes from this list, not
+// from key order, and levels the API doesn't know are simply absent.
+const EFFORT_ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+
+export function effortsFromCapabilities(caps: unknown): EffortLevel[] {
+  const effort = (caps as { effort?: Record<string, unknown> } | undefined)?.effort;
+  if (effort?.supported !== true) return [];
+  return EFFORT_ORDER.filter((l) => (effort[l] as { supported?: boolean } | undefined)?.supported === true);
 }
 
 export async function listModels(provider: string): Promise<RemoteModel[]> {
@@ -47,9 +62,10 @@ async function fetchModels(provider: string, key: string): Promise<RemoteModel[]
     });
     if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
     const json = await res.json();
-    return ((json.data || []) as { id: string; display_name?: string }[]).map((m) => ({
+    return ((json.data || []) as { id: string; display_name?: string; capabilities?: unknown }[]).map((m) => ({
       id: m.id,
       name: m.display_name || m.id,
+      efforts: effortsFromCapabilities(m.capabilities),
     }));
   }
 

@@ -5,7 +5,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { PROVIDERS, type Message } from "@/entities/model/model/registry";
 import type { ModelOption } from "@/entities/model/model/backend";
 import type { ModelMenuItem } from "@/entities/model/ui/ModelMenu";
-import { anthropicEffortTier, EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
+import { EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
+import { effortSurface, pickEffort } from "@/entities/session/api/effortSurface";
 import { listAvailableModels, peekAvailableModels, optionAllowsImages, optionAllowsWeb } from "@/features/pick-backend/model/pickBackend";
 import { supportsReasoning } from "@/entities/model/lib/pricingSource";
 import { clearModelCache } from "@/shared/lib/modelCache";
@@ -94,13 +95,12 @@ export function useComposerModelState(chatId: string, messages: Message[], loadi
     }
   }
 
-  // Effort selector visibility/levels. Explicit Anthropic pick → its model's tier; Auto →
-  // safe low/med/high set when any connected model is Anthropic. resolveEffort is the final gate.
-  const effTier = modelSel?.provider === "anthropic" ? anthropicEffortTier(modelSel.backend.model) : null;
-  // OpenRouter reasoning models (e.g. Claude) accept low/medium/high effort too — only meaningful with
-  // Thinking on. effortLevels/activeEffort fall back to the sonnet set (low/medium/high) when effTier is null.
-  const orEffort = modelSel?.provider === "openrouter" && (supportsReasoning(modelSel.backend.model) ?? false) && thinking;
-  const showEffort = modelSel ? !!effTier || orEffort : options.some((o) => o.provider === "anthropic");
+  // Effort selector visibility/levels, from the provider's own catalog (see effortSurface). An
+  // OpenRouter pick's knob is only meaningful with Thinking on; Anthropic's applies either way.
+  // With Auto (no explicit pick) fall back to the safe low/med/high set.
+  const surface = modelSel ? effortSurface(modelSel.provider, modelSel.backend.model) : null;
+  const effInfo = surface && (modelSel?.provider !== "openrouter" || thinking) ? surface : null;
+  const showEffort = modelSel ? !!effInfo : options.some((o) => o.provider === "anthropic");
   // Thinking toggle only for reasoning-capable models (per OpenRouter's catalog). A model unknown to
   // the catalog defaults to shown; the provider backends still gate the actual param. Auto → shown if
   // any connected model can reason.
@@ -111,8 +111,9 @@ export function useComposerModelState(chatId: string, messages: Message[], loadi
   useEffect(() => {
     if (!reasoningOk) setThinking(false);
   }, [reasoningOk]);
-  const effortLevels = effTier ? EFFORT_LEVELS[effTier] : EFFORT_LEVELS.sonnet;
-  const activeEffort = resolveEffort(effTier ?? "sonnet", effort);
+  const effortFallback = { levels: EFFORT_LEVELS.sonnet, dflt: resolveEffort("sonnet", "auto") };
+  const effortLevels = (effInfo ?? effortFallback).levels;
+  const activeEffort = pickEffort(effInfo ?? effortFallback, effort);
   // Thinking/Effort rows animate in/out (on model switch, and Effort when Thinking is toggled). The
   // rows stay mounted and collapse via a CSS grid transition, so each appears/disappears smoothly.
   const hasExtras = reasoningOk || showEffort;

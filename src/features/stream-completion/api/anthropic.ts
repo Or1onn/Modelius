@@ -2,7 +2,8 @@
 // OAuth accounts reject browser-origin requests with a CORS org error).
 import { invoke } from "@tauri-apps/api/core";
 import type { ChatMsg, Delta } from "@/entities/model/model/backend";
-import { anthropicEffortTier, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
+import type { EffortLevel } from "@/entities/model/model/apiIds";
+import { effortSurface, pickEffort } from "@/entities/session/api/effortSurface";
 import { getKey } from "@/entities/session/model/keys";
 import { getAnthropicAccessToken, handleAnthropicUnauthorized } from "@/entities/session/model/anthropicSession";
 import { channelToDeltas } from "@/features/stream-completion/lib/channel";
@@ -53,17 +54,17 @@ export async function* streamClaude(
   const body: Record<string, unknown> = { model, max_tokens: 8192, stream: true, messages: msgs };
   // Effort-capable models use adaptive thinking (budget_tokens 400s on Opus 4.7/4.8);
   // older ones use the fixed budget. display:summarized keeps the trace visible.
-  const tier = anthropicEffortTier(model);
+  const eff = effortSurface("anthropic", model);
   if (thinking) {
-    if (tier) {
+    if (eff) {
       body.thinking = { type: "adaptive", display: "summarized" };
     } else if (anthropicSupportsThinking(model)) {
       body.thinking = { type: "enabled", budget_tokens: 2048 };
     }
   }
-  // Effort applies whenever supported, independent of the thinking toggle. resolveEffort
-  // clamps levels the model can't use (e.g. Auto→Sonnet with max selected).
-  if (tier) body.output_config = { effort: resolveEffort(tier, effort) };
+  // Effort applies whenever supported, independent of the thinking toggle. Levels the model can't
+  // use (e.g. Auto→Sonnet with max selected) fall back to its default rather than 400ing.
+  if (eff) body.output_config = { effort: pickEffort(eff, effort) };
   // Server-side web search: Claude runs searches itself and folds results (with citations) into
   // the streamed answer. The tool/result content blocks are ignored by the Rust SSE parser; only
   // text/thinking deltas surface, so the answer streams as usual.

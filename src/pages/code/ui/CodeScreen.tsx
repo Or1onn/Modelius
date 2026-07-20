@@ -24,9 +24,11 @@ import { clearModelCache } from "@/shared/lib/modelCache";
 import { useGateways } from "@/entities/agent/model/gateways";
 import { GatewayModal } from "@/pages/code/ui/GatewayModal";
 import { listBranches, checkoutBranch } from "@/entities/agent/model/git";
-import { getCodeChat, getCodeConfig, setCodeConfig, subscribeCodeConfig, isEmptyCodeChat, codeEffortInfo } from "@/features/run-agent/lib/codeChatRegistry";
+import { getCodeChat, getCodeConfig, getCodeTitle, setCodeConfig, subscribeCodeConfig, isEmptyCodeChat, codeEffortInfo } from "@/features/run-agent/lib/codeChatRegistry";
 import { fmtTokens } from "@/pages/code/model/codeUsage";
 import { getTurnStatus, subscribeTurnStatus } from "@/features/run-agent/lib/turnStatus";
+import { codeToMarkdown } from "@/features/export-chat/model/serializeCode";
+import { copyToClipboard } from "@/features/export-chat/lib/save";
 import { AssistantMessage } from "@/pages/code/ui/messageParts";
 import { CodeStats, PLogo } from "@/pages/code/ui/CodeStats";
 import { TerminalPanel } from "@/pages/code/ui/TerminalPanel";
@@ -233,6 +235,8 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const getSnapshot = useCallback(() => getCodeConfig(chatId), [chatId]);
   const config = useSyncExternalStore(subscribe, getSnapshot);
   const { harness: harnessId, model, cwd, permissionMode, effort } = config;
+  // Generated chat name (shares the config listener set); falls back to the first-message snippet.
+  const genTitle = useSyncExternalStore(subscribe, useCallback(() => getCodeTitle(chatId), [chatId]));
 
   const [input, setInput] = useState("");
   // Bottom terminal: mounted only while open. Re-fitting a hidden xterm under the shell `zoom`
@@ -299,7 +303,24 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     : 0;
   const cost = lastMeta?.totalCostUsd ?? null;
   const active = messages.length > 0; // a started session: fold the folder strip into a top bar
-  const chatTitle = active ? userText(messages.find((m) => m.role === "user") as any) : "";
+  const chatTitle = active ? genTitle || userText(messages.find((m) => m.role === "user") as any) : "";
+
+  // TEST: copy the whole transcript (prose + reasoning + tool calls + per-turn meta) as Markdown.
+  const [exported, setExported] = useState(false);
+  const exportChat = async () => {
+    const md = codeToMarkdown(messages, {
+      title: chatTitle,
+      harness: harness?.name ?? harnessId,
+      model: model.label,
+      effort: activeEffort,
+      cwd,
+    });
+    try {
+      await copyToClipboard(md);
+      setExported(true);
+      setTimeout(() => setExported(false), 1400);
+    } catch { /* clipboard denied */ }
+  };
 
   // Reconcile a stale codex/kimi pick against a freshly-loaded list: the hardcoded fallback
   // default may lead with a model (e.g. plan-locked gpt-5.6-sol, or a renamed kimi alias) that
@@ -458,6 +479,9 @@ export function CodeScreen({ chatId }: { chatId: string }) {
             <Icon name="folder" size={14} />
             {basename(cwd)}
           </span>
+          <button className="cd-top-act" onClick={exportChat} title="Copy transcript as Markdown (test)">
+            <Icon name={exported ? "check" : "copy"} size={16} />
+          </button>
           <button className={"cd-top-act" + (termOpen ? " on" : "")} onClick={toggleTerm} title="Toggle terminal">
             <Icon name="terminal" size={16} />
           </button>

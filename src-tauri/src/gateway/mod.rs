@@ -29,6 +29,7 @@ pub(crate) struct GatewayConfig {
     pub outbound: Proto,     // protocol the target endpoint speaks
     pub target_base: String, // provider root, no trailing slash
     pub api_key: String,     // real provider key; never reaches the CLI
+    pub effort: String,      // Reasoning depth the user picked in the app
 }
 
 pub(crate) struct Gateway {
@@ -71,7 +72,7 @@ pub(crate) async fn start(cfg: GatewayConfig) -> std::io::Result<Gateway> {
 
 #[cfg(test)]
 mod tests {
-    use super::anthropic_openai::{map_stop, tool_result_text};
+    use super::anthropic_openai::{map_stop, to_openrouter_reasoning, tool_result_text};
     use super::http::read_request;
     use super::openai_anthropic::{chat_to_anthropic, responses_to_anthropic};
     use super::*;
@@ -86,6 +87,24 @@ mod tests {
         assert_eq!(tool_result_text(Some(&arr)), "ab");
         assert_eq!(tool_result_text(None), "");
         assert_eq!(tool_result_text(Some(&json!(42))), ""); // non-text → empty
+    }
+
+    // Reasoning is opt-in: it rides the level the user picked in the app, never the CLI's request.
+    // Probe-verified why — `claude` with no --effort still sends output_config.effort "xhigh" and
+    // thinking:{type:"adaptive"}, so reading the body would bill every routed run for reasoning.
+    #[test]
+    fn openrouter_reasoning_follows_the_picked_level() {
+        assert_eq!(to_openrouter_reasoning("low"), Some(json!({ "effort": "low" })));
+        assert_eq!(to_openrouter_reasoning("medium"), Some(json!({ "effort": "medium" })));
+        // OpenRouter tops out at high — the Anthropic-only levels clamp instead of erroring.
+        for lvl in ["high", "xhigh", "max"] {
+            assert_eq!(to_openrouter_reasoning(lvl), Some(json!({ "effort": "high" })), "{lvl}");
+        }
+    }
+
+    #[test]
+    fn openrouter_reasoning_absent_on_auto() {
+        assert_eq!(to_openrouter_reasoning(""), None);
     }
 
     #[test]
@@ -147,6 +166,7 @@ mod tests {
             outbound: Proto::Anthropic,
             target_base: format!("http://127.0.0.1:{}", port),
             api_key: "k".into(),
+            effort: String::new(),
         })
         .await
         .unwrap()
@@ -165,6 +185,7 @@ mod tests {
             outbound: Proto::OpenAi,
             target_base: format!("http://127.0.0.1:{}", port),
             api_key: "k".into(),
+            effort: String::new(),
         })
         .await
         .unwrap();
@@ -188,6 +209,7 @@ mod tests {
             outbound: Proto::OpenAi,
             target_base: format!("http://127.0.0.1:{}", port),
             api_key: "k".into(),
+            effort: String::new(),
         })
         .await
         .unwrap();
@@ -209,6 +231,7 @@ mod tests {
             outbound: Proto::OpenAi,
             target_base: format!("http://127.0.0.1:{}", port),
             api_key: "k".into(),
+            effort: String::new(),
         })
         .await
         .unwrap();
@@ -229,6 +252,7 @@ mod tests {
             outbound: Proto::Anthropic,
             target_base: format!("http://127.0.0.1:{}", port),
             api_key: "k".into(),
+            effort: String::new(),
         })
         .await
         .unwrap();
@@ -254,6 +278,7 @@ mod tests {
             outbound: Proto::OpenAi,
             target_base: format!("http://127.0.0.1:{}", port),
             api_key: "k".into(),
+            effort: String::new(),
         })
         .await
         .unwrap();
@@ -294,6 +319,7 @@ mod tests {
             outbound: Proto::OpenAi,
             target_base: format!("http://127.0.0.1:{}", port),
             api_key: "k".into(),
+            effort: String::new(),
         })
         .await
         .unwrap();
@@ -319,6 +345,7 @@ mod tests {
             outbound: Proto::OpenAi,
             target_base: format!("http://127.0.0.1:{}", port),
             api_key: "k".into(),
+            effort: String::new(),
         })
         .await
         .unwrap();
@@ -347,6 +374,7 @@ mod tests {
             outbound: Proto::OpenAi,
             target_base: format!("http://127.0.0.1:{}", port),
             api_key: "k".into(),
+            effort: String::new(),
         })
         .await
         .unwrap();
@@ -549,6 +577,7 @@ mod tests {
             outbound: Proto::OpenAi,
             target_base: "http://127.0.0.1:1".into(),
             api_key: "k".into(),
+            effort: String::new(),
         })
         .await
         .unwrap();

@@ -70,6 +70,11 @@ describe("anthropicEffortTier", () => {
     expect(anthropicEffortTier("claude-haiku-4-5-20251001")).toBe(null);
     expect(anthropicEffortTier("gpt-4o")).toBe(null);
   });
+  it("gives the gen-5 models the full level set", () => {
+    expect(anthropicEffortTier("claude-sonnet-5")).toBe("opus");
+    expect(anthropicEffortTier("claude-fable-5")).toBe("opus");
+    expect(anthropicEffortTier("claude-mythos-5")).toBe("opus");
+  });
 });
 
 describe("resolveEffort", () => {

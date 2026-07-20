@@ -6,13 +6,19 @@ use tokio::net::TcpStream;
 
 // ---- /v1/messages: translate and forward (anthropic-in → openai-out) ----
 
-pub(super) async fn proxy_messages(sock: &mut TcpStream, base: &str, key: &str, body: &[u8]) -> std::io::Result<()> {
+pub(super) async fn proxy_messages(
+    sock: &mut TcpStream,
+    base: &str,
+    key: &str,
+    body: &[u8],
+    effort: &str,
+) -> std::io::Result<()> {
     let Ok(req) = serde_json::from_slice::<Value>(body) else {
         return respond_json(sock, 400, &err_body("invalid_request_error", "bad JSON")).await;
     };
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let model = req.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let openai_req = to_openai_request(&req, base, stream);
+    let openai_req = to_openai_request(&req, base, stream, effort);
 
     let Some(upstream) = send_chat(sock, base, key, &openai_req).await? else {
         return Ok(());
@@ -21,6 +27,21 @@ pub(super) async fn proxy_messages(sock: &mut TcpStream, base: &str, key: &str, 
         stream_response(sock, upstream, &model).await
     } else {
         respond_translated(sock, upstream, &model, to_anthropic_response).await
+    }
+}
+
+// OpenRouter's `reasoning` field for a routed run. Driven solely by the level the user picked in
+// the app (GatewayConfig::effort) — reasoning stays opt-in, matching how Chat mode treats
+// OpenRouter. Deliberately NOT read off the request: the CLI sends thinking:{type:"adaptive"} and
+// its own default output_config.effort on every call, so the body always looks like a request for
+// reasoning and would silently bill every routed run for it. "" (Auto) → no field at all.
+// OpenRouter tops out at high, so the Anthropic-only xhigh/max clamp down.
+pub(super) fn to_openrouter_reasoning(effort: &str) -> Option<Value> {
+    match effort {
+        "" => None,
+        "low" => Some(json!({ "effort": "low" })),
+        "medium" => Some(json!({ "effort": "medium" })),
+        _ => Some(json!({ "effort": "high" })), // high / xhigh / max / ultra
     }
 }
 
@@ -59,7 +80,7 @@ pub(super) fn map_chat_tools(tools: &[Value], params_key: &str, filter: fn(&Valu
 
 
 // Anthropic Messages request → OpenAI chat/completions request.
-fn to_openai_request(req: &Value, base: &str, stream: bool) -> Value {
+fn to_openai_request(req: &Value, base: &str, stream: bool, effort: &str) -> Value {
     let mut messages: Vec<Value> = Vec::new();
 
     // system: string or [{type:"text"}] blocks.
@@ -151,11 +172,10 @@ fn to_openai_request(req: &Value, base: &str, stream: bool) -> Value {
     }
     // OpenRouter surfaces reasoning only when asked (mirrors chat mode's OpenRouter-only extra);
     // other compat providers may reject the unknown field, so keep it host-gated.
-    if base.contains("openrouter.ai") && req.pointer("/thinking/type").and_then(|v| v.as_str()) == Some("enabled") {
-        out["reasoning"] = match req.pointer("/thinking/budget_tokens").and_then(|v| v.as_u64()) {
-            Some(budget) => json!({ "max_tokens": budget }),
-            None => json!({ "enabled": true }),
-        };
+    if base.contains("openrouter.ai") {
+        if let Some(reasoning) = to_openrouter_reasoning(effort) {
+            out["reasoning"] = reasoning;
+        }
     }
     if let Some(tools) = req.get("tools").and_then(|v| v.as_array()) {
         // Skip server-tool entries with no schema.

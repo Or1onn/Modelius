@@ -25,7 +25,7 @@ pub(super) async fn handle_conn(mut sock: TcpStream, cfg: &GatewayConfig, token:
     let base = cfg.target_base.trim_end_matches('/');
     match (cfg.inbound, method.as_str(), path.as_str()) {
         (Proto::Anthropic, "POST", "/v1/messages") => match cfg.outbound {
-            Proto::OpenAi => proxy_messages(&mut sock, base, &cfg.api_key, &body).await,
+            Proto::OpenAi => proxy_messages(&mut sock, base, &cfg.api_key, &body, &cfg.effort).await,
             Proto::Anthropic => {
                 passthrough(&mut sock, "POST", &format!("{}/v1/messages", base), &headers, &body, cfg).await
             }

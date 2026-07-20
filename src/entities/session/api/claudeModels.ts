@@ -5,7 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { cached, peek } from "@/shared/lib/modelCache";
 import { hasKey } from "@/entities/session/model/keys";
 import { hasAnthropicOAuth, getAnthropicAccessToken } from "@/entities/session/model/anthropicSession";
-import { listModels, peekModels, type RemoteModel } from "@/entities/session/api/providerModels";
+import { listModels, peekModels, effortsFromCapabilities, type RemoteModel } from "@/entities/session/api/providerModels";
+import { anthropicEffortTier, EFFORT_LEVELS, resolveEffort, type EffortLevel } from "@/entities/model/model/apiIds";
 
 // Family derived generically from the id — drop the "claude" prefix and any numeric/version/date
 // segments, leaving the alpha family word ("opus", "sonnet", "fable", …). No hardcoded list, so a
@@ -38,11 +39,15 @@ async function fetchSubscriptionModels(): Promise<RemoteModel[]> {
   const token = await getAnthropicAccessToken();
   if (!token) return [];
   return cached("sub:anthropic", async () => {
-    const json = await invoke<{ data?: { id: string; display_name?: string }[] }>("anthropic_list_models", {
-      token,
-      oauth: true,
-    });
-    return (json.data || []).map((m) => ({ id: m.id, name: m.display_name || m.id }));
+    const json = await invoke<{ data?: { id: string; display_name?: string; capabilities?: unknown }[] }>(
+      "anthropic_list_models",
+      { token, oauth: true }
+    );
+    return (json.data || []).map((m) => ({
+      id: m.id,
+      name: m.display_name || m.id,
+      efforts: effortsFromCapabilities(m.capabilities),
+    }));
   });
 }
 
@@ -52,6 +57,26 @@ export async function listAppClaudeModels(): Promise<RemoteModel[]> {
   if (hasAnthropicOAuth()) return currentClaudeModels(await fetchSubscriptionModels().catch(() => []));
   if (hasKey("anthropic")) return currentClaudeModels(await listModels("anthropic").catch(() => []));
   return [];
+}
+
+// Raw (non-deduped) cached list, for capability lookups by exact id: a saved pick can be a model
+// the picker's per-family dedupe dropped (an older dated Opus, say) and it still has capabilities.
+function peekRawClaudeModels(): RemoteModel[] | null {
+  if (hasAnthropicOAuth()) return peek<RemoteModel[]>("sub:anthropic");
+  if (hasKey("anthropic")) return peekModels("anthropic");
+  return null;
+}
+
+// Effort surface for an Anthropic model: the live /v1/models capabilities when the list has been
+// fetched, else the static tier table (cold cache, offline, or a model the account can't list).
+// null = no effort knob. The API advertises no default level, so that stays tier-derived.
+export function anthropicEffortInfo(modelId: string): { levels: EffortLevel[]; dflt: EffortLevel } | null {
+  const live = peekRawClaudeModels()?.find((m) => m.id === modelId)?.efforts;
+  const tier = anthropicEffortTier(modelId);
+  const levels = live ?? (tier ? EFFORT_LEVELS[tier] : []);
+  if (!levels.length) return null;
+  const dflt = tier ? resolveEffort(tier, "auto") : levels.includes("high") ? "high" : levels[levels.length - 1];
+  return { levels, dflt };
 }
 
 // Sync cache mirror of listAppClaudeModels — null when cold/stale or nothing connected.
