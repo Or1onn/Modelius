@@ -50,9 +50,33 @@ describe("claude transform", () => {
     ]);
     expect(types(cs)).toContain("message-metadata");
     expect(types(cs)).toContain("finish");
-    const meta = cs.find((c) => c.type === "message-metadata") as Extract<UIMessageChunk, { type: "message-metadata" }>;
-    expect(meta.messageMetadata.sessionId).toBe("sess-9");
-    expect(meta.messageMetadata.totalCostUsd).toBe(0.02);
+    const fin = cs.find((c) => c.type === "finish") as Extract<UIMessageChunk, { type: "finish" }>;
+    expect(fin.messageMetadata?.sessionId).toBe("sess-9");
+    expect(fin.messageMetadata?.totalCostUsd).toBe(0.02);
+  });
+
+  // Regression: a cancelled turn drops the final result line (the transport's abort closes the
+  // stream) — the resume id and last usage snapshot must already sit on the message by then.
+  it("surfaces the session id and usage before the result line", () => {
+    const cs = run([
+      { type: "system", subtype: "init", session_id: "sess-9", tools: [] },
+      {
+        type: "assistant",
+        session_id: "sess-9",
+        message: { content: [], usage: { input_tokens: 7, cache_read_input_tokens: 100, cache_creation_input_tokens: 3, output_tokens: 2 } },
+      },
+      // no result line — simulates a cancel
+    ]);
+    const metas = cs.filter((c) => c.type === "message-metadata") as Extract<UIMessageChunk, { type: "message-metadata" }>[];
+    expect(metas.some((m) => m.messageMetadata.sessionId === "sess-9")).toBe(true);
+    expect(metas.some((m) => m.messageMetadata.cacheReadInputTokens === 100 && m.messageMetadata.inputTokens === 7)).toBe(true);
+  });
+
+  it("does not surface a sidechain line's session id early", () => {
+    const cs = run([
+      { type: "assistant", session_id: "sub", parent_tool_use_id: "toolu_parent", message: { content: [] } },
+    ]);
+    expect(cs.filter((c) => c.type === "message-metadata")).toHaveLength(0);
   });
 
   // Regression: subagent (sidechain) lines interleave with the MAIN thread's stream_events

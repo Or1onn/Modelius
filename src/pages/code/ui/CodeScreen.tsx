@@ -36,6 +36,11 @@ import { useSettings } from "@/entities/settings/model/settings";
 import { getRecentFolders, pushRecentFolder, getFolderBranch, setFolderBranch } from "@/pages/code/model/recentFolders";
 import { basename } from "@/shared/lib/paths";
 import { lastOfRole } from "@/shared/lib/lastOfRole";
+import { readDataUrl } from "@/pages/chat/lib/files";
+
+// A staged image attachment (base64 for the model, data URL for the chip thumbnail) — same shape
+// as Chat's ImageRef.
+interface StagedImage { name: string; mime: string; data: string; dataUrl: string }
 
 const EFFORT_LABEL: Record<EffortLevel, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "X-high", max: "Max", ultra: "Ultra" };
 
@@ -239,6 +244,15 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const genTitle = useSyncExternalStore(subscribe, useCallback(() => getCodeTitle(chatId), [chatId]));
 
   const [input, setInput] = useState("");
+  // Staged attachments for the next turn: images (sent as native vision blocks) and files (sent by
+  // absolute path — the agent reads them in place). Cleared on send.
+  const [images, setImages] = useState<StagedImage[]>([]);
+  const [files, setFiles] = useState<{ name: string; path: string }[]>([]);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const addMenuRef = useRef<HTMLDivElement>(null);
+  const imgInputRef = useRef<HTMLInputElement>(null);
+  useOutsideClick(addMenuRef, addMenuOpen, () => setAddMenuOpen(false));
   // Bottom terminal: mounted only while open. Re-fitting a hidden xterm under the shell `zoom`
   // corrupts its grid, so closing tears it down and opening starts a fresh, correctly-fitted shell.
   const { zoom } = useSettings();
@@ -275,6 +289,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const activeEffort = effort !== "auto" && effortLevels?.includes(effort) ? effort : effortDefault;
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true); // at bottom → follow the stream; scrolling up unpins so the user can read back
+  const [atBottom, setAtBottom] = useState(true); // mirrors pinnedRef for the floating scroll-to-bottom button
   const taRef = useRef<HTMLTextAreaElement>(null);
   const hintRef = useRef<HTMLDivElement>(null);
   const [showHint, setShowHint] = useState(false);
@@ -296,8 +311,12 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const silentMs = turnStatus.activityAt ? Date.now() - turnStatus.activityAt : 0;
   const workNote = busy ? (turnStatus.note ?? (silentMs > 15_000 ? "waiting for the model…" : null)) : null;
 
-  // Prompt-token fill + cost from the last assistant turn's metadata.
-  const lastMeta = lastOfRole(messages, "assistant")?.metadata as RunMeta | undefined;
+  // Prompt-token fill + cost from the last assistant turn that carries usage — a cancelled or
+  // errored turn may have no token metadata; falling back keeps the ring from resetting to 0.
+  const lastMeta = lastOfRole(messages, "assistant", (m) => {
+    const md = m.metadata as RunMeta | undefined;
+    return md?.inputTokens != null || md?.cacheReadInputTokens != null || md?.cacheCreationInputTokens != null;
+  })?.metadata as RunMeta | undefined;
   const contextTokens = lastMeta
     ? (lastMeta.inputTokens ?? 0) + (lastMeta.cacheReadInputTokens ?? 0) + (lastMeta.cacheCreationInputTokens ?? 0)
     : 0;
@@ -348,6 +367,14 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     const el = scrollRef.current;
     if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
   }, [messages, status]);
+
+  const toBottom = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    pinnedRef.current = true;
+    setAtBottom(true);
+  };
 
   useEffect(() => {
     void refreshHarnessStatuses();
@@ -433,16 +460,50 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     return true;
   }
 
+  // Stage image files (drop/paste/pick) → base64 for the model + a data URL for the chip thumbnail.
+  // Non-images are ignored here (files go through pickFiles by path).
+  async function addImages(list: ArrayLike<File>) {
+    for (const file of Array.from(list)) {
+      if (!file.type.startsWith("image/")) continue;
+      const url = await readDataUrl(file).catch(() => "");
+      const data = url.split(",")[1];
+      if (!data) continue;
+      setImages((p) => (p.some((x) => x.dataUrl === url) ? p : [...p, { name: file.name, mime: file.type, data, dataUrl: url }]));
+    }
+  }
+
+  // Attach files by absolute path (Tauri dialog) — the agent's CLI reads them in place, so any type
+  // or size works without copying bytes into the prompt.
+  async function pickFiles() {
+    const sel = await openDialog({ multiple: true, title: "Attach files" });
+    if (!sel) return;
+    const paths = Array.isArray(sel) ? sel : [sel];
+    setFiles((p) => {
+      const next = [...p];
+      for (const path of paths) if (typeof path === "string" && !next.some((f) => f.path === path)) next.push({ name: basename(path), path });
+      return next;
+    });
+  }
+
   // `force` = user chose "continue anyway" in the sign-in gate.
   async function send(force = false) {
     const text = input.trim();
     if (busy) return;
     if (!cwd) { pokeFolder(); return; }
-    if (!text) return;
+    if (!text && images.length === 0 && files.length === 0) return;
     if (!force && (await needsLoginGate())) return;
+    // Attached files ride the prompt as a path list; the agent reads them with its own tools.
+    const fileNote = files.length ? "\n\nAttached files (read them):\n" + files.map((f) => "- " + f.path).join("\n") : "";
+    const fullText = text + fileNote;
+    // Images become AI SDK `file` parts (data URL) → persisted + rendered, and extracted for the CLI
+    // in resolveSend.
+    const imgParts = images.map((im) => ({ type: "file" as const, mediaType: im.mime, filename: im.name, url: im.dataUrl }));
     setInput("");
+    setImages([]);
+    setFiles([]);
     setTimeout(() => { if (taRef.current) taRef.current.style.height = "auto"; }, 0);
-    void sendMessage({ text });
+    if (imgParts.length) void sendMessage({ text: fullText, files: imgParts });
+    else void sendMessage({ text: fullText });
   }
 
   function stop() {
@@ -475,10 +536,10 @@ export function CodeScreen({ chatId }: { chatId: string }) {
       {active && (
         <header className="cd-top" data-tauri-drag-region>
           <span className="cd-top-title" title={chatTitle}>{chatTitle}</span>
-          <span className="cd-top-folder" title={cwd}>
+          <button className="cd-top-folder" onClick={pickFolder} title="Change project folder">
             <Icon name="folder" size={14} />
             {basename(cwd)}
-          </span>
+          </button>
           <button className="cd-top-act" onClick={exportChat} title="Copy transcript as Markdown (test)">
             <Icon name={exported ? "check" : "copy"} size={16} />
           </button>
@@ -489,19 +550,33 @@ export function CodeScreen({ chatId }: { chatId: string }) {
       )}
 
       {/* Transcript */}
+      <div className="cd-thread-scroll">
       <div
         className="cd-thread"
         ref={scrollRef}
         onScroll={(e) => {
           const el = e.currentTarget;
-          pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+          const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+          pinnedRef.current = pinned;
+          setAtBottom(pinned);
         }}
       >
         <div className="cd-thread-inner">
           {messages.length === 0 && !busy && <CodeStats />}
           {messages.map((m, i) =>
             m.role === "user" ? (
-              <div key={m.id} className="cd-user"><div className="cd-user-bubble">{userText(m)}</div></div>
+              <div key={m.id} className="cd-user">
+                <div className="cd-user-bubble">
+                  {userImages(m).length > 0 && (
+                    <div className="cd-user-imgs">
+                      {userImages(m).map((src, k) => (
+                        <img key={k} src={src} alt="" />
+                      ))}
+                    </div>
+                  )}
+                  {userText(m) && <span className="cd-user-text">{userText(m)}</span>}
+                </div>
+              </div>
             ) : (
               <AssistantMessage
                 key={m.id}
@@ -541,6 +616,12 @@ export function CodeScreen({ chatId }: { chatId: string }) {
           )}
         </div>
       </div>
+      {!atBottom && (
+        <button className="scroll-bottom-btn" onClick={toBottom} title="Scroll to bottom">
+          <Icon name="chevronD" size={18} />
+        </button>
+      )}
+      </div>
 
       {/* Composer */}
       <div className="cd-composer-wrap">
@@ -556,7 +637,35 @@ export function CodeScreen({ chatId }: { chatId: string }) {
               <span className="cd-folder-hint-arrow" />
             </div>
           )}
-          <div className={"cd-composer" + (busy ? " busy" : "")}>
+          <div
+            className={"cd-composer" + (busy ? " busy" : "") + (dragging ? " dragover" : "")}
+            onDragOver={(e) => { e.preventDefault(); if (!dragging) setDragging(true); }}
+            onDragLeave={(e) => { if (e.currentTarget === e.target) setDragging(false); }}
+            onDrop={(e) => { e.preventDefault(); setDragging(false); if (e.dataTransfer.files.length) void addImages(e.dataTransfer.files); }}
+          >
+          {(images.length > 0 || files.length > 0) && (
+            <div className="composer-chips">
+              {images.map((im, k) => (
+                <div className="image-chip" key={"img" + k}>
+                  <img src={im.dataUrl} alt={im.name} title={im.name} />
+                  <button className="image-chip-x" onClick={() => setImages((p) => p.filter((_, j) => j !== k))} title="Remove">
+                    <Icon name="close" size={11} />
+                  </button>
+                </div>
+              ))}
+              {files.map((f, k) => (
+                <div className="paste-chip" key={"file" + k}>
+                  <span className="paste-chip-body" title={f.path}>
+                    <Icon name="attach" size={13} />
+                    <span className="paste-chip-title">{f.name}</span>
+                  </span>
+                  <button className="paste-chip-x" onClick={() => setFiles((p) => p.filter((_, j) => j !== k))} title="Remove">
+                    <Icon name="close" size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <textarea
             ref={taRef}
             value={input}
@@ -564,12 +673,42 @@ export function CodeScreen({ chatId }: { chatId: string }) {
             placeholder={busy ? "Agent is working…" : cwd ? "Describe a change, a bug, or a task…" : "Select a project folder first…"}
             rows={1}
             onChange={(e) => { setInput(e.target.value); autosize(); }}
+            onPaste={(e) => {
+              const imgs = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith("image/"));
+              if (imgs.length) { e.preventDefault(); void addImages(imgs); }
+            }}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }}
           />
+          <input
+            ref={imgInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            style={{ display: "none" }}
+            onChange={(e) => { if (e.target.files?.length) void addImages(e.target.files); e.target.value = ""; }}
+          />
           <div className="cd-comp-bar">
-            <button className="cd-comp-tool" onClick={pickFolder} title="Add files (select a project folder)">
-              <Icon name="plus" size={17} />
-            </button>
+            <div className="comp-add-wrap" ref={addMenuRef}>
+              <button
+                className={"cd-comp-tool" + (addMenuOpen ? " on" : "")}
+                onClick={() => setAddMenuOpen((v) => !v)}
+                title="Attach images or files"
+              >
+                <Icon name="plus" size={17} />
+              </button>
+              {addMenuOpen && (
+                <div className="comp-add-menu">
+                  <button className="model-menu-item" onClick={() => { setAddMenuOpen(false); imgInputRef.current?.click(); }}>
+                    <span className="model-menu-logo"><Icon name="image" size={15} /></span>
+                    <span style={{ flex: 1 }}>Images &amp; media</span>
+                  </button>
+                  <button className="model-menu-item" onClick={() => { setAddMenuOpen(false); void pickFiles(); }}>
+                    <span className="model-menu-logo"><Icon name="attach" size={15} /></span>
+                    <span style={{ flex: 1 }}>Files</span>
+                  </button>
+                </div>
+              )}
+            </div>
             <ModelMenu
               items={modelGroups.flatMap((g) =>
                 g.models.map((c): ModelMenuItem => ({
@@ -624,9 +763,9 @@ export function CodeScreen({ chatId }: { chatId: string }) {
             />
             <span style={{ flex: 1 }} />
             <button
-              className={"cd-send" + (busy ? " stop" : input.trim() && cwd ? " on" : "")}
+              className={"cd-send" + (busy ? " stop" : (input.trim() || images.length || files.length) && cwd ? " on" : "")}
               onClick={() => (busy ? stop() : void send())}
-              disabled={!busy && !input.trim()}
+              disabled={!busy && !(input.trim() || images.length || files.length)}
               title={busy ? "Stop" : "Send"}
             >
               {busy ? <span className="cd-send-spin" /> : <Icon name="arrowUp" size={16} />}
@@ -698,4 +837,11 @@ function userText(m: { parts: { type: string }[] }): string {
     .filter((p) => p.type === "text" && typeof p.text === "string")
     .map((p) => p.text)
     .join("\n");
+}
+
+// Data URLs of image `file` parts on a user message — rendered as thumbnails in the bubble.
+function userImages(m: { parts: { type: string }[] }): string[] {
+  return (m.parts as any[])
+    .filter((p) => p.type === "file" && typeof p.url === "string" && String(p.mediaType ?? "").startsWith("image/"))
+    .map((p) => p.url as string);
 }

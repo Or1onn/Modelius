@@ -52,12 +52,24 @@ pub(crate) fn session_open_line(id: u64, resume: Option<&str>, cwd: &str) -> Str
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()
 }
 
-pub(crate) fn prompt_line(id: u64, session_id: &str, text: &str) -> String {
+// Attached images ride the `prompt` ContentBlock array as ACP `{type:"image", mimeType, data}`
+// blocks (base64). Per ACP the agent must advertise the `image` prompt capability at initialize;
+// kimi's support for that is GUI-verify-pending, so image blocks are only appended when the user
+// actually attaches one (text-only turns are byte-identical to before).
+pub(crate) fn prompt_line(id: u64, session_id: &str, text: &str, images: &[crate::agent::ImageInput]) -> String {
+    let mut prompt = Vec::new();
+    // Omit an empty text block when an image carries the turn; keep it otherwise so prompt is never empty.
+    if !text.is_empty() || images.is_empty() {
+        prompt.push(json!({ "type": "text", "text": text }));
+    }
+    for im in images {
+        prompt.push(json!({ "type": "image", "mimeType": im.mime, "data": im.data }));
+    }
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "session/prompt",
-        "params": { "sessionId": session_id, "prompt": [{ "type": "text", "text": text }] }
+        "params": { "sessionId": session_id, "prompt": prompt }
     })
     .to_string()
 }
@@ -165,7 +177,7 @@ mod tests {
             initialize_line(1),
             session_open_line(2, None, "D:\\proj"),
             session_open_line(2, Some("session_x"), "D:\\proj"),
-            prompt_line(3, "session_x", "hi"),
+            prompt_line(3, "session_x", "hi", &[]),
             cancel_line("session_x"),
             set_model_line(4, "session_x", "kimi-k2.7-code"),
             set_mode_line(5, "session_x", "yolo"),
@@ -201,10 +213,29 @@ mod tests {
 
     #[test]
     fn prompt_line_wraps_text_in_a_content_block() {
-        let v: serde_json::Value = serde_json::from_str(&prompt_line(3, "session_a", "do it")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&prompt_line(3, "session_a", "do it", &[])).unwrap();
         assert_eq!(v["method"], "session/prompt");
         assert_eq!(v["params"]["sessionId"], "session_a");
         assert_eq!(v["params"]["prompt"], serde_json::json!([{ "type": "text", "text": "do it" }]));
+    }
+
+    #[test]
+    fn prompt_line_appends_image_content_blocks() {
+        let imgs = [crate::agent::ImageInput { mime: "image/jpeg".into(), data: "QUJD".into() }];
+        let v: serde_json::Value = serde_json::from_str(&prompt_line(3, "session_a", "look", &imgs)).unwrap();
+        assert_eq!(
+            v["params"]["prompt"],
+            serde_json::json!([
+                { "type": "text", "text": "look" },
+                { "type": "image", "mimeType": "image/jpeg", "data": "QUJD" }
+            ])
+        );
+        // image with no text → just the image block (no empty text block)
+        let only: serde_json::Value = serde_json::from_str(&prompt_line(3, "session_a", "", &imgs)).unwrap();
+        assert_eq!(
+            only["params"]["prompt"],
+            serde_json::json!([{ "type": "image", "mimeType": "image/jpeg", "data": "QUJD" }])
+        );
     }
 
     #[test]

@@ -26,6 +26,11 @@ export function createTransformer() {
   let lastCompactId: string | null = null
   let compactCounter = 0
 
+  // Resume id already surfaced this turn? The final result line is dropped when the user
+  // cancels (the transport's abort closes the stream before the interrupt's result arrives),
+  // so the id must land on the message early or the resume chain breaks on the next respawn.
+  let sessionMetaSent = false
+
   let currentThinkingId: string | null = null
   let accumulatedThinking = ""
   let inThinkingBlock = false
@@ -95,6 +100,14 @@ export function createTransformer() {
     }
 
     yield* gate.ensure()
+
+    // Every top-level stream-json line carries session_id — attach it once per turn, up front
+    // (finishTurn re-merges the same value at the end). Sidechain lines are skipped: their id
+    // must never pre-empt the main session's.
+    if (!sessionMetaSent && typeof msg.session_id === "string" && msg.parent_tool_use_id == null) {
+      sessionMetaSent = true
+      yield { type: "message-metadata", messageMetadata: { sessionId: msg.session_id } }
+    }
 
     // Reset thinking state on new message start to prevent memory leaks
     if (msg.type === "stream_event" && msg.event?.type === "message_start") {
@@ -234,6 +247,17 @@ export function createTransformer() {
         cache_read_input_tokens: msg.message.usage.cache_read_input_tokens ?? 0,
         cache_creation_input_tokens: msg.message.usage.cache_creation_input_tokens ?? 0,
         output_tokens: msg.message.usage.output_tokens ?? 0,
+      }
+      // Stream the snapshot onto the message as it grows: the context ring stays live mid-turn,
+      // and a cancelled turn keeps its last usage instead of losing everything with the result line.
+      yield {
+        type: "message-metadata",
+        messageMetadata: {
+          inputTokens: lastMainAssistantUsage.input_tokens,
+          cacheReadInputTokens: lastMainAssistantUsage.cache_read_input_tokens,
+          cacheCreationInputTokens: lastMainAssistantUsage.cache_creation_input_tokens,
+          outputTokens: lastMainAssistantUsage.output_tokens,
+        },
       }
     }
 

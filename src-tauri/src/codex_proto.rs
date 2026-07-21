@@ -52,11 +52,21 @@ pub(crate) fn thread_open_line(id: u64, resume: Option<&str>, model: &str, cwd: 
 // One user turn. model/effort/approvalPolicy/sandboxPolicy are per-turn overrides that "stick for
 // this turn and subsequent turns" — re-asserting the mode each turn makes an in-session permission
 // switch free (the codex analog of claude's set_permission_mode), and effort changes never respawn.
-pub(crate) fn turn_start_line(id: u64, thread_id: &str, text: &str, model: &str, effort: &str, mode: &str) -> String {
+// Attached images ride the `input` array as `{type:"image", image_url}` items with an inline data
+// URL — the app-server InputItem shape (remote HTTP urls are rejected; a data URL is accepted).
+pub(crate) fn turn_start_line(id: u64, thread_id: &str, text: &str, images: &[crate::agent::ImageInput], model: &str, effort: &str, mode: &str) -> String {
     let (approval, _, sandbox_policy) = codex_mode(mode);
+    let mut input = Vec::new();
+    // Omit an empty text item when an image carries the turn; keep it otherwise so input is never empty.
+    if !text.is_empty() || images.is_empty() {
+        input.push(json!({ "type": "text", "text": text }));
+    }
+    for im in images {
+        input.push(json!({ "type": "image", "image_url": format!("data:{};base64,{}", im.mime, im.data) }));
+    }
     let mut params = json!({
         "threadId": thread_id,
-        "input": [{ "type": "text", "text": text }],
+        "input": input,
         "approvalPolicy": approval,
         "sandboxPolicy": sandbox_policy,
     });
@@ -199,7 +209,7 @@ mod tests {
     #[test]
     fn turn_start_carries_per_turn_overrides() {
         let v: serde_json::Value =
-            serde_json::from_str(&turn_start_line(5, "t-1", "do it", "gpt-5.5", "high", "acceptEdits")).unwrap();
+            serde_json::from_str(&turn_start_line(5, "t-1", "do it", &[], "gpt-5.5", "high", "acceptEdits")).unwrap();
         assert_eq!(v["method"], "turn/start");
         assert_eq!(v["params"]["threadId"], "t-1");
         assert_eq!(v["params"]["input"], serde_json::json!([{ "type": "text", "text": "do it" }]));
@@ -208,9 +218,30 @@ mod tests {
         assert_eq!(v["params"]["sandboxPolicy"], serde_json::json!({ "type": "workspaceWrite" }));
         // empty effort/model are omitted, not sent as ""
         let bare: serde_json::Value =
-            serde_json::from_str(&turn_start_line(5, "t-1", "hi", "", "", "default")).unwrap();
+            serde_json::from_str(&turn_start_line(5, "t-1", "hi", &[], "", "", "default")).unwrap();
         assert!(bare["params"].get("effort").is_none());
         assert!(bare["params"].get("model").is_none());
+    }
+
+    #[test]
+    fn turn_start_appends_image_items_as_data_urls() {
+        let imgs = [crate::agent::ImageInput { mime: "image/png".into(), data: "QUJD".into() }];
+        let v: serde_json::Value =
+            serde_json::from_str(&turn_start_line(5, "t-1", "look", &imgs, "", "", "default")).unwrap();
+        assert_eq!(
+            v["params"]["input"],
+            serde_json::json!([
+                { "type": "text", "text": "look" },
+                { "type": "image", "image_url": "data:image/png;base64,QUJD" }
+            ])
+        );
+        // image with no text → just the image item (no empty text block)
+        let only: serde_json::Value =
+            serde_json::from_str(&turn_start_line(5, "t-1", "", &imgs, "", "", "default")).unwrap();
+        assert_eq!(
+            only["params"]["input"],
+            serde_json::json!([{ "type": "image", "image_url": "data:image/png;base64,QUJD" }])
+        );
     }
 
     #[test]

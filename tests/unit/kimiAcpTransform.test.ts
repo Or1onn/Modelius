@@ -30,6 +30,7 @@ describe("kimi acp transform", () => {
     expect(chunks.map((c) => c.type)).toEqual([
       "start",
       "start-step",
+      "message-metadata", // early resume id — survives a cancelled turn
       "text-start",
       "text-delta",
       "text-delta",
@@ -38,9 +39,11 @@ describe("kimi acp transform", () => {
       "finish-step",
       "finish",
     ]);
+    // the early metadata already carries the resume id
+    expect(chunks[2].messageMetadata.sessionId).toBe(SID);
     // both deltas share the single open block
-    expect(chunks[3].id).toBe(chunks[2].id);
-    expect(chunks[3].delta).toBe("He");
+    expect(chunks[4].id).toBe(chunks[3].id);
+    expect(chunks[4].delta).toBe("He");
     // the ACP session id is the resume id
     const meta = chunks.find((c) => c.type === "finish")?.messageMetadata;
     expect(meta.sessionId).toBe(SID);

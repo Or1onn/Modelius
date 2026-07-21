@@ -274,18 +274,19 @@ impl AgentSession {
         Ok(())
     }
 
+    // The CLI switched its own mode (a control_response carried updatedPermissions setMode,
+    // written via agent_respond) — track it so the next reconcile compares against reality.
+    pub fn note_permission_mode(&self, mode: &str) {
+        *self.permission_mode.lock().unwrap() = mode.to_string();
+    }
+
     // Deliver one user turn over the session's protocol. Err = pipe gone / protocol failure —
     // the caller's write-failed retry respawns once.
-    pub async fn begin_turn(&self, prompt: &str, model: &str, effort: &str, mode: &str) -> std::io::Result<()> {
+    pub async fn begin_turn(&self, prompt: &str, images: &[crate::agent::ImageInput], model: &str, effort: &str, mode: &str) -> std::io::Result<()> {
         match &self.proto {
             SessionProto::Claude => {
                 self.reconcile_permission_mode(mode).await?;
-                let line = serde_json::json!({
-                    "type": "user",
-                    "message": { "role": "user", "content": [{ "type": "text", "text": prompt }] }
-                })
-                .to_string();
-                self.write_line(&line).await
+                self.write_line(&crate::agent::claude_user_line(prompt, images)).await
             }
             SessionProto::Codex(rt) => {
                 // Fresh spawn: wait for the thread/start | thread/resume response (the pump fires
@@ -294,7 +295,7 @@ impl AgentSession {
                 let id = rt.open.take_id();
                 *rt.turn_req.lock().unwrap() = Some(id);
                 *rt.turn_id.lock().unwrap() = None;
-                self.write_line(&crate::codex_proto::turn_start_line(id, &thread_id, prompt, model, effort, mode))
+                self.write_line(&crate::codex_proto::turn_start_line(id, &thread_id, prompt, images, model, effort, mode))
                     .await
             }
             SessionProto::Kimi(rt) => {
@@ -328,7 +329,7 @@ impl AgentSession {
                         .await?;
                     *rt.model_sent.lock().unwrap() = Some(model.to_string());
                 }
-                self.write_line(&crate::kimi_proto::prompt_line(id, &session_id, prompt)).await
+                self.write_line(&crate::kimi_proto::prompt_line(id, &session_id, prompt, images)).await
             }
         }
     }

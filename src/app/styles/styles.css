@@ -335,9 +335,12 @@ input, textarea { font-family: inherit; }
 /* ============ Chat ============ */
 .chat-wrap { flex: 1; min-width: 0; display: flex; }
 .chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
+/* Scroll area = the region between the top bar and the composer; positioning context for the
+   floating scroll-to-bottom button so it sits just above the composer, never over it. */
+.thread-scroll, .cd-thread-scroll { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 /* Floating "scroll to bottom" pill, shown while the thread is scrolled up. */
 .scroll-bottom-btn {
-  position: absolute; left: 50%; transform: translateX(-50%); bottom: calc(100px * var(--su)); z-index: 5;
+  position: absolute; left: 50%; transform: translateX(-50%); bottom: 14px; z-index: 5;
   display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px;
   border-radius: 99px; background: var(--surface-3); border: 1px solid var(--border); color: var(--text-1);
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35); transition: background .15s, transform .15s;
@@ -387,7 +390,7 @@ input, textarea { font-family: inherit; }
 .ctx-pop-win .ctx-pop-bar { margin: 6px 0 0; }
 
 .thread { flex: 1; min-height: 0; overflow-y: auto; }
-.thread-inner { max-width: 760px; margin: 0 auto; padding: calc(28px * var(--su)) 24px 8px; display: flex; flex-direction: column; gap: calc(26px * var(--su)); }
+.thread-inner { max-width: 840px; margin: 0 auto; padding: calc(28px * var(--su)) 24px 8px; display: flex; flex-direction: column; gap: calc(26px * var(--su)); }
 
 /* New-chat hero: greeting + centered composer, AI-workspace style. */
 .chat-hero { flex: 1; min-height: 0; overflow-y: auto; display: flex; align-items: center; justify-content: center; padding: 24px; }
@@ -556,7 +559,7 @@ input, textarea { font-family: inherit; }
 
 /* Composer */
 .composer-wrap { flex-shrink: 0; padding: 8px 24px calc(20px * var(--su)); }
-.composer-wrap > * { max-width: 760px; margin-left: auto; margin-right: auto; }
+.composer-wrap > * { max-width: 840px; margin-left: auto; margin-right: auto; }
 
 /* Self-contained bordered shell — padding lives here, not on the textarea. */
 .composer {
@@ -1335,11 +1338,16 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
   flex-shrink: 0; margin-left: auto;
   display: inline-flex; align-items: center; gap: 7px;
   font-size: 13px; font-weight: 560; letter-spacing: -.01em; color: var(--text-2);
+  background: none; border: none; cursor: pointer; padding: 3px 6px; border-radius: var(--r-sm);
+  transition: background .12s, color .12s;
 }
+.cd-top-folder:hover { background: var(--surface-2); color: var(--text-1); }
 .cd-top-folder svg { color: var(--text-3); flex-shrink: 0; }
 
-.cd-thread { flex: 1; min-height: 0; overflow-y: auto; }
-.cd-thread-inner { max-width: 820px; margin: 0 auto; padding: 26px 26px 12px; display: flex; flex-direction: column; gap: 15px; }
+.cd-thread { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+/* overflow-wrap inherits: breaks unbreakable pasted runs (long ─── lines) in prose + user bubbles
+   so they can't blow past the thread width. Code blocks keep white-space:pre and scroll internally. */
+.cd-thread-inner { max-width: 920px; margin: 0 auto; padding: 26px 26px 12px; display: flex; flex-direction: column; gap: 15px; min-width: 0; overflow-wrap: anywhere; }
 
 /* agent prose */
 .cd-text { font-size: 14px; line-height: 1.65; color: var(--text-2); text-wrap: pretty; }
@@ -1354,6 +1362,11 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
   background: var(--surface-2); border: 1px solid var(--border);
   border-radius: var(--radius) var(--radius) 3px var(--radius); text-wrap: pretty;
 }
+/* Attached-image thumbnails inside a user bubble; the path list keeps its line breaks. */
+.cd-user-imgs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.cd-user-imgs:last-child { margin-bottom: 0; }
+.cd-user-imgs img { max-width: 220px; max-height: 220px; border-radius: 8px; border: 1px solid var(--border); display: block; }
+.cd-user-text { white-space: pre-wrap; }
 
 /* tool calls — a run collapsed into one tab; expand for each row, each row expands to its output/diff */
 .cd-tool { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-1); overflow: hidden; }
@@ -1437,8 +1450,13 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 
 /* diff block */
 .cd-diff { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--code-panel); }
-.cd-diff-path { padding: 9px 14px; border-bottom: 1px solid var(--border); background: var(--surface-1); }
-.cd-diff-path .mono { font-size: 11.5px; color: var(--text-3); letter-spacing: -0.01em; }
+.cd-diff-path { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--border); background: var(--surface-1); }
+.cd-diff-path .mono { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--text-3); letter-spacing: -0.01em; }
+.cd-diff-copy { flex-shrink: 0; display: inline-flex; color: var(--text-4); padding: 2px; border-radius: var(--r-sm); transition: color .12s, background .12s; }
+.cd-diff-copy:hover { color: var(--text-2); background: color-mix(in oklab, var(--surface-2) 60%, transparent); }
+/* file-edit card: diff blends into the tool card (top border only) with a hunk divider per edit */
+.cd-file-diff { border: 0; border-top: 1px solid var(--border); border-radius: 0; max-height: 360px; overflow: auto; }
+.cd-file-diff .cd-hunk { border-top: 1px dashed var(--border); }
 .cd-diff-body { padding: 8px 0; overflow-x: auto; font-family: var(--font-mono); font-size: 12px; line-height: 1.7; }
 .cd-line { display: flex; align-items: baseline; white-space: pre; padding: 0 12px; }
 .cd-line.add { background: color-mix(in oklab, var(--ok) 13%, transparent); }
@@ -1466,7 +1484,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 
 /* composer */
 .cd-composer-wrap { flex-shrink: 0; padding: 8px 26px 20px; }
-.cd-composer-wrap > * { max-width: 820px; margin-left: auto; margin-right: auto; }
+.cd-composer-wrap > * { max-width: 920px; margin-left: auto; margin-right: auto; }
 
 /* Enveloping plate: the folder chip sits on top and the plate wraps the prompt input,
    which nests inside with its own lighter card — an "обволакивание" layered look. */
@@ -1495,7 +1513,8 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
    so on focus the top edge stayed unpainted and its rounded corners read as clipped. Re-light the
    top edge on focus too. */
 .cd-composer:first-child:focus-within { border-top-color: rgba(var(--fg-rgb), 0.24); }
-.cd-composer.busy { border-color: color-mix(in oklab, var(--accent) 30%, transparent); }
+/* Drag-over highlight for image drops (declared after the focus/first-child rules so it wins). */
+.cd-composer.dragover { border-color: var(--accent); background: color-mix(in oklab, var(--accent) 7%, var(--surface-1)); }
 .cd-composer textarea { display: block; width: 100%; resize: none; border: none; outline: none; background: transparent; color: var(--text-1); font-size: 14px; line-height: 1.55; padding: 2px 4px; min-height: 42px; max-height: 200px; }
 .cd-composer textarea::placeholder { color: var(--text-4); }
 .cd-comp-bar { display: flex; align-items: center; gap: 4px; margin-top: 9px; }
@@ -1671,7 +1690,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px;
 }
 
 /* new-session empty state: usage statistics hero */
-.cd-hero { max-width: 820px; margin: 0 auto; padding: 18px 4px 4px; width: 100%; }
+.cd-hero { max-width: 920px; margin: 0 auto; padding: 18px 4px 4px; width: 100%; }
 .cd-hero-greet { display: flex; align-items: center; gap: 15px; margin: 6px 0 26px; }
 .cd-hero-spark { color: var(--accent); display: inline-flex; flex-shrink: 0; }
 .cd-hero-greet h1 { font-size: 30px; font-weight: 560; letter-spacing: -0.03em; color: var(--text-1); margin: 0; }

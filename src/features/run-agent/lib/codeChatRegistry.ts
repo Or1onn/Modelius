@@ -75,6 +75,23 @@ function textOf(msg: UIMessage | undefined): string {
     .join("\n");
 }
 
+// Image `file` parts of a UIMessage → {mime, base64} for the harness's native image block. The AI
+// SDK stores an attached image as a `file` part whose `url` is a data URL; strip the prefix to the
+// raw base64 the Rust side wraps. Non-image or non-data-URL parts are ignored.
+function imagesOf(msg: UIMessage | undefined): { mime: string; data: string }[] {
+  if (!msg?.parts) return [];
+  const out: { mime: string; data: string }[] = [];
+  for (const p of msg.parts as any[]) {
+    if (p.type !== "file" || typeof p.url !== "string") continue;
+    const mime: string = p.mediaType ?? "";
+    if (!mime.startsWith("image/")) continue;
+    const comma = p.url.indexOf(",");
+    if (!p.url.startsWith("data:") || comma === -1) continue;
+    out.push({ mime, data: p.url.slice(comma + 1) });
+  }
+  return out;
+}
+
 type SendTarget = RunConfig["target"];
 
 // Resolve the endpoint a run should land on — mirrors the old codeSessionStore.resolveRouting.
@@ -139,9 +156,15 @@ function resolvedEffort(config: CodeConfig): string {
 // Turn the current message list + config into a concrete run (called by the transport per send).
 async function resolveSend(chatId: string, messages: UIMessage[]): Promise<ResolvedSend> {
   const { config } = ensure(chatId);
-  const prompt = textOf(lastOfRole(messages, "user"));
-  const lastAssistant = lastOfRole(messages, "assistant");
-  const resume = (lastAssistant?.metadata as { sessionId?: string } | undefined)?.sessionId;
+  const lastUser = lastOfRole(messages, "user");
+  const prompt = textOf(lastUser);
+  const images = imagesOf(lastUser);
+  // Last assistant turn that actually carries a resume id — a cancelled or errored turn's
+  // message may have none; an earlier turn's id still resumes the same CLI session.
+  const resume = (
+    lastOfRole(messages, "assistant", (m) => !!(m.metadata as { sessionId?: string } | undefined)?.sessionId)
+      ?.metadata as { sessionId?: string } | undefined
+  )?.sessionId;
 
   // Never hand a foreign model id to the harness CLI (codex only serves its own models).
   if (!choiceFitsHarness(config.model, config.harness)) {
@@ -155,6 +178,7 @@ async function resolveSend(chatId: string, messages: UIMessage[]): Promise<Resol
 
   return {
     prompt,
+    images,
     resume,
     run: { harness: config.harness, model: config.model.id, cwd: config.cwd, permissionMode: config.permissionMode, effort: resolvedEffort(config), target, codexAuth, claudeToken },
   };

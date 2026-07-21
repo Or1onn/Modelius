@@ -12,6 +12,7 @@ import { diffLines } from "@/shared/lib/diff";
 import { langFromPath, highlightHtml } from "@/shared/lib/highlight";
 import { allowPermission, denyPermission, type PermissionRequestData } from "@/features/run-agent/lib/permission";
 import { setCodeConfig } from "@/features/run-agent/lib/codeChatRegistry";
+import { copyToClipboard } from "@/features/export-chat/lib/save";
 import { basename } from "@/shared/lib/paths";
 
 export type DiffRow = { n?: number; t: "ctx" | "add" | "del"; c: string };
@@ -30,6 +31,8 @@ export type ToolItem = {
 
 const SHELL_VERBS = new Set(["Bash", "PowerShell", "Ran"]);
 const EXPLORING = new Set(["Read", "Grep", "Glob", "WebSearch", "WebFetch"]);
+// File-mutating tools: consecutive calls to the SAME file fold into one FileEdits card.
+const FILE_EDIT = new Set(["Edit", "Write", "MultiEdit"]);
 
 function DiffRows({ rows, lang }: { rows: DiffRow[]; lang?: string }) {
   return (
@@ -45,6 +48,26 @@ function DiffRows({ rows, lang }: { rows: DiffRow[]; lang?: string }) {
   );
 }
 
+// The CLI's edit tool result carries a `structuredPatch` (jsdiff hunks) with the REAL file line
+// numbers + surrounding context — unlike an old/new-string diff, whose numbers restart at 1 per
+// edit. Convert those hunks straight to rows so every line keeps its true position in the file.
+function patchRows(patch: any[]): DiffRow[] {
+  const rows: DiffRow[] = [];
+  for (const h of patch) {
+    if (!h || !Array.isArray(h.lines)) continue;
+    let oldNo = Number(h.oldStart) || 0;
+    let newNo = Number(h.newStart) || 0;
+    for (const raw of h.lines as string[]) {
+      const c = raw.slice(1);
+      if (raw[0] === "+") rows.push({ t: "add", c, n: newNo++ });
+      else if (raw[0] === "-") rows.push({ t: "del", c, n: oldNo++ });
+      else if (raw[0] === " ") { rows.push({ t: "ctx", c, n: newNo }); oldNo++; newNo++; }
+      // else: "\ No newline at end of file" — skip
+    }
+  }
+  return rows;
+}
+
 // Map a tool part → the row display model (verb, target, lifecycle, optional diff). Tools arrive as
 // static `tool-<Name>` parts (name in the type) since we don't register a tool schema; `verb` is the
 // resolved name.
@@ -54,21 +77,19 @@ function toToolItem(part: any, verb: string): ToolItem {
   const lang = langFromPath(input.file_path ?? input.path);
   const pending = part.state === "input-streaming" || part.state === "input-available";
   const isError = part.state === "output-error";
-
-  let output: string | undefined;
-  if (isError) output = part.errorText;
-  else if (part.state === "output-available") {
-    const o = part.output;
-    output = typeof o === "string" ? o : o == null ? undefined : JSON.stringify(o, null, 2);
-    // synthetic completion marker emitted for edits/thinking — carries no real output
-    if (output === '{"completed":true}') output = undefined;
-  }
+  const rawOut = !isError && part.state === "output-available" ? part.output : undefined;
 
   let diff: DiffRow[] | undefined;
   const lower = verb.toLowerCase();
   const toRows = (old: string, next: string) =>
     diffLines(old, next).map((r) => ({ t: r.type, c: r.text, n: r.newNo ?? r.oldNo }));
-  if (lower === "edit" && typeof input.old_string === "string") {
+  // Prefer the CLI's real-line-numbered patch; fall back to an input diff (before the result lands,
+  // or for harnesses that send no patch — e.g. Write returns an empty structuredPatch).
+  const patch = rawOut && typeof rawOut === "object" && Array.isArray((rawOut as any).structuredPatch)
+    ? (rawOut as any).structuredPatch as any[] : null;
+  if (patch?.length) {
+    diff = patchRows(patch);
+  } else if (lower === "edit" && typeof input.old_string === "string") {
     diff = toRows(input.old_string, input.new_string ?? "");
   } else if (lower === "write" && typeof input.content === "string") {
     diff = input.content.split("\n").map((line: string, i: number) => ({ t: "add" as const, c: line, n: i + 1 }));
@@ -76,6 +97,17 @@ function toToolItem(part: any, verb: string): ToolItem {
     const j = (k: string) => input.edits.map((e: any) => e?.[k] ?? "").join("\n");
     diff = toRows(j("old_string"), j("new_string"));
   }
+
+  // Output text only matters when there's no diff to show (errors, or non-edit tool output) — an
+  // edit's toolUseResult is a big object (originalFile + patch) we don't want dumped as JSON.
+  let output: string | undefined;
+  if (isError) output = part.errorText;
+  else if (!diff && rawOut != null) {
+    output = typeof rawOut === "string" ? rawOut : JSON.stringify(rawOut, null, 2);
+    // synthetic completion marker emitted for edits/thinking — carries no real output
+    if (output === '{"completed":true}') output = undefined;
+  }
+
   let add: number | undefined, del: number | undefined;
   if (diff) {
     add = diff.filter((r) => r.t === "add").length;
@@ -114,6 +146,58 @@ function ToolRow({ item }: { item: ToolItem }) {
 // block. Without the wrapper a bare .cd-tool-row floats unstyled (no border/bg).
 function SoloTool({ item }: { item: ToolItem }) {
   return <div className="cd-tool"><ToolRow item={item} /></div>;
+}
+
+// One or more consecutive edits to the SAME file, folded into a single card (Claude-Code style):
+// header shows the file once + summed +add/-del; expanding reveals every hunk under one path bar.
+function FileEdits({ items }: { items: ToolItem[] }) {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const path = items[0].file;
+  const anyErr = items.some((it) => it.isError);
+  const pending = items.some((it) => it.pending);
+  const verb = items.every((it) => it.verb === "Write") ? "Wrote" : "Edited";
+  // Failed edits didn't apply — don't count their intended lines in the summary.
+  const good = items.filter((it) => !it.isError);
+  const add = good.reduce((s, it) => s + (it.add ?? 0), 0);
+  const del = good.reduce((s, it) => s + (it.del ?? 0), 0);
+  const hasBody = items.some((it) => it.diff?.length || it.output);
+  const copyPath = () =>
+    void copyToClipboard(path).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }).catch(() => {});
+  return (
+    <div className="cd-tool">
+      <button className="cd-tool-row" onClick={() => hasBody && setOpen((v) => !v)} disabled={!hasBody}>
+        <span className={"cd-verb" + (anyErr ? " err" : "")}>{verb}</span>
+        <span className="cd-tool-file mono">{path ? basename(path) : ""}</span>
+        {items.length > 1 && <span className="cd-tool-count mono">{items.length} edits</span>}
+        {add > 0 && <span className="cd-add mono">+{add}</span>}
+        {del > 0 && <span className="cd-del mono">-{del}</span>}
+        {pending && <span className="cd-tool-spin" />}
+        {hasBody && <span className={"cd-tool-chev" + (open ? " open" : "")}><Icon name="chevronD" size={13} /></span>}
+      </button>
+      {open && hasBody && (
+        <div className="cd-diff cd-file-diff">
+          <div className="cd-diff-path">
+            <span className="mono" title={path}>{path}</span>
+            <button className="cd-diff-copy" onClick={copyPath} title="Copy path">
+              <Icon name={copied ? "check" : "copy"} size={13} />
+            </button>
+          </div>
+          {items.map((it, i) => (
+            <div key={it.id} className={i ? "cd-hunk" : ""}>
+              {it.isError
+                ? <pre className="cd-tool-out mono err">{it.output}</pre>
+                : it.diff?.length
+                  ? <DiffRows rows={it.diff} lang={it.lang} />
+                  : it.output
+                    ? <pre className="cd-tool-out mono hljs"><code dangerouslySetInnerHTML={{ __html: highlightHtml(it.output, it.lang) }} /></pre>
+                    : null}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 const VERB_PHRASE: Record<string, { verb: string; noun: [string, string] }> = {
@@ -420,15 +504,27 @@ function renderNodes(nodes: Node[], streaming: boolean, keyBase: string, chatId?
     else run.forEach((it) => out.push(<SoloTool key={it.id} item={it} />));
     run = [];
   };
-  nodes.forEach((n, i) => {
-    if (n.kind === "tool" && EXPLORING.has(n.item.verb)) { run.push(n.item); return; }
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    if (n.kind === "tool" && EXPLORING.has(n.item.verb)) { run.push(n.item); continue; }
     flush(false);
+    // Fold a maximal run of consecutive edits to the same file into one FileEdits card.
+    if (n.kind === "tool" && FILE_EDIT.has(n.item.verb)) {
+      const group = [n.item];
+      while (i + 1 < nodes.length) {
+        const next = nodes[i + 1];
+        if (next.kind !== "tool" || !FILE_EDIT.has(next.item.verb) || next.item.file !== n.item.file) break;
+        group.push(next.item); i++;
+      }
+      out.push(<FileEdits key={group[0].id} items={group} />);
+      continue;
+    }
     if (n.kind === "tool") out.push(<SoloTool key={n.item.id} item={n.item} />);
     else if (n.kind === "thinking") out.push(<ThinkingBlock key={`${keyBase}-th${i}`} text={n.text} />);
     else if (n.kind === "plan") out.push(<PlanCard key={`${keyBase}-pl${i}`} text={n.text} onApprove={n.onApprove} />);
     else if (n.kind === "perm") out.push(<PermissionCard key={n.data.requestId} data={n.data} chatId={chatId} />);
     else out.push(<div key={`${keyBase}-tx${i}`} className="cd-text md"><Markdown text={n.text} /></div>);
-  });
+  }
   flush(true);
   return out;
 }

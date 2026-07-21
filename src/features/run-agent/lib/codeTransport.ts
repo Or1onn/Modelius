@@ -29,8 +29,16 @@ export interface RunConfig {
   claudeToken?: string;
 }
 
+// An image attached to the turn: MIME + base64 payload (no data-URL prefix). Per-turn content the
+// Rust side wraps in each harness's native image content block (agent.rs ImageInput).
+export interface CodeImage {
+  mime: string;
+  data: string;
+}
+
 export interface ResolvedSend {
   prompt: string;
+  images?: CodeImage[]; // vision attachments on this turn
   resume?: string; // prior CLI session id (from the last assistant message's metadata)
   run: RunConfig;
 }
@@ -153,7 +161,7 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
     messages: UIMessage[];
     abortSignal?: AbortSignal;
   }): Promise<ReadableStream<UIMessageChunk>> {
-    const { prompt, resume, run } = await this.resolve(options.messages);
+    const { prompt, images, resume, run } = await this.resolve(options.messages);
     const streamId = crypto.randomUUID();
     const isCodex = run.harness === "codex";
     const isKimi = run.harness === "kimi-code";
@@ -264,6 +272,7 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
           harness: run.harness,
           model: run.model,
           prompt,
+          images: images ?? [],
           cwd: run.cwd,
           permissionMode: run.permissionMode,
           effort: run.effort,
@@ -300,11 +309,18 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
             pendingKimiPerms.clear();
             void invoke("cancel_stream", { streamId }).catch(() => {});
             clearTurnStatus(this.chatId);
-            try {
-              controller.close();
-            } catch {
-              // already closed
-            }
+            // Don't close yet: the interrupt's final line (resume id + usage metadata) arrives
+            // right after the CLI acks, and the Done event closes the stream then. The SDK keeps
+            // consuming an open stream after abort, so those chunks still land on the message.
+            // 2s backstop covers a deaf CLI (Rust kills it at 5s; late events hit a closed
+            // stream harmlessly).
+            setTimeout(() => {
+              try {
+                controller.close();
+              } catch {
+                // already closed
+              }
+            }, 2000);
           },
           { once: true }
         );

@@ -78,10 +78,12 @@ describe("codex app-server transform", () => {
     const chunks = run([turnStarted, msgDelta("He"), msgDelta("llo"), msgCompleted]);
     expect(chunks[0]).toEqual({ type: "start" });
     expect(chunks[1]).toEqual({ type: "start-step" });
-    expect(chunks[2]).toEqual({ type: "text-start", id: "msg_1" });
-    expect(chunks[3]).toEqual({ type: "text-delta", id: "msg_1", delta: "He" });
-    expect(chunks[4]).toEqual({ type: "text-delta", id: "msg_1", delta: "llo" });
-    expect(chunks[5]).toEqual({ type: "text-end", id: "msg_1" });
+    // early resume id — survives a cancelled turn (turn/completed never arrives then)
+    expect(chunks[2]).toEqual({ type: "message-metadata", messageMetadata: { sessionId: TH } });
+    expect(chunks[3]).toEqual({ type: "text-start", id: "msg_1" });
+    expect(chunks[4]).toEqual({ type: "text-delta", id: "msg_1", delta: "He" });
+    expect(chunks[5]).toEqual({ type: "text-delta", id: "msg_1", delta: "llo" });
+    expect(chunks[6]).toEqual({ type: "text-end", id: "msg_1" });
   });
 
   it("emits whole text when no deltas arrived (non-streaming provider)", () => {

@@ -24,6 +24,14 @@ pub(crate) fn agent_stdins() -> &'static Mutex<HashMap<String, StdinHandle>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Warm-session key per live stream — lets agent_respond find the AgentSession behind an answer
+// (a plan-approve control_response carries updatedPermissions setMode: the CLI switches its own
+// mode, and the session's tracked mode must follow or a later reconcile no-ops against reality).
+pub(crate) fn agent_session_keys() -> &'static Mutex<HashMap<String, String>> {
+    static R: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 // RAII: drop the stdin handle on every agent_run exit path. Removing the map entry drops the
 // last Arc (agent_respond only holds a transient clone), which closes the pipe — the CLI sees
 // stdin EOF and exits instead of waiting for more stream-json input.
@@ -34,7 +42,23 @@ struct StdinGuard {
 impl Drop for StdinGuard {
     fn drop(&mut self) {
         agent_stdins().lock().unwrap().remove(&self.id);
+        agent_session_keys().lock().unwrap().remove(&self.id);
     }
+}
+
+// The mode a control_response switches the CLI to, if any: updatedPermissions carrying a
+// {type:"setMode", mode} entry (plan approval rides "acceptEdits" this way).
+fn set_mode_of(v: &serde_json::Value) -> Option<String> {
+    if v.get("type")?.as_str()? != "control_response" {
+        return None;
+    }
+    let perms = v.get("response")?.get("response")?.get("updatedPermissions")?.as_array()?;
+    perms.iter().find_map(|p| {
+        if p.get("type")?.as_str()? != "setMode" {
+            return None;
+        }
+        Some(p.get("mode")?.as_str()?.to_string())
+    })
 }
 
 // Answer a pending control_request (e.g. a can_use_tool permission prompt) by writing one JSON
@@ -42,7 +66,7 @@ impl Drop for StdinGuard {
 // corrupt the stream-json channel.
 #[tauri::command]
 pub async fn agent_respond(stream_id: String, payload: String) -> Result<(), String> {
-    serde_json::from_str::<serde_json::Value>(&payload)
+    let parsed = serde_json::from_str::<serde_json::Value>(&payload)
         .map_err(|e| format!("payload must be JSON: {}", e))?;
     let handle = agent_stdins()
         .lock()
@@ -50,15 +74,26 @@ pub async fn agent_respond(stream_id: String, payload: String) -> Result<(), Str
         .get(&stream_id)
         .cloned()
         .ok_or_else(|| "no live agent run for this stream".to_string())?;
-    let mut stdin = handle.lock().await;
-    let write = async {
-        stdin.write_all(payload.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await
-    };
-    write
-        .await
-        .map_err(|e: std::io::Error| format!("failed to write control response: {}", e))
+    {
+        let mut stdin = handle.lock().await;
+        let write = async {
+            stdin.write_all(payload.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await
+        };
+        write
+            .await
+            .map_err(|e: std::io::Error| format!("failed to write control response: {}", e))?;
+    }
+    // Mirror a setMode answer into the warm session's tracked mode, so the next turn's
+    // reconcile_permission_mode compares against what the CLI actually runs under.
+    if let Some(mode) = set_mode_of(&parsed) {
+        let key = agent_session_keys().lock().unwrap().get(&stream_id).cloned();
+        if let Some(session) = key.and_then(|k| crate::session::get(&k)) {
+            session.note_permission_mode(&mode);
+        }
+    }
+    Ok(())
 }
 
 // Events sent back to the webview. `Line` carries one raw stdout line from the CLI (decoded in TS);
@@ -82,6 +117,38 @@ pub(crate) struct RouteTarget {
     pub protocol: String, // "anthropic" | "openai"
     pub base_url: String,
     pub api_key: String,
+}
+
+// One image attached to a turn: a MIME type + base64 payload (no data-URL prefix). Per-turn
+// content, like the prompt — it rides begin_turn, never the warm-session fingerprint. Each harness
+// wraps it in its own native content block (claude_user_line here; codex/kimi_proto builders).
+#[derive(serde::Deserialize, Clone)]
+pub(crate) struct ImageInput {
+    pub mime: String,
+    pub data: String,
+}
+
+// The claude stream-json user line: a text block plus one native Anthropic image block per
+// attachment. Shared by the cold per-turn path and the warm session (session.rs begin_turn) so the
+// two can't drift.
+pub(crate) fn claude_user_line(prompt: &str, images: &[ImageInput]) -> String {
+    let mut content = Vec::new();
+    // Drop an empty text block when an image carries the turn (Anthropic rejects empty text
+    // blocks); keep it when there are no images so the content array is never empty.
+    if !prompt.is_empty() || images.is_empty() {
+        content.push(serde_json::json!({ "type": "text", "text": prompt }));
+    }
+    for im in images {
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": im.mime, "data": im.data }
+        }));
+    }
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": content }
+    })
+    .to_string()
 }
 
 // Build argv from the harness's declarative template. The prompt never enters argv — it rides
@@ -415,6 +482,7 @@ pub async fn agent_run(
     harness: String,
     model: String,
     prompt: String,
+    images: Vec<ImageInput>,
     cwd: String,
     permission_mode: String,
     effort: String,
@@ -471,6 +539,7 @@ pub async fn agent_run(
                 permission_mode,
                 resume,
                 prompt,
+                images,
                 effort,
                 path_env,
                 codex_home,
@@ -522,11 +591,7 @@ pub async fn agent_run(
                 return Err("no stdin".to_string());
             }
         };
-        let initial = serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": prompt }] }
-        })
-        .to_string();
+        let initial = claude_user_line(&prompt, &images);
         let wrote = async {
             si.write_all(initial.as_bytes()).await?;
             si.write_all(b"\n").await?;
@@ -621,6 +686,8 @@ struct WarmRun {
     permission_mode: String,
     resume: Option<String>,
     prompt: String,
+    // Images attached to this turn (per-turn content, not part of the fingerprint).
+    images: Vec<ImageInput>,
     // Raw effort as picked in the UI. For claude it's already in the fingerprint (argv);
     // for codex it rides each turn/start (session.begin_turn) and stays out of the fingerprint.
     effort: String,
@@ -680,9 +747,10 @@ async fn run_warm(
         if let Some(stdin) = session.stdin() {
             agent_stdins().lock().unwrap().insert(stream_id.to_string(), stdin);
         }
+        agent_session_keys().lock().unwrap().insert(stream_id.to_string(), key.to_string());
         let done_rx = session.attach_turn(on_event.clone());
         let wrote = session
-            .begin_turn(&run.prompt, &run.fingerprint.model, &run.effort, &run.permission_mode)
+            .begin_turn(&run.prompt, &run.images, &run.fingerprint.model, &run.effort, &run.permission_mode)
             .await;
         match wrote {
             Ok(()) => break (session, done_rx),
@@ -924,6 +992,26 @@ mod tests {
         let argv = build_argv(s, "", "", "", None, Some("sess-1"));
         let ri = argv.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(argv[ri + 1], "sess-1");
+    }
+
+    #[test]
+    fn set_mode_of_extracts_only_a_control_response_set_mode() {
+        let v = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        // plan-approve answer: allow + updatedPermissions setMode (the shape permission.ts builds)
+        let approve = v(r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"allow","updatedInput":{},"updatedPermissions":[{"type":"setMode","mode":"acceptEdits","destination":"session"}]}}}"#);
+        assert_eq!(set_mode_of(&approve).as_deref(), Some("acceptEdits"));
+        // plain allow without a mode switch
+        let plain = v(r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"allow","updatedInput":{}}}}"#);
+        assert_eq!(set_mode_of(&plain), None);
+        // deny carries no permissions either
+        let deny = v(r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"deny","message":"no"}}}"#);
+        assert_eq!(set_mode_of(&deny), None);
+        // codex/kimi JSON-RPC answers are not control_responses
+        let codex = v(r#"{"id":3,"result":{"decision":"accept"}}"#);
+        assert_eq!(set_mode_of(&codex), None);
+        // a non-setMode permission entry is ignored
+        let other = v(r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"allow","updatedPermissions":[{"type":"addRules","rules":[]}]}}}"#);
+        assert_eq!(set_mode_of(&other), None);
     }
 
     #[test]

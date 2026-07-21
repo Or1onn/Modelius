@@ -441,7 +441,7 @@ export function ChatThread({
   }, [allThreads]);
 
   return (
-    <>
+    <div className="thread-scroll">
     <div
       className="thread"
       ref={scrollRef}
@@ -510,6 +510,6 @@ export function ChatThread({
         <Icon name="chevronD" size={18} />
       </button>
     )}
-    </>
+    </div>
   );
 }

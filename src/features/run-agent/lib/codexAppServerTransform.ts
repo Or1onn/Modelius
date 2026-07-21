@@ -11,6 +11,9 @@ import { finishTurn, startGate } from "./baseTransformer";
 export function createCodexAppServerTransformer() {
   const gate = startGate();
   let threadId: string | undefined;
+  // Resume id surfaced this turn? Must land early — a cancelled turn never sees its
+  // turn/completed metadata (the transport's abort closes the stream first).
+  let sessionMetaSent = false;
   const openText = new Set<string>(); // agentMessage item ids with a text-start emitted
   const openReasoning = new Set<string>(); // reasoning item ids with a reasoning-start emitted
   const startedTools = new Set<string>(); // command/mcp items whose call was already emitted
@@ -163,6 +166,11 @@ export function createCodexAppServerTransformer() {
     if (typeof p.thread?.id === "string") threadId = p.thread.id;
 
     yield* gate.ensure();
+
+    if (!sessionMetaSent && threadId) {
+      sessionMetaSent = true;
+      yield { type: "message-metadata", messageMetadata: { sessionId: threadId } };
+    }
 
     switch (method) {
       case "turn/started":

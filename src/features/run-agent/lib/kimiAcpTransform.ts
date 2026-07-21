@@ -69,6 +69,9 @@ export function kimiToolInput(update: { rawInput?: unknown; content?: unknown; t
 export function createKimiAcpTransformer() {
   const gate = startGate();
   let sessionId: string | undefined;
+  // Resume id surfaced this turn? Must land early — a cancelled turn never sees its
+  // finishTurn metadata (the transport's abort closes the stream first).
+  let sessionMetaSent = false;
   let openTextId: string | null = null; // ACP chunks carry no item ids — one open block at a time
   let openThoughtId: string | null = null;
   const startedTools = new Map<string, string>(); // toolCallId → resolved toolName
@@ -202,6 +205,11 @@ export function createKimiAcpTransformer() {
     if (typeof p.sessionId === "string") sessionId = p.sessionId;
 
     yield* gate.ensure();
+
+    if (!sessionMetaSent && sessionId) {
+      sessionMetaSent = true;
+      yield { type: "message-metadata", messageMetadata: { sessionId } };
+    }
 
     yield* emitUpdate(p.update);
   };
