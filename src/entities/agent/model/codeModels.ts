@@ -3,9 +3,12 @@
 // providers connected in the app, locally installed Ollama models, and user-configured gateways
 // whose protocol the gateway proxy can serve. peek renders instantly; list revalidates the
 // async sources.
-import { HARNESS_BY_ID } from "@/entities/agent/model/harnesses";
+import { HARNESS_BY_ID, type NativeKind } from "@/entities/agent/model/harnesses";
+import { peekCliLoggedIn } from "@/entities/agent/model/harnessStatus";
 import { PROVIDERS } from "@/entities/model/model/registry";
 import { hasKey } from "@/entities/session/model/keys";
+import { hasAnthropicOAuth } from "@/entities/session/model/anthropicSession";
+import { hasOpenAIOAuth } from "@/entities/session/model/openaiSession";
 import { KEY_PROVIDER_IDS, listKeyProviderModels, peekKeyProviderModels } from "@/entities/session/model/keyProviders";
 import { listModels, peekModels, type RemoteModel } from "@/entities/session/api/providerModels";
 import { listAppClaudeModels, peekAppClaudeModels, currentClaudeModels } from "@/entities/session/api/claudeModels";
@@ -36,6 +39,16 @@ function connectedGroup(pid: string, models: RemoteModel[] | null): CodeModelGro
   };
 }
 
+// A native group is the CLI's own account, so it belongs in the picker only while that account is
+// signed in — either through the app (OAuth) or through the CLI's own credentials on disk. Kimi
+// has no app-side login, so it rests entirely on the CLI marker. An unprobed answer (undefined,
+// and every web build) counts as signed in: the list must not flicker empty before the probe lands.
+function nativeSignedIn(harnessId: string, kind: NativeKind): boolean {
+  if (kind === "anthropic" && hasAnthropicOAuth()) return true;
+  if (kind === "codex" && hasOpenAIOAuth()) return true;
+  return peekCliLoggedIn(harnessId) !== false;
+}
+
 function buildGroups(
   harnessId: string,
   connected: Record<string, RemoteModel[] | null>,
@@ -48,7 +61,7 @@ function buildGroups(
   if (!harness) return [];
 
   const groups: CodeModelGroup[] = [];
-  if (harness.native) {
+  if (harness.native && nativeSignedIn(harnessId, harness.native.kind)) {
     const native = harness.native;
     // Native groups use the app's live subscription list when connected (Anthropic /v1/models,
     // Codex model/list, Kimi acp configOptions); otherwise the CLI's own login is authed

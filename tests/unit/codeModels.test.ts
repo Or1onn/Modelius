@@ -1,10 +1,17 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { peekCodeModelGroups } from "@/entities/agent/model/codeModels";
+
+// The CLI-login probe is Tauri-only; stub it so the sign-in gating can be exercised here.
+const probe = vi.hoisted(() => ({ loggedIn: undefined as boolean | undefined }));
+vi.mock("@/entities/agent/model/harnessStatus", () => ({ peekCliLoggedIn: () => probe.loggedIn }));
 
 // The picker must distinguish the CLI's native login (well-trodden tool loop) from non-native
 // picks that run through the local gateway proxy — the "via gateway" suffix carries that.
 describe("code model groups", () => {
-  beforeEach(() => localStorage.clear());
+  beforeEach(() => {
+    localStorage.clear();
+    probe.loggedIn = undefined; // unprobed → treated as signed in
+  });
 
   it("suffixes only non-native groups with via gateway", () => {
     localStorage.setItem(
@@ -51,5 +58,21 @@ describe("code model groups", () => {
     const anthropic = groups.find((g) => g.models.some((m) => m.kind === "connected" && m.providerId === "anthropic"));
     expect(anthropic).toBeDefined();
     expect(anthropic?.label.endsWith("· via gateway")).toBe(true);
+  });
+
+  // A native group is the CLI's own account: with neither the app's login nor the CLI's own
+  // credentials, listing it would offer models the user can't actually run.
+  it("hides the native group when the account isn't signed in", () => {
+    probe.loggedIn = false;
+    expect(peekCodeModelGroups("claude-code").some((g) => g.models.some((m) => m.kind === "anthropic"))).toBe(false);
+    expect(peekCodeModelGroups("codex").some((g) => g.models.some((m) => m.kind === "codex"))).toBe(false);
+    expect(peekCodeModelGroups("kimi-code")).toEqual([]); // native-only harness → nothing left to pick
+  });
+
+  it("keeps the native group when the app holds the account login", () => {
+    probe.loggedIn = false; // CLI has no credentials of its own
+    localStorage.setItem("modelius.oauthmeta.anthropic", JSON.stringify({ hasRefresh: true }));
+    expect(peekCodeModelGroups("claude-code")[0].models.every((m) => m.kind === "anthropic")).toBe(true);
+    expect(peekCodeModelGroups("codex").some((g) => g.models.some((m) => m.kind === "codex"))).toBe(false);
   });
 });

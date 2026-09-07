@@ -16,7 +16,7 @@ import { fmtReset, fmtUsd, winUsedPct } from "@/widgets/usage-meter/lib/format";
 import { useAutosize } from "@/shared/lib/useAutosize";
 import type { EffortLevel } from "@/entities/model/model/apiIds";
 import { HARNESSES, HARNESS_BY_ID, PERMISSION_MODES, PERMISSION_LABEL, type NativeKind } from "@/entities/agent/model/harnesses";
-import { useHarnessStatuses, refreshHarnessStatuses, installHarness, cliLoggedIn } from "@/entities/agent/model/harnessStatus";
+import { useHarnessStatuses, refreshHarnessStatuses, refreshHarnessLogins, installHarness, cliLoggedIn } from "@/entities/agent/model/harnessStatus";
 import { hasAnthropicOAuth } from "@/entities/session/model/anthropicSession";
 import { hasOpenAIOAuth } from "@/entities/session/model/openaiSession";
 import { AuthModal } from "@/pages/code/ui/AuthModal";
@@ -289,6 +289,14 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const gateways = useGateways();
   const harnessStatuses = useHarnessStatuses();
   const harness = HARNESS_BY_ID[harnessId];
+  // Mirrors codeModels' nativeSignedIn: the native group is listed only while its account is
+  // signed in, so the model list has to be rebuilt whenever that flips (login modal, kimi's
+  // terminal flow, a disconnect on the Providers screen).
+  const nativeKind = harness?.native?.kind;
+  const nativeSignedIn =
+    (nativeKind === "anthropic" && hasAnthropicOAuth()) ||
+    (nativeKind === "codex" && hasOpenAIOAuth()) ||
+    harnessStatuses[harnessId]?.loggedIn !== false;
   // Effort picker for native picks whose harness supports it — the level list + default come
   // from the same helper the registry's resolvedEffort uses, so UI and CLI can't drift.
   const { levels: effortLevels, dflt: effortDefault } = codeEffortInfo(model);
@@ -379,14 +387,18 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     } catch { /* clipboard denied */ }
   };
 
-  // Reconcile a stale codex/kimi pick against a freshly-loaded list: the hardcoded fallback
-  // default may lead with a model (e.g. plan-locked gpt-5.6-sol, or a renamed kimi alias) that
-  // the live list hides — reset to the live default so the selection isn't a model missing from
-  // the dropdown.
+  // Reconcile a stale native pick against a freshly-loaded list: the hardcoded fallback default
+  // may lead with a model (e.g. plan-locked gpt-5.6-sol, or a renamed kimi alias) that the live
+  // list hides, and a signed-out native group isn't listed at all — move to the harness default
+  // when it's listed, else to the first model that is. With nothing left to pick (signed out and
+  // no gateway/key groups) the stale choice stays, so the send-time login gate still fires.
   const reconcilePick = (g: CodeModelGroup[]) => {
-    if ((model.kind === "codex" || model.kind === "kimi") && !g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(model)))) {
-      setCodeConfig(chatId, { model: defaultModelForHarness(harnessId) });
-    }
+    const listed = (c: CodeModelChoice) => g.some((grp) => grp.models.some((m) => choiceKey(m) === choiceKey(c)));
+    if (listed(model)) return;
+    if (model.kind !== "codex" && model.kind !== "kimi" && model.kind !== nativeKind) return;
+    const dflt = defaultModelForHarness(harnessId);
+    const next = listed(dflt) ? dflt : g.flatMap((grp) => grp.models)[0];
+    if (next) setCodeConfig(chatId, { model: next });
   };
 
   useEffect(() => {
@@ -399,7 +411,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gateways.length, harnessId]);
+  }, [gateways.length, harnessId, nativeSignedIn]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -416,6 +428,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
 
   useEffect(() => {
     void refreshHarnessStatuses();
+    void refreshHarnessLogins(); // drives whether the native model group is listed at all
   }, []);
 
   // A brand-new session inherits the last-used folder, so it's ready to go on launch.
@@ -1048,7 +1061,9 @@ export function CodeScreen({ chatId }: { chatId: string }) {
       {termOpen && runCwd && (
         <TerminalPanel
           cwd={runCwd}
-          onClose={() => { setTermOpen(false); setTermCmd(null); }}
+          // The terminal is also where `kimi login` runs — re-probe on close so a fresh login
+          // brings the native group back into the picker.
+          onClose={() => { setTermOpen(false); setTermCmd(null); void refreshHarnessLogins(); }}
           zoom={zoom}
           bootstrapCommand={termCmd ?? undefined}
         />

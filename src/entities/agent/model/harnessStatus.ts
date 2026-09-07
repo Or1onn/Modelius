@@ -13,6 +13,7 @@ export interface HarnessInstall {
   installed?: boolean; // undefined until the first probe (web builds never probe)
   installing: boolean;
   error?: string;
+  loggedIn?: boolean; // CLI's own login present — undefined until the first probe
 }
 
 const statuses = new Map<string, HarnessInstall>();
@@ -44,6 +45,7 @@ export async function refreshHarnessStatuses(): Promise<void> {
         installed,
         installing: prev?.installing ?? false,
         error: installed ? undefined : prev?.error,
+        loggedIn: prev?.loggedIn,
       });
     }
     commit();
@@ -52,20 +54,49 @@ export async function refreshHarnessStatuses(): Promise<void> {
   }
 }
 
+function setLoggedIn(id: string, loggedIn: boolean): void {
+  const prev = statuses.get(id);
+  if (prev?.loggedIn === loggedIn) return;
+  statuses.set(id, { installed: prev?.installed, installing: prev?.installing ?? false, error: prev?.error, loggedIn });
+}
+
 // Whether the CLI's own login is present (file marker or an auth-gated probe command — see
 // harness_logged_in). Best-effort; callers should offer a bypass. Web → true (never gate).
 // Successes are cached: probes can cost a network round trip per call.
-const loggedInCache = new Set<string>();
 export async function cliLoggedIn(id: string): Promise<boolean> {
   if (!isTauri()) return true;
-  if (loggedInCache.has(id)) return true;
+  if (statuses.get(id)?.loggedIn) return true;
   try {
     const ok = await invoke<boolean>("harness_logged_in", { harness: id });
-    if (ok) loggedInCache.add(id);
+    setLoggedIn(id, ok);
+    commit();
     return ok;
   } catch {
     return false;
   }
+}
+
+// Probe every harness's own login at once, so the model picker can hide a native group whose
+// account isn't signed in. Best-effort; a failed probe leaves the previous answer in place.
+export async function refreshHarnessLogins(): Promise<void> {
+  if (!isTauri()) return;
+  await Promise.all(
+    Object.keys(HARNESS_BY_ID).map(async (id) => {
+      try {
+        setLoggedIn(id, await invoke<boolean>("harness_logged_in", { harness: id }));
+      } catch {
+        /* leave whatever we knew */
+      }
+    })
+  );
+  commit();
+}
+
+// Sync read for the picker: true/false once probed, undefined before that. Web builds never
+// probe and never gate → always signed in.
+export function peekCliLoggedIn(id: string): boolean | undefined {
+  if (!isTauri()) return true;
+  return statuses.get(id)?.loggedIn;
 }
 
 // npm install -g the harness's package. Single-flight: concurrent global npm runs contend on the
