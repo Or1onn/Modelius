@@ -1,8 +1,12 @@
-// ProviderLogo.tsx — provider/company brand icons served from the TheSVG CDN (no bundled files).
+// ProviderLogo.tsx — provider/company brand icons. The marks for the providers we ship are bundled
+// under public/logos; the rest (OpenRouter's long tail of vendors) come from the TheSVG CDN.
 // The slug is the provider id, or — for aggregator (OpenRouter) models "vendor/model" — the id's
-// vendor prefix. A few ids differ from TheSVG's slug; those are remapped. On a CDN miss, shows initials.
+// vendor prefix. A few ids differ from TheSVG's slug; those are remapped. On a miss, shows initials.
 import { useEffect, useRef, useState } from "react";
 
+// The bundled copies keep TheSVG's "<slug>/default.svg" layout, so a local and a CDN icon are the
+// same path under a different root — and the src-based CSS rules match either one.
+const LOCAL = "/logos";
 const THESVG = "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons";
 
 // provider id / OpenRouter vendor prefix → TheSVG slug, where they differ.
@@ -28,6 +32,15 @@ function slugFor(pid: string, modelId?: string): string {
   }
   const k = pid.toLowerCase();
   return SLUG[k] ?? k;
+}
+
+// Attempt 0 is the bundled file — a hit there needs no network at all. Later attempts fall back to
+// the CDN: a cold jsDelivr edge often 404s/times-out the first hit then serves it warm, so the
+// retries are cache-busted to make the browser refetch.
+const MAX_ATTEMPT = 3;
+function urlFor(slug: string, attempt: number): string {
+  if (attempt === 0) return `${LOCAL}/${slug}/default.svg`;
+  return `${THESVG}/${slug}/default.svg${attempt > 1 ? `?r=${attempt}` : ""}`;
 }
 
 // Many brand marks are a single flat color (OpenAI = white, OpenRouter = white, …) that vanishes
@@ -58,8 +71,21 @@ function luminance(v: string): number | null {
   return null; // named color (gold, red, …) — not monochrome black/white
 }
 
-async function detectTone(url: string): Promise<Tone> {
-  const svg = await fetch(url).then((r) => (r.ok ? r.text() : ""));
+// Same bundled-then-CDN order as the <img>, so the tone is read from the copy that actually renders.
+async function fetchSvg(slug: string): Promise<string> {
+  for (let a = 0; a <= 1; a++) {
+    try {
+      const r = await fetch(urlFor(slug, a));
+      if (r.ok) return await r.text();
+    } catch {
+      /* offline, or the CSP blocked it — try the next source */
+    }
+  }
+  return "";
+}
+
+async function detectTone(slug: string): Promise<Tone> {
+  const svg = await fetchSvg(slug);
   // Both fill and stroke decide a mark's color (OpenRouter is drawn with strokes).
   const tokens = [...svg.matchAll(/(?:fill|stroke)\s*[:=]\s*["']?\s*([#\w(),.%-]+)/gi)]
     .map((m) => m[1].toLowerCase().replace(/\s+/g, ""))
@@ -76,12 +102,12 @@ async function detectTone(url: string): Promise<Tone> {
   return null;
 }
 
-function loadTone(slug: string, url: string): Promise<Tone> {
+function loadTone(slug: string): Promise<Tone> {
   const hit = toneCache.get(slug);
   if (hit !== undefined) return Promise.resolve(hit);
   let p = inflight.get(slug);
   if (!p) {
-    p = detectTone(url)
+    p = detectTone(slug)
       .catch(() => null)
       .then((v) => {
         toneCache.set(slug, v);
@@ -93,15 +119,13 @@ function loadTone(slug: string, url: string): Promise<Tone> {
   return p;
 }
 
-// `short` (initials) shows until the CDN icon loads, and stays if it's missing/slow/errors — the
-// jsDelivr fetch can be slow or fail, and waiting only for onError leaves an empty slot meanwhile.
-// A cold jsDelivr edge often 404s/times-out the first hit then serves it warm, so onError retries a
-// couple times (cache-busted so the browser refetches) before settling on initials.
-const RETRIES = 2;
+// `short` (initials) shows until the icon loads, and stays if every source misses — a bundled icon
+// resolves in the same frame, but the jsDelivr fallback can be slow or fail, and waiting only for
+// onError leaves an empty slot meanwhile.
 export function ProviderLogo({ pid, short, modelId }: { pid: string; short: string; modelId?: string }) {
   const slug = slugFor(pid, modelId);
   const [attempt, setAttempt] = useState(0);
-  const url = `${THESVG}/${slug}/default.svg${attempt ? `?r=${attempt}` : ""}`;
+  const url = urlFor(slug, attempt);
   // The url whose icon finished loading. Derived, not reset in an effect: a cached icon can fire
   // `load` before the mount's passive effects flush, and a `setLoaded(false)` there would clobber it
   // — with no second `load` coming, the initials would stick forever.
@@ -115,11 +139,11 @@ export function ProviderLogo({ pid, short, modelId }: { pid: string; short: stri
 
   useEffect(() => {
     let alive = true;
-    void loadTone(slug, url).then((v) => alive && setTone(v));
+    void loadTone(slug).then((v) => alive && setTone(v));
     return () => {
       alive = false;
     };
-  }, [slug, url]);
+  }, [slug]);
 
   return (
     <>
@@ -132,10 +156,11 @@ export function ProviderLogo({ pid, short, modelId }: { pid: string; short: stri
         style={loaded ? undefined : { display: "none" }}
         onLoad={() => setOkUrl(url)}
         onError={() => {
-          if (attempt < RETRIES) {
-            clearTimeout(retryTimer.current);
-            retryTimer.current = setTimeout(() => setAttempt((a) => a + 1), 500 * (attempt + 1));
-          }
+          if (attempt >= MAX_ATTEMPT) return;
+          // A missing bundled icon is a local 404 — switch to the CDN without the backoff wait.
+          if (attempt === 0) return setAttempt(1);
+          clearTimeout(retryTimer.current);
+          retryTimer.current = setTimeout(() => setAttempt((a) => a + 1), 500 * attempt);
         }}
       />
     </>
