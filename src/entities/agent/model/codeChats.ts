@@ -5,6 +5,8 @@
 import { makeChatIndexStore, makeBodyStore, type ChatIndexEntry } from "@/entities/chat/model/chats";
 import type { UIMessage } from "ai";
 import { fromLegacyModelId, type CodeModelChoice } from "@/entities/agent/model/codeModel";
+import type { WorktreeInfo } from "@/entities/agent/model/git";
+import { estimateTokens } from "@/shared/lib/tokens";
 
 // ---- Index (encrypted localStorage blob + in-RAM cache, reactive) ----
 
@@ -40,6 +42,7 @@ export interface CodeChatBody {
   model?: CodeModelChoice;
   permissionMode: string;
   effort?: string; // "auto" or an Anthropic effort level; absent on pre-effort bodies
+  worktree?: WorktreeInfo | null; // isolated checkout this chat runs in, if any
   title: string;
 }
 
@@ -69,6 +72,7 @@ export async function loadCodeBody(id: string): Promise<CodeChatBody | null> {
     // Retired "default" (Ask each time) mode — headless CLIs can't prompt; coerce to acceptEdits.
     permissionMode: b.permissionMode && b.permissionMode !== "default" ? b.permissionMode : "acceptEdits",
     effort: b.effort ?? "auto",
+    worktree: b.worktree && typeof b.worktree.path === "string" ? b.worktree : null,
     title: b.title ?? "",
   };
 }
@@ -83,18 +87,36 @@ function messageText(m: UIMessage): string {
     .join("\n");
 }
 
-// Build an index entry from the transcript: title/preview from the first user message's prompt.
-export function codeIndexEntryFrom(id: string, messages: UIMessage[], createdAt: number, title?: string, cwd?: string): ChatIndexEntry | null {
+// Concatenate the human-visible text of a whole transcript (text + tool I/O) for a rough token
+// estimate. Feeds the index's usage summary so the stats hero never has to load bodies.
+export function transcriptText(messages: UIMessage[]): string {
+  const out: string[] = [];
+  for (const m of messages)
+    for (const p of m.parts as any[]) {
+      if (p.type === "text" && typeof p.text === "string") out.push(p.text);
+      else if (p.type === "dynamic-tool") {
+        if (p.input) out.push(JSON.stringify(p.input));
+        if (typeof p.output === "string") out.push(p.output);
+      }
+    }
+  return out.join("\n");
+}
+
+// Build an index entry from the transcript: title/preview from the first user message's prompt,
+// plus the usage summary (turns / est. tokens / model) the Code stats hero aggregates.
+export function codeIndexEntryFrom(id: string, messages: UIMessage[], createdAt: number, title?: string, cwd?: string, modelId?: string): ChatIndexEntry | null {
   const firstUser = messages.find((m) => m.role === "user");
   if (!firstUser) return null; // skip empty code chats
   const snippet = messageText(firstUser).trim().replace(/\s+/g, " ");
   return {
     id,
     title: title?.trim() || snippet.slice(0, 60) || "New session",
-    modelId: "",
+    modelId: modelId ?? "",
     preview: snippet.slice(0, 120),
     createdAt,
     updatedAt: Date.now(),
     cwd: cwd || "",
+    msgs: messages.filter((m) => m.role === "user").length,
+    tokens: estimateTokens(transcriptText(messages)),
   };
 }

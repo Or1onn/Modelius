@@ -1,10 +1,11 @@
-// codeUsage.ts — real usage statistics for the Code empty-state hero, aggregated from stored
-// code sessions. Tokens aren't persisted per turn, so "tokens" is estimated from the transcript
-// text (estimateTokens); everything else is exact: session counts, active-day streaks derived from
-// timestamps, favorite model from each body's saved modelId. Bodies are loaded once and cached.
-import { useEffect, useState } from "react";
-import { getCodeChats, loadCodeBody } from "@/entities/agent/model/codeChats";
-import type { UIMessage } from "ai";
+// codeUsage.ts — real usage statistics for the Code empty-state hero, aggregated from the chat
+// INDEX (per-session summaries stamped by codeIndexEntryFrom at persist time) — no body loads on
+// render. Tokens aren't persisted per turn, so "tokens" is estimated from the transcript text
+// (estimateTokens); everything else is exact: session counts, active-day streaks derived from
+// timestamps, favorite model from each session's modelId. Index entries written before the summary
+// fields existed are backfilled from their bodies once, sequentially, then re-indexed.
+import { useEffect } from "react";
+import { getCodeChats, loadCodeBody, upsertCodeChat, useCodeChatStore, transcriptText, type ChatIndexEntry } from "@/entities/agent/model/codeChats";
 import { estimateTokens } from "@/shared/lib/tokens";
 
 export interface UsageSession {
@@ -16,67 +17,46 @@ export interface UsageSession {
 
 export type RangeId = "All" | "30d" | "7d";
 
-// Concatenate the human-visible text of a transcript for a rough token estimate.
-function messagesText(messages: UIMessage[]): string {
-  const out: string[] = [];
-  for (const m of messages)
-    for (const p of m.parts as any[]) {
-      if (p.type === "text" && typeof p.text === "string") out.push(p.text);
-      else if (p.type === "dynamic-tool") {
-        if (p.input) out.push(JSON.stringify(p.input));
-        if (typeof p.output === "string") out.push(p.output);
-      }
-    }
-  return out.join("\n");
-}
+// One-time migration: legacy index entries (no `msgs`) get their summary computed from the body
+// and written back to the index. Sequential on purpose — a parallel sweep floods the IPC bridge
+// with every decrypted transcript at once, which is exactly the stall this store used to cause.
+let backfill: Promise<void> | null = null;
 
-// ---- module-level cache (bodies loaded once per session) ----
-let cache: UsageSession[] | null = null;
-let inflight: Promise<UsageSession[]> | null = null;
-
-async function loadUsage(): Promise<UsageSession[]> {
-  if (cache) return cache;
-  if (inflight) return inflight;
-  inflight = (async () => {
-    const chats = getCodeChats();
-    const rows = await Promise.all(
-      chats.map(async (c) => {
-        const body = await loadCodeBody(c.id);
+function backfillLegacyEntries(): Promise<void> {
+  if (!backfill)
+    backfill = (async () => {
+      for (const c of getCodeChats().filter((c) => c.msgs == null)) {
+        const body = await loadCodeBody(c.id).catch(() => null);
         const messages = body?.messages ?? [];
-        return {
-          createdAt: c.createdAt,
-          modelId: body?.modelId ?? "",
+        // A live persist may have stamped the entry while this body loaded — never clobber it.
+        const cur = getCodeChats().find((x) => x.id === c.id);
+        if (!cur || cur.msgs != null) continue;
+        upsertCodeChat({
+          ...cur,
+          modelId: cur.modelId || body?.modelId || "",
           msgs: messages.filter((m) => m.role === "user").length,
-          tokens: estimateTokens(messagesText(messages)),
-        };
-      })
-    );
-    cache = rows;
-    inflight = null;
-    return rows;
-  })();
-  return inflight;
+          tokens: estimateTokens(transcriptText(messages)),
+        });
+      }
+    })().finally(() => { backfill = null; });
+  return backfill;
 }
 
-// Invalidate after a run persists, so the hero reflects the latest session next time it opens.
-export function invalidateCodeUsage(): void {
-  cache = null;
-  inflight = null;
-}
+const toSession = (c: ChatIndexEntry): UsageSession => ({
+  createdAt: c.createdAt,
+  modelId: c.modelId,
+  msgs: c.msgs ?? 0,
+  tokens: c.tokens ?? 0,
+});
 
-export function useCodeUsage(): { sessions: UsageSession[]; loading: boolean } {
-  const [sessions, setSessions] = useState<UsageSession[]>(cache ?? []);
-  const [loading, setLoading] = useState(!cache);
+export function useCodeUsage(): { sessions: UsageSession[] } {
+  useCodeChatStore(); // re-render on index changes (persists, backfill writes, hydration)
+  const chats = getCodeChats();
+  const hasLegacy = chats.some((c) => c.msgs == null);
   useEffect(() => {
-    let alive = true;
-    void loadUsage().then((rows) => {
-      if (!alive) return;
-      setSessions(rows);
-      setLoading(false);
-    });
-    return () => { alive = false; };
-  }, []);
-  return { sessions, loading };
+    if (hasLegacy) void backfillLegacyEntries();
+  }, [hasLegacy]);
+  return { sessions: chats.map(toSession) };
 }
 
 // ---- derived metrics ----
@@ -190,11 +170,4 @@ export function computeHeat(sessions: UsageSession[], range: RangeId): number[][
     grid.push(row);
   }
   return grid;
-}
-
-// Playful footer comparing token spend to Animal Farm (~39K tokens).
-export function usageFoot(sessions: UsageSession[], range: RangeId): string | null {
-  const total = withinRange(sessions, range).reduce((a, s) => a + s.tokens, 0);
-  if (total < 39_000) return null;
-  return `You've used ~${Math.round(total / 39_000)}× more tokens than Animal Farm.`;
 }

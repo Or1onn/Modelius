@@ -6,6 +6,8 @@ import { dynamicRate } from "@/entities/model/lib/pricingSource";
 const PRICING: Record<string, { in: number; out: number }> = {
   "gpt-4o": { in: 2.5, out: 10 },
   "gpt-4o-mini": { in: 0.15, out: 0.6 },
+  "claude-opus-5": { in: 5, out: 25 },
+  "claude-sonnet-5": { in: 3, out: 15 },
   "claude-opus-4-20250514": { in: 15, out: 75 },
   "claude-sonnet-4-20250514": { in: 3, out: 15 },
   "claude-3-5-haiku-20241022": { in: 0.8, out: 4 },

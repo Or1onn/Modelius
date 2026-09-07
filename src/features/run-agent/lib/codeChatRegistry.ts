@@ -6,13 +6,15 @@
 import type { UIMessage } from "ai";
 import { Chat } from "@ai-sdk/react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { HARNESSES, HARNESS_BY_ID } from "@/entities/agent/model/harnesses";
 import {
-  DEFAULT_CODE_MODEL,
   choiceFitsHarness,
+  codeProviderKey,
   defaultModelForHarness,
   type CodeModelChoice,
 } from "@/entities/agent/model/codeModel";
+import { markUsageStale, refreshUsage } from "@/entities/session/model/usageLimits";
 import { CODEX_EFFORT_DEFAULT, type EffortLevel } from "@/entities/model/model/apiIds";
 import { effortSurface, pickEffort } from "@/entities/session/api/effortSurface";
 import { getGateways, gatewaySecretKey } from "@/entities/agent/model/gateways";
@@ -21,15 +23,15 @@ import { getCodexAuth } from "@/entities/session/model/openaiSession";
 import { lastOfRole } from "@/shared/lib/lastOfRole";
 import { getAnthropicAccessToken } from "@/entities/session/model/anthropicSession";
 import { getKey } from "@/entities/session/model/keys";
+import type { WorktreeInfo } from "@/entities/agent/model/git";
 import { KEY_PROVIDER_BASE } from "@/entities/session/model/keyProviders";
 import { secretGet } from "@/shared/api/secrets";
 import { getCodeChats, loadCodeBody, saveCodeBody, upsertCodeChat, codeIndexEntryFrom } from "@/entities/agent/model/codeChats";
-import { invalidateCodeUsage } from "@/pages/code/model/codeUsage";
 import { generateTitle } from "@/pages/chat/model/generateTitle";
 import { pickSummarizerBackend } from "@/features/pick-backend/model/pickBackend";
 import { route } from "@/features/route-request/model/route";
 import { TITLE_PROMPT } from "@/shared/config/prompts";
-import { CodeChatTransport, type ResolvedSend, type RunConfig } from "./codeTransport";
+import { CodeChatTransport, type CodeAttachment, type ResolvedSend, type RunConfig } from "./codeTransport";
 
 const DEFAULT_HARNESS = HARNESSES[0].id;
 
@@ -39,6 +41,16 @@ export interface CodeConfig {
   cwd: string;
   permissionMode: string;
   effort: EffortLevel | "auto"; // reasoning depth for Anthropic picks; "auto" → the tier default
+  // Worktree isolation. `armed` + `base` are the pre-flight pick (empty chat only); `worktree` is
+  // the checkout, created on the first send — from then on it, not `cwd`, is where the CLI runs.
+  worktreeArmed: boolean;
+  worktreeBase: string; // ref to branch from; "" → the folder's current HEAD
+  worktree: WorktreeInfo | null;
+}
+
+// Where the harness actually runs: the isolated checkout when this chat has one, else the folder.
+export function effectiveCwd(config: CodeConfig): string {
+  return config.worktree?.path || config.cwd;
 }
 
 interface Entry {
@@ -48,6 +60,7 @@ interface Entry {
   createdAt: number;
   title: string; // LLM-generated chat name (empty → sidebar falls back to the first-message snippet)
   titleTried: boolean; // guard: generate the title at most once per warm chat
+  loaded: boolean; // persisted body restored (or nothing to restore) — gates the empty-state hero
 }
 
 // Dev-only HMR guard: a hot update would swap in a fresh empty map, orphaning live Chats mid-turn
@@ -63,7 +76,46 @@ if (import.meta.hot) {
 }
 
 function defaultConfig(): CodeConfig {
-  return { harness: DEFAULT_HARNESS, model: DEFAULT_CODE_MODEL, cwd: "", permissionMode: "acceptEdits", effort: "auto" };
+  // Resolved per call (not a module const) so a warm model cache picks the live current-gen model
+  // instead of whatever the static registry held at import time.
+  return {
+    harness: DEFAULT_HARNESS,
+    model: defaultModelForHarness(DEFAULT_HARNESS),
+    cwd: "",
+    permissionMode: "acceptEdits",
+    effort: "auto",
+    worktreeArmed: false,
+    worktreeBase: "",
+    worktree: null,
+  };
+}
+
+// ---- CLI-initiated continuations (claude auto-resume after a background task) ----
+// session.rs parks the CLI's between-turn output and emits agent-cli-resume with the chat id.
+// Claim it with a synthetic turn: a metadata-marked user message routes resolveSend to the
+// attach path, and the parked + live lines stream into a normal assistant message. A busy chat
+// defers the claim to its onFinish (the pump forwards to a live turn, so busy means the event
+// raced this chat's own turn teardown).
+const pendingResume = new Set<string>();
+
+function claimResume(chatId: string): void {
+  const e = entries.get(chatId);
+  if (!e) return; // chat gone from this app run — the Rust auto-deny safety net covers the CLI
+  if (e.chat.status === "streaming" || e.chat.status === "submitted") {
+    pendingResume.add(chatId);
+    return;
+  }
+  pendingResume.delete(chatId);
+  void e.chat.sendMessage({ text: "Background agent finished — continuing.", metadata: { cliResume: true } });
+}
+
+const unlistenResume = listen<string>("agent-cli-resume", (ev) => claimResume(ev.payload)).catch(
+  () => () => {} // web build — no Tauri event bridge (and no warm CLI to resume)
+);
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    void unlistenResume.then((u) => u());
+  });
 }
 
 // Concatenate the text parts of a UIMessage (the CLI prompt is plain text).
@@ -75,19 +127,21 @@ function textOf(msg: UIMessage | undefined): string {
     .join("\n");
 }
 
-// Image `file` parts of a UIMessage → {mime, base64} for the harness's native image block. The AI
-// SDK stores an attached image as a `file` part whose `url` is a data URL; strip the prefix to the
-// raw base64 the Rust side wraps. Non-image or non-data-URL parts are ignored.
-function imagesOf(msg: UIMessage | undefined): { mime: string; data: string }[] {
+// Attachment `file` parts of a UIMessage → {mime, base64, name} for the harness's native content
+// block. The AI SDK stores an attachment as a `file` part whose `url` is a data URL; strip the
+// prefix to the raw base64 the Rust side wraps. Images and PDFs ride this path (a harness without
+// a PDF block gets it as a temp-file path instead — agent.rs spill_unsupported); anything else, or
+// a non-data-URL part, is ignored.
+export function attachmentsOf(msg: UIMessage | undefined): CodeAttachment[] {
   if (!msg?.parts) return [];
-  const out: { mime: string; data: string }[] = [];
+  const out: CodeAttachment[] = [];
   for (const p of msg.parts as any[]) {
     if (p.type !== "file" || typeof p.url !== "string") continue;
     const mime: string = p.mediaType ?? "";
-    if (!mime.startsWith("image/")) continue;
+    if (!mime.startsWith("image/") && mime !== "application/pdf") continue;
     const comma = p.url.indexOf(",");
     if (!p.url.startsWith("data:") || comma === -1) continue;
-    out.push({ mime, data: p.url.slice(comma + 1) });
+    out.push({ mime, data: p.url.slice(comma + 1), name: typeof p.filename === "string" ? p.filename : undefined });
   }
   return out;
 }
@@ -157,8 +211,17 @@ function resolvedEffort(config: CodeConfig): string {
 async function resolveSend(chatId: string, messages: UIMessage[]): Promise<ResolvedSend> {
   const { config } = ensure(chatId);
   const lastUser = lastOfRole(messages, "user");
+  // Synthetic turn claiming a CLI-initiated continuation (see the agent-cli-resume listener):
+  // no prompt, no routing/auth — agent_attach only needs the session key.
+  if ((lastUser?.metadata as { cliResume?: boolean } | undefined)?.cliResume) {
+    return {
+      prompt: "",
+      attach: true,
+      run: { harness: config.harness, model: config.model.id, cwd: effectiveCwd(config), permissionMode: config.permissionMode, effort: "" },
+    };
+  }
   const prompt = textOf(lastUser);
-  const images = imagesOf(lastUser);
+  const attachments = attachmentsOf(lastUser);
   // Last assistant turn that actually carries a resume id — a cancelled or errored turn's
   // message may have none; an earlier turn's id still resumes the same CLI session.
   const resume = (
@@ -178,9 +241,9 @@ async function resolveSend(chatId: string, messages: UIMessage[]): Promise<Resol
 
   return {
     prompt,
-    images,
+    attachments,
     resume,
-    run: { harness: config.harness, model: config.model.id, cwd: config.cwd, permissionMode: config.permissionMode, effort: resolvedEffort(config), target, codexAuth, claudeToken },
+    run: { harness: config.harness, model: config.model.id, cwd: effectiveCwd(config), permissionMode: config.permissionMode, effort: resolvedEffort(config), target, codexAuth, claudeToken },
   };
 }
 
@@ -193,32 +256,60 @@ function ensure(chatId: string): Entry {
     onFinish: () => {
       void persist(chatId); // save the finished transcript + index it for the sidebar
       maybeGenerateTitle(chatId); // name the chat from its first exchange (like Chat mode)
+      // Usage just changed and the CLI hides response headers — re-probe the account limits now,
+      // in the background, so the usage popover is already current when it next opens.
+      const cfg = entries.get(chatId)?.config;
+      if (cfg) {
+        const pk = codeProviderKey(cfg.model);
+        markUsageStale(pk);
+        void refreshUsage(pk, cfg.model.id);
+      }
+      // A continuation event that raced this turn's teardown parked its claim — run it now,
+      // after the SDK has settled the status (hence the microtask hop).
+      if (pendingResume.has(chatId)) setTimeout(() => claimResume(chatId), 0);
     },
   });
-  e = { chat, config: defaultConfig(), listeners: new Set(), createdAt: Date.now(), title: "", titleTried: false };
+  e = { chat, config: defaultConfig(), listeners: new Set(), createdAt: Date.now(), title: "", titleTried: false, loaded: false };
   entries.set(chatId, e);
   void load(chatId);
   return e;
 }
 
 // Restore a saved chat's config + messages once (guarding against clobbering an in-flight run).
+// Every exit marks the entry loaded so the screen knows the transcript (or its absence) is final.
 async function load(chatId: string): Promise<void> {
   const e = entries.get(chatId);
   if (!e) return;
+  const done = () => {
+    if (e.loaded) return;
+    e.loaded = true;
+    e.listeners.forEach((fn) => fn());
+  };
   const existing = getCodeChats().find((c) => c.id === chatId);
-  if (!existing) return; // fresh chat — nothing persisted
+  if (!existing) { done(); return; } // fresh chat — nothing persisted
   e.createdAt = existing.createdAt;
   const body = await loadCodeBody(chatId);
-  if (!body || e.chat.messages.length > 0 || e.chat.status !== "ready") return;
+  if (!body || e.chat.messages.length > 0 || e.chat.status !== "ready") { done(); return; }
   let model = body.model ?? e.config.model;
   const harness = body.harnessId && HARNESS_BY_ID[body.harnessId] ? body.harnessId : e.config.harness;
   if (!choiceFitsHarness(model, harness)) model = defaultModelForHarness(harness);
-  e.config = { harness, model, cwd: body.cwd, permissionMode: body.permissionMode, effort: (body.effort as EffortLevel | "auto") ?? "auto" };
+  e.config = {
+    harness,
+    model,
+    cwd: body.cwd,
+    permissionMode: body.permissionMode,
+    effort: (body.effort as EffortLevel | "auto") ?? "auto",
+    // A saved chat always has messages, so `armed` no longer matters — the worktree itself does.
+    worktreeArmed: !!body.worktree,
+    worktreeBase: body.worktree?.base ?? "",
+    worktree: body.worktree ?? null,
+  };
   e.chat.messages = body.messages;
   if (body.title) {
     e.title = body.title;
     e.titleTried = true; // already named — don't regenerate
   }
+  e.loaded = true;
   e.listeners.forEach((fn) => fn());
 }
 
@@ -244,7 +335,7 @@ async function persistNow(chatId: string): Promise<void> {
   const e = entries.get(chatId);
   if (!e) return;
   const messages = e.chat.messages;
-  const entry = codeIndexEntryFrom(chatId, messages, e.createdAt, e.title, e.config.cwd);
+  const entry = codeIndexEntryFrom(chatId, messages, e.createdAt, e.title, e.config.cwd, e.config.model.id);
   if (!entry) return;
   await saveCodeBody(chatId, {
     messages,
@@ -254,10 +345,10 @@ async function persistNow(chatId: string): Promise<void> {
     model: e.config.model,
     permissionMode: e.config.permissionMode,
     effort: e.config.effort,
+    worktree: e.config.worktree,
     title: e.title,
   });
   upsertCodeChat(entry);
-  invalidateCodeUsage();
 }
 
 // Name a code chat from its first exchange via a cheap backend, once per chat (mirrors Chat mode's
@@ -306,6 +397,13 @@ export function subscribeCodeConfig(chatId: string, cb: () => void): () => void 
   const e = ensure(chatId);
   e.listeners.add(cb);
   return () => e.listeners.delete(cb);
+}
+
+// True once the chat's persisted body has been restored (or there was none). Gates the empty-state
+// hero so opening a saved chat doesn't flash it before the transcript lands. `!== false` treats
+// pre-flag HMR-stashed entries (dev only) as loaded. Reactive via subscribeCodeConfig.
+export function isCodeChatLoaded(chatId: string): boolean {
+  return ensure(chatId).loaded;
 }
 
 // True when this code chat has no transcript yet (pristine "new session").

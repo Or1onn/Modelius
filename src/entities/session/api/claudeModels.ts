@@ -39,14 +39,14 @@ async function fetchSubscriptionModels(): Promise<RemoteModel[]> {
   const token = await getAnthropicAccessToken();
   if (!token) return [];
   return cached("sub:anthropic", async () => {
-    const json = await invoke<{ data?: { id: string; display_name?: string; capabilities?: unknown }[] }>(
-      "anthropic_list_models",
-      { token, oauth: true }
-    );
+    const json = await invoke<{
+      data?: { id: string; display_name?: string; capabilities?: unknown; max_input_tokens?: number }[];
+    }>("anthropic_list_models", { token, oauth: true });
     return (json.data || []).map((m) => ({
       id: m.id,
       name: m.display_name || m.id,
       efforts: effortsFromCapabilities(m.capabilities),
+      maxInputTokens: m.max_input_tokens,
     }));
   });
 }
@@ -77,6 +77,12 @@ export function anthropicEffortInfo(modelId: string): { levels: EffortLevel[]; d
   if (!levels.length) return null;
   const dflt = tier ? resolveEffort(tier, "auto") : levels.includes("high") ? "high" : levels[levels.length - 1];
   return { levels, dflt };
+}
+
+// Live context window (in tokens) for an Anthropic model, from the cached /v1/models list
+// (`max_input_tokens`). null = cold cache, nothing connected, or the API didn't say.
+export function anthropicContextTokens(modelId: string): number | null {
+  return peekRawClaudeModels()?.find((m) => m.id === modelId)?.maxInputTokens ?? null;
 }
 
 // Sync cache mirror of listAppClaudeModels — null when cold/stale or nothing connected.

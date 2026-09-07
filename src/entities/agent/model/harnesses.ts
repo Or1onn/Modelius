@@ -73,10 +73,15 @@ export interface PermissionMode {
 // Both CLIs prompt interactively over their stdio protocols (claude can_use_tool / codex
 // requestApproval server requests) — requests surface as Allow/Deny cards in the transcript.
 // Saved bodies with the old "default" mode are migrated to acceptEdits on load (codeChats.ts).
+// "auto" has no native equivalent in any harness: the CLI runs in its ask-everything mode and the
+// app answers the safe requests itself, carding only the dangerous ones (autoApprove.ts).
+// "bypassPermissions" turns the CLI's own permission system off — claude can only enter it at
+// spawn time, so switching to/from it respawns the warm process (session::Fingerprint.bypass).
 export const PERMISSION_MODES: PermissionMode[] = [
   { id: "acceptEdits", label: "Accept edits" },
   { id: "plan", label: "Plan mode" },
-  { id: "bypassPermissions", label: "Full auto" },
+  { id: "auto", label: "Auto" },
+  { id: "bypassPermissions", label: "Bypass permissions" },
 ];
 
 export const PERMISSION_LABEL: Record<string, string> = Object.fromEntries(

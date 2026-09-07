@@ -72,7 +72,7 @@ pub(crate) async fn start(cfg: GatewayConfig) -> std::io::Result<Gateway> {
 
 #[cfg(test)]
 mod tests {
-    use super::anthropic_openai::{map_stop, to_openrouter_reasoning, tool_result_text};
+    use super::anthropic_openai::{map_stop, to_openai_request, to_openrouter_reasoning, tool_result_text};
     use super::http::read_request;
     use super::openai_anthropic::{chat_to_anthropic, responses_to_anthropic};
     use super::*;
@@ -105,6 +105,28 @@ mod tests {
     #[test]
     fn openrouter_reasoning_absent_on_auto() {
         assert_eq!(to_openrouter_reasoning(""), None);
+    }
+
+    // A routed run carries attachments too: claude sends an image block and (for a PDF) a document
+    // block, and both must survive the translation instead of being dropped on the floor.
+    #[test]
+    fn user_attachments_translate_to_openai_image_and_file_parts() {
+        let req = json!({
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "read it" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "QUJD" } },
+                { "type": "document", "title": "spec.pdf", "source": { "type": "base64", "media_type": "application/pdf", "data": "JVBE" } },
+            ]}]
+        });
+        let out = to_openai_request(&req, "https://api.openai.com/v1", false, "");
+        assert_eq!(
+            out["messages"][0]["content"],
+            json!([
+                { "type": "text", "text": "read it" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,QUJD" } },
+                { "type": "file", "file": { "filename": "spec.pdf", "file_data": "data:application/pdf;base64,JVBE" } },
+            ])
+        );
     }
 
     #[test]

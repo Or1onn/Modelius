@@ -3,11 +3,12 @@
 // local gateway (see src-tauri/src/gateway.rs) toward the picked endpoint. Which kinds fit which
 // harness is derived from the harness registry (protocol/routable/native), not hardcoded.
 // Secrets are never stored on the choice — only provider/gateway ids.
-import { LIVE_ANTHROPIC, MODEL_BY_ID } from "@/entities/model/model/registry";
+import { MODEL_BY_ID } from "@/entities/model/model/registry";
 import { HARNESS_BY_ID, type NativeKind } from "@/entities/agent/model/harnesses";
 import { getGateways } from "@/entities/agent/model/gateways";
 import { peekAppCodexModels } from "@/entities/session/api/codexModels";
 import { peekAppKimiModels } from "@/entities/session/api/kimiModels";
+import { anthropicContextTokens, peekAppClaudeModels } from "@/entities/session/api/claudeModels";
 import { ctxTokens } from "@/shared/lib/tokens";
 
 export type CodeModelChoice =
@@ -18,12 +19,6 @@ export type CodeModelChoice =
   | { kind: "connected"; id: string; label: string; providerId: string }
   | { kind: "gateway"; id: string; label: string; gatewayId: string };
 
-export const DEFAULT_CODE_MODEL: CodeModelChoice = {
-  kind: "anthropic",
-  id: LIVE_ANTHROPIC[0].id,
-  label: LIVE_ANTHROPIC[0].name,
-};
-
 export function nativeChoice(kind: NativeKind, id: string, label: string): CodeModelChoice {
   switch (kind) {
     case "anthropic":
@@ -33,6 +28,16 @@ export function nativeChoice(kind: NativeKind, id: string, label: string): CodeM
     case "kimi":
       return { kind: "kimi", id, label };
   }
+}
+
+// The account key this choice bills against (usage meter / limits store). Native CLI logins map
+// to their subscription account; a connected key uses its provider id. Others (gateway/Ollama)
+// have no first-class usage surface.
+export function codeProviderKey(choice: CodeModelChoice): string | undefined {
+  if (choice.kind === "anthropic") return "anthropic";
+  if (choice.kind === "codex") return "chatgpt";
+  if (choice.kind === "connected") return choice.providerId;
+  return undefined;
 }
 
 export function choiceFitsHarness(choice: CodeModelChoice, harnessId: string): boolean {
@@ -52,6 +57,13 @@ export function choiceFitsHarness(choice: CodeModelChoice, harnessId: string): b
 export function defaultModelForHarness(harnessId: string): CodeModelChoice {
   const h = HARNESS_BY_ID[harnessId];
   if (h?.native) {
+    // Anthropic: default to the account's live /v1/models list (newest-first, deduped per family)
+    // so the preselected model is the top of the dropdown, not whatever generation the static
+    // registry was last updated to. Falls back to the static list only when the cache is cold.
+    if (h.native.kind === "anthropic") {
+      const live = peekAppClaudeModels();
+      if (live?.length) return nativeChoice("anthropic", live[0].id, live[0].name);
+    }
     // Codex: default to the account's live model/list (subscription-filtered) so the default
     // matches the dropdown — the hardcoded native.models() may lead with a plan-locked model
     // (e.g. gpt-5.6-sol) the live list hides. Fall back to static only when the cache is cold.
@@ -98,15 +110,22 @@ export function sameChoice(a: CodeModelChoice, b: CodeModelChoice): boolean {
   return choiceKey(a) === choiceKey(b);
 }
 
-// Context-window size (in tokens) for a Code-mode pick, for the context-fill ring. No model list or
-// CLI event carries this, so: registry hit first (exact id), then per-family defaults matching what
-// each CLI hardcodes internally. 0 = unknown → the ring shows "?" rather than a wrong denominator.
+// Context-window size (in tokens) for a Code-mode pick, for the context-fill ring. Anthropic:
+// live /v1/models `max_input_tokens` first (the API is the source of truth), then registry, then
+// a per-family guess. Codex/Kimi CLI protocols don't report the window, so: registry hit (exact
+// id), then per-family defaults matching what each CLI hardcodes internally. 0 = unknown → the
+// ring shows "?" rather than a wrong denominator.
 export function codeContextTokens(model: CodeModelChoice): number {
+  if (model.kind === "anthropic") {
+    const live = anthropicContextTokens(model.id);
+    if (live) return live;
+  }
   const reg = MODEL_BY_ID[model.id];
   if (reg?.ctx) return ctxTokens(reg.ctx);
   const id = model.id.toLowerCase();
-  // Opus is 1M; other Claude models 200K (unless an explicit 1M-context id).
-  if (model.kind === "anthropic") return ctxTokens(id.includes("opus") || id.includes("[1m]") || id.includes("-1m") ? "1M" : "200K");
+  // Opus/Fable/Mythos are 1M; other Claude models 200K (unless an explicit 1M-context id).
+  if (model.kind === "anthropic")
+    return ctxTokens(/opus|fable|mythos|\[1m\]|-1m/.test(id) ? "1M" : "200K");
   if (model.kind === "codex") return ctxTokens("400K"); // gpt-5.x family
   if (model.kind === "kimi") return ctxTokens("256K"); // kimi k2.x family
   return 0; // connected / ollama / gateway — arbitrary third-party model, size unknown

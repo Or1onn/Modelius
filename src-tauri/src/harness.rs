@@ -89,12 +89,16 @@ pub(crate) struct HarnessSpec {
     pub env: EnvSpec,
 }
 
+// Modelius mode → claude's own --permission-mode. Only "auto" is ours: the CLI has no
+// "everything except dangerous" mode, so it runs in `default` (asks for every acting tool) and
+// the webview auto-answers the safe requests (features/run-agent/lib/autoApprove.ts).
 fn claude_permission(mode: &str) -> Vec<String> {
-    if mode.is_empty() {
-        vec![]
-    } else {
-        vec!["--permission-mode".into(), mode.into()]
-    }
+    let native = match mode {
+        "" => return vec![],
+        "auto" => "default",
+        m => m,
+    };
+    vec!["--permission-mode".into(), native.into()]
 }
 
 static HARNESSES: &[HarnessSpec] = &[
@@ -102,12 +106,13 @@ static HARNESSES: &[HarnessSpec] = &[
         id: "claude-code",
         bin: "claude",
         install: Install::Npm("@anthropic-ai/claude-code"),
-        // Same GCS origin the official install script uses. 2.1.206 = the version the warm-session
-        // stdio protocol (multi-turn stdin / can_use_tool / interrupt / set_permission_mode) was
-        // probe-verified against.
+        // Same GCS origin the official install script uses. 2.1.220 = the version the warm-session
+        // stdio protocol (multi-turn stdin / can_use_tool / interrupt / set_permission_mode) and
+        // `--prompt-suggestions` were probe-verified against; the flag is rejected by builds that
+        // predate it, so a managed install must not lag behind the argv above.
         native_dist: Some(NativeDist {
             base: "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases",
-            version: "2.1.206",
+            version: "2.1.220",
         }),
         login_marker: &[".claude/.credentials.json"],
         protocol: Proto::Anthropic,
@@ -127,6 +132,12 @@ static HARNESSES: &[HarnessSpec] = &[
             Arg::Lit("stream-json"),
             Arg::Lit("--permission-prompt-tool"),
             Arg::Lit("stdio"),
+            // After each turn the CLI emits a `prompt_suggestion` message (a predicted next user
+            // prompt) on the same stream-json channel — the composer shows it as ghost text.
+            // Generated inside the CLI, so the app makes no extra model call. The value is passed
+            // explicitly: the flag's value is optional, and a bare form is ambiguous to read.
+            Arg::Lit("--prompt-suggestions"),
+            Arg::Lit("true"),
             Arg::Resume,
             Arg::ModelFlag("--model"),
             // Reasoning depth (low/medium/high/xhigh/max) — emitted only when the webview
@@ -264,5 +275,11 @@ mod tests {
         assert_eq!(claude_permission(""), Vec::<String>::new());
         assert_eq!(claude_permission("plan"), vec!["--permission-mode", "plan"]);
         assert_eq!(claude_permission("acceptEdits"), vec!["--permission-mode", "acceptEdits"]);
+        assert_eq!(
+            claude_permission("bypassPermissions"),
+            vec!["--permission-mode", "bypassPermissions"]
+        );
+        // "auto" is a Modelius-only mode — the CLI must see a mode it knows.
+        assert_eq!(claude_permission("auto"), vec!["--permission-mode", "default"]);
     }
 }

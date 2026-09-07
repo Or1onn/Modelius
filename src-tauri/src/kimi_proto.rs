@@ -9,6 +9,9 @@ use serde_json::json;
 // Modelius permission mode → kimi ACP session mode id. Probe-verified mode set:
 // default ("Manual approvals") / plan ("Read-only planning") / auto ("Auto-approve safe
 // operations") / yolo ("Auto-approve everything").
+// Modelius "auto" maps to the CLI's "default", NOT its "auto": the app's own danger policy
+// (features/run-agent/lib/autoApprove.ts) decides what to card, so every harness asks the same
+// questions and the answer rules live in one place.
 pub(crate) fn kimi_mode(mode: &str) -> &'static str {
     match mode {
         "plan" => "plan",
@@ -56,14 +59,16 @@ pub(crate) fn session_open_line(id: u64, resume: Option<&str>, cwd: &str) -> Str
 // blocks (base64). Per ACP the agent must advertise the `image` prompt capability at initialize;
 // kimi's support for that is GUI-verify-pending, so image blocks are only appended when the user
 // actually attaches one (text-only turns are byte-identical to before).
-pub(crate) fn prompt_line(id: u64, session_id: &str, text: &str, images: &[crate::agent::ImageInput]) -> String {
+// ACP has no PDF block kimi accepts (its promptCapabilities are image + embeddedContext), so
+// non-image attachments never reach here — agent.rs spill_unsupported hands them over as paths.
+pub(crate) fn prompt_line(id: u64, session_id: &str, text: &str, attachments: &[crate::agent::AttachmentInput]) -> String {
     let mut prompt = Vec::new();
-    // Omit an empty text block when an image carries the turn; keep it otherwise so prompt is never empty.
-    if !text.is_empty() || images.is_empty() {
-        prompt.push(json!({ "type": "text", "text": text }));
+    for at in attachments.iter().filter(|a| a.mime.starts_with("image/")) {
+        prompt.push(json!({ "type": "image", "mimeType": at.mime, "data": at.data }));
     }
-    for im in images {
-        prompt.push(json!({ "type": "image", "mimeType": im.mime, "data": im.data }));
+    // Omit an empty text block when an image carries the turn; keep it otherwise so prompt is never empty.
+    if !text.is_empty() || prompt.is_empty() {
+        prompt.insert(0, json!({ "type": "text", "text": text }));
     }
     json!({
         "jsonrpc": "2.0",
@@ -167,6 +172,8 @@ mod tests {
         assert_eq!(kimi_mode("bypassPermissions"), "yolo");
         assert_eq!(kimi_mode("default"), "default");
         assert_eq!(kimi_mode(""), "default");
+        // Modelius "auto" rides the CLI's manual-approval mode — the app filters the requests.
+        assert_eq!(kimi_mode("auto"), "default");
     }
 
     #[test]
@@ -221,7 +228,7 @@ mod tests {
 
     #[test]
     fn prompt_line_appends_image_content_blocks() {
-        let imgs = [crate::agent::ImageInput { mime: "image/jpeg".into(), data: "QUJD".into() }];
+        let imgs = [crate::agent::AttachmentInput { mime: "image/jpeg".into(), data: "QUJD".into(), name: None }];
         let v: serde_json::Value = serde_json::from_str(&prompt_line(3, "session_a", "look", &imgs)).unwrap();
         assert_eq!(
             v["params"]["prompt"],

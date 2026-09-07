@@ -6,8 +6,11 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { createTransformer } from "./transform";
 import { createCodexAppServerTransformer } from "./codexAppServerTransform";
 import { createKimiAcpTransformer, kimiToolName, kimiToolInput } from "./kimiAcpTransform";
-import { buildAcpResult, type AcpPermissionOption, type PermissionRequestData } from "./permission";
+import { allowPermission, buildAcpResult, type AcpPermissionOption, type PermissionRequestData } from "./permission";
+import { dangerReason } from "./autoApprove";
+import { smoothTextStream } from "./smoothTextStream";
 import { bumpTurnActivity, clearTurnStatus, noteTurnStderr } from "./turnStatus";
+import { setPromptSuggestion } from "./promptSuggestion";
 
 // Raw pipe events from Rust agent.rs (PipeEvent).
 type PipeEvent =
@@ -29,18 +32,24 @@ export interface RunConfig {
   claudeToken?: string;
 }
 
-// An image attached to the turn: MIME + base64 payload (no data-URL prefix). Per-turn content the
-// Rust side wraps in each harness's native image content block (agent.rs ImageInput).
-export interface CodeImage {
+// A file attached to the turn: MIME + base64 payload (no data-URL prefix) + the original name.
+// Per-turn content the Rust side wraps in each harness's native content block, or spills to a temp
+// file when the harness has none (agent.rs AttachmentInput).
+export interface CodeAttachment {
   mime: string;
   data: string;
+  name?: string;
 }
 
 export interface ResolvedSend {
   prompt: string;
-  images?: CodeImage[]; // vision attachments on this turn
+  attachments?: CodeAttachment[]; // images / PDFs on this turn
   resume?: string; // prior CLI session id (from the last assistant message's metadata)
   run: RunConfig;
+  // Claim a CLI-initiated continuation instead of starting a turn: the warm claude CLI
+  // auto-resumed after a background task and session.rs parked its output. `agent_attach`
+  // replays those lines into this stream — no prompt is sent.
+  attach?: boolean;
 }
 
 // Decode a codex app-server SERVER REQUEST (JSON-RPC {id, method, params} from the CLI to us)
@@ -161,7 +170,7 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
     messages: UIMessage[];
     abortSignal?: AbortSignal;
   }): Promise<ReadableStream<UIMessageChunk>> {
-    const { prompt, images, resume, run } = await this.resolve(options.messages);
+    const { prompt, attachments, resume, run, attach } = await this.resolve(options.messages);
     const streamId = crypto.randomUUID();
     const isCodex = run.harness === "codex";
     const isKimi = run.harness === "kimi-code";
@@ -175,8 +184,15 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
     // answer every request, so the abort handler resolves them as "cancelled" before cancelling
     // the stream — an unanswered request could otherwise wedge the agent mid-cancel.
     const pendingKimiPerms = new Set<number | string>();
+    // "Auto" mode: the harness asks, we answer the safe requests ourselves and only render a card
+    // for what the danger policy flags (autoApprove.ts). Returns true when it handled the request.
+    const autoAnswer = (data: PermissionRequestData): boolean => {
+      if (run.permissionMode !== "auto" || dangerReason(data.toolName, data.input)) return false;
+      void allowPermission(data).catch(() => {});
+      return true;
+    };
 
-    return new ReadableStream<UIMessageChunk>({
+    const source = new ReadableStream<UIMessageChunk>({
       start: (controller) => {
         // Our transform yields the (structurally identical) local chunk shape; the SDK's generic
         // UIMessageChunk type is stricter, so cast at the boundary.
@@ -206,8 +222,9 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
               const req = parsed as { method?: string; id?: number | string };
               if (typeof req.method === "string" && req.id !== undefined && req.id !== null) {
                 const perm = codexPermissionDataFrom(parsed, streamId);
-                if (perm) push(perm);
-                else
+                if (perm) {
+                  if (!autoAnswer(perm.data)) push(perm);
+                } else
                   void invoke("agent_respond", {
                     streamId,
                     payload: JSON.stringify({
@@ -225,8 +242,11 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
               if (typeof req.method === "string" && req.id !== undefined && req.id !== null) {
                 const perm = kimiPermissionDataFrom(parsed, streamId);
                 if (perm) {
-                  pendingKimiPerms.add(req.id);
-                  push(perm);
+                  // Auto-answered requests are already resolved — don't track them as pending.
+                  if (!autoAnswer(perm.data)) {
+                    pendingKimiPerms.add(req.id);
+                    push(perm);
+                  }
                 } else {
                   void invoke("agent_respond", {
                     streamId,
@@ -241,8 +261,13 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
               }
             } else if ((parsed as { type?: string }).type === "control_request") {
               const perm = permissionDataFrom(parsed, streamId);
-              if (perm) push(perm);
+              if (perm && !autoAnswer(perm.data)) push(perm);
               return; // other control traffic is not transcript content
+            } else if ((parsed as { type?: string }).type === "prompt_suggestion") {
+              // The CLI's predicted next user prompt (claude --prompt-suggestions). Composer state,
+              // not transcript content — the transform would have nothing to do with it.
+              setPromptSuggestion(this.chatId, (parsed as { suggestion?: string }).suggestion ?? "");
+              return;
             }
             for (const chunk of transform(parsed)) push(chunk);
           } else if (ev.type === "stderr") {
@@ -268,22 +293,27 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
 
         // Seed the silence detector at turn start so the pre-first-token wait counts too.
         bumpTurnActivity(this.chatId);
-        const call = invoke("agent_run", {
-          harness: run.harness,
-          model: run.model,
-          prompt,
-          images: images ?? [],
-          cwd: run.cwd,
-          permissionMode: run.permissionMode,
-          effort: run.effort,
-          resume,
-          target: run.target,
-          codexAuth: run.codexAuth,
-          claudeToken: run.claudeToken,
-          sessionKey: this.chatId,
-          streamId,
-          onEvent: channel,
-        });
+        // The prior turn's suggestion is stale the moment a new turn starts.
+        setPromptSuggestion(this.chatId, "");
+        const call = attach
+          ? // Synthetic turn: claim the parked CLI-initiated continuation (no prompt sent).
+            invoke("agent_attach", { sessionKey: this.chatId, streamId, onEvent: channel })
+          : invoke("agent_run", {
+              harness: run.harness,
+              model: run.model,
+              prompt,
+              attachments: attachments ?? [],
+              cwd: run.cwd,
+              permissionMode: run.permissionMode,
+              effort: run.effort,
+              resume,
+              target: run.target,
+              codexAuth: run.codexAuth,
+              claudeToken: run.claudeToken,
+              sessionKey: this.chatId,
+              streamId,
+              onEvent: channel,
+            });
         call.catch((e) => {
           clearTurnStatus(this.chatId);
           push({ type: "error", errorText: e instanceof Error ? e.message : String(e) });
@@ -326,6 +356,9 @@ export class CodeChatTransport implements ChatTransport<UIMessage> {
         );
       },
     });
+    // The CLIs coalesce token deltas into sentence-sized chunks — re-slice them into a word-per-
+    // ~10ms typewriter so the answer visibly generates instead of popping in (smoothTextStream.ts).
+    return source.pipeThrough(smoothTextStream());
   }
 
   async reconnectToStream(): Promise<ReadableStream<UIMessageChunk> | null> {

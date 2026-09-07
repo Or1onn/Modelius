@@ -57,8 +57,8 @@ describe("toAnthropicModel", () => {
     expect(toAnthropicModel(m("claude-opus-4", 98))).toBe("claude-opus-4-20250514");
   });
   it("falls back by family for off-registry ids", () => {
-    expect(toAnthropicModel(m("mystery", 99))).toBe("claude-opus-4-8");
-    expect(toAnthropicModel(m("mystery", 86))).toBe("claude-sonnet-4-6");
+    expect(toAnthropicModel(m("mystery", 99))).toBe("claude-opus-5");
+    expect(toAnthropicModel(m("mystery", 86))).toBe("claude-sonnet-5");
     expect(toAnthropicModel(m("mystery", 70))).toBe("claude-haiku-4-5-20251001");
   });
 });
@@ -71,6 +71,7 @@ describe("anthropicEffortTier", () => {
     expect(anthropicEffortTier("gpt-4o")).toBe(null);
   });
   it("gives the gen-5 models the full level set", () => {
+    expect(anthropicEffortTier("claude-opus-5")).toBe("opus");
     expect(anthropicEffortTier("claude-sonnet-5")).toBe("opus");
     expect(anthropicEffortTier("claude-fable-5")).toBe("opus");
     expect(anthropicEffortTier("claude-mythos-5")).toBe("opus");

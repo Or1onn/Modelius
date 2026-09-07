@@ -3,6 +3,7 @@
 mod agent;
 mod anthropic;
 mod artifacts;
+mod attachments;
 mod codex_proto;
 mod compat;
 mod gateway;
@@ -40,6 +41,7 @@ pub fn run() {
         )
         .setup(|app| {
             vault::init(app.handle()); // capture the app-data dir for the vault-initialized sentinel
+            session::init(app.handle().clone()); // app handle for pump-side events (agent-cli-resume)
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -57,6 +59,7 @@ pub fn run() {
             compat::ollama_show,
             stream::cancel_stream,
             agent::agent_run,
+            agent::agent_attach,
             agent::agent_respond,
             agent::agent_session_close,
             agent::codex_list_models,
@@ -66,12 +69,18 @@ pub fn run() {
             installer::harness_logged_in,
             git::git_branches,
             git::git_checkout,
+            git::git_worktree_create,
+            git::git_worktree_status,
+            git::git_worktree_commit,
+            git::git_worktree_merge,
+            git::git_worktree_remove,
             terminal::terminal_open,
             terminal::terminal_write,
             terminal::terminal_resize,
             terminal::terminal_close,
             artifacts::artifact_write,
             artifacts::artifact_read,
+            attachments::attachment_read,
             secrets::secret_set,
             secrets::secret_get,
             secrets::secret_delete,

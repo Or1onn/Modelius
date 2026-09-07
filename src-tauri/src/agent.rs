@@ -119,36 +119,107 @@ pub(crate) struct RouteTarget {
     pub api_key: String,
 }
 
-// One image attached to a turn: a MIME type + base64 payload (no data-URL prefix). Per-turn
-// content, like the prompt — it rides begin_turn, never the warm-session fingerprint. Each harness
-// wraps it in its own native content block (claude_user_line here; codex/kimi_proto builders).
+// One file attached to a turn: a MIME type + base64 payload (no data-URL prefix) + the original
+// file name when the composer had one. Per-turn content, like the prompt — it rides begin_turn,
+// never the warm-session fingerprint. Each harness wraps it in its own native content block
+// (claude_user_line here; codex/kimi_proto builders); what a harness can't carry natively is
+// spilled to a temp file and handed over as a path (spill_unsupported).
 #[derive(serde::Deserialize, Clone)]
-pub(crate) struct ImageInput {
+pub(crate) struct AttachmentInput {
     pub mime: String,
     pub data: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
-// The claude stream-json user line: a text block plus one native Anthropic image block per
-// attachment. Shared by the cold per-turn path and the warm session (session.rs begin_turn) so the
-// two can't drift.
-pub(crate) fn claude_user_line(prompt: &str, images: &[ImageInput]) -> String {
+// The claude stream-json user line: a text block plus one native Anthropic content block per
+// attachment — `image` for image/*, `document` for application/pdf (probe-verified: claude 2.1.206
+// reads a base64 document block). Shared by the cold per-turn path and the warm session
+// (session.rs begin_turn) so the two can't drift.
+pub(crate) fn claude_user_line(prompt: &str, attachments: &[AttachmentInput]) -> String {
     let mut content = Vec::new();
-    // Drop an empty text block when an image carries the turn (Anthropic rejects empty text
-    // blocks); keep it when there are no images so the content array is never empty.
-    if !prompt.is_empty() || images.is_empty() {
-        content.push(serde_json::json!({ "type": "text", "text": prompt }));
+    for at in attachments {
+        let kind = match () {
+            _ if at.mime == "application/pdf" => "document",
+            _ if at.mime.starts_with("image/") => "image",
+            _ => continue,
+        };
+        let mut block = serde_json::json!({
+            "type": kind,
+            "source": { "type": "base64", "media_type": at.mime, "data": at.data }
+        });
+        // `title` is a document-only field; it names the PDF for the model and survives the
+        // gateway's translation as the OpenAI file part's filename.
+        if kind == "document" {
+            if let Some(name) = at.name.as_deref().filter(|n| !n.is_empty()) {
+                block["title"] = serde_json::json!(name);
+            }
+        }
+        content.push(block);
     }
-    for im in images {
-        content.push(serde_json::json!({
-            "type": "image",
-            "source": { "type": "base64", "media_type": im.mime, "data": im.data }
-        }));
+    // Drop an empty text block when an attachment carries the turn (Anthropic rejects empty text
+    // blocks); keep it when there is nothing else so the content array is never empty.
+    if !prompt.is_empty() || content.is_empty() {
+        content.insert(0, serde_json::json!({ "type": "text", "text": prompt }));
     }
     serde_json::json!({
         "type": "user",
         "message": { "role": "user", "content": content }
     })
     .to_string()
+}
+
+// Only claude's protocol carries a document block; codex's app-server input items and kimi's ACP
+// prompt blocks are text/image only. Rather than drop a PDF silently, write it to a temp file and
+// append its path to the prompt — the same contract the composer's "Attach files" uses, so the CLI
+// reads it with its own tools. Images pass through untouched.
+fn spill_unsupported(prompt: &str, attachments: Vec<AttachmentInput>) -> Result<(String, Vec<AttachmentInput>), String> {
+    let mut kept = Vec::new();
+    let mut paths = Vec::new();
+    for at in attachments {
+        if at.mime.starts_with("image/") {
+            kept.push(at);
+            continue;
+        }
+        let path = write_temp_attachment(&at)
+            .map_err(|e| format!("failed to stage attachment '{}': {}", at.name.as_deref().unwrap_or("file"), e))?;
+        paths.push(path.to_string_lossy().to_string());
+    }
+    if paths.is_empty() {
+        return Ok((prompt.to_string(), kept));
+    }
+    let note = format!(
+        "\n\nAttached files (read them):\n{}",
+        paths.iter().map(|p| format!("- {}", p)).collect::<Vec<_>>().join("\n")
+    );
+    Ok((format!("{}{}", prompt, note), kept))
+}
+
+// Materialize one attachment under {temp}/modelius-attachments. The name is content-hashed so
+// re-sending the same file reuses one path instead of piling up copies.
+fn write_temp_attachment(at: &AttachmentInput) -> std::io::Result<std::path::PathBuf> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use std::hash::{Hash, Hasher};
+    let bytes = STANDARD
+        .decode(at.data.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    let mut stem: String = at
+        .name
+        .as_deref()
+        .unwrap_or("attachment")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect();
+    if at.mime == "application/pdf" && !stem.to_ascii_lowercase().ends_with(".pdf") {
+        stem.push_str(".pdf");
+    }
+    let dir = std::env::temp_dir().join("modelius-attachments");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{:x}-{}", h.finish(), stem));
+    std::fs::write(&path, &bytes)?;
+    Ok(path)
 }
 
 // Build argv from the harness's declarative template. The prompt never enters argv — it rides
@@ -482,7 +553,7 @@ pub async fn agent_run(
     harness: String,
     model: String,
     prompt: String,
-    images: Vec<ImageInput>,
+    attachments: Vec<AttachmentInput>,
     cwd: String,
     permission_mode: String,
     effort: String,
@@ -510,6 +581,20 @@ pub async fn agent_run(
     }
     let path_env = crate::node_runtime::child_path_env(&app);
 
+    // Non-image attachments (PDFs) only ride the wire natively on claude — elsewhere they become
+    // temp files referenced from the prompt.
+    let (prompt, attachments) = if matches!(spec.channel, PromptChannel::ClaudeStream) {
+        (prompt, attachments)
+    } else {
+        match spill_unsupported(&prompt, attachments) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = on_event.send(PipeEvent::Error(e.clone()));
+                return Err(e);
+            }
+        }
+    };
+
     // Warm path: reuse/spawn the chat's live process and feed it this turn over its stdio
     // protocol (claude stream-json / codex app-server JSON-RPC — session.rs begin_turn).
     {
@@ -524,6 +609,10 @@ pub async fn agent_run(
                     harness,
                     model,
                     cwd,
+                    // Claude refuses to ENTER bypassPermissions at runtime (see Fingerprint.bypass)
+                    // — make it a spawn-time identity so switching in/out respawns with --resume.
+                    bypass: matches!(spec.channel, PromptChannel::ClaudeStream)
+                        && permission_mode == "bypassPermissions",
                     // Claude: argv-only knob — an effort change respawns (--resume keeps context).
                     // Codex: per-turn turn/start override — kept out so a change never respawns.
                     // Kimi: no effort surface at all — always out.
@@ -539,7 +628,7 @@ pub async fn agent_run(
                 permission_mode,
                 resume,
                 prompt,
-                images,
+                attachments,
                 effort,
                 path_env,
                 codex_home,
@@ -591,7 +680,7 @@ pub async fn agent_run(
                 return Err("no stdin".to_string());
             }
         };
-        let initial = claude_user_line(&prompt, &images);
+        let initial = claude_user_line(&prompt, &attachments);
         let wrote = async {
             si.write_all(initial.as_bytes()).await?;
             si.write_all(b"\n").await?;
@@ -686,8 +775,8 @@ struct WarmRun {
     permission_mode: String,
     resume: Option<String>,
     prompt: String,
-    // Images attached to this turn (per-turn content, not part of the fingerprint).
-    images: Vec<ImageInput>,
+    // Files attached to this turn (per-turn content, not part of the fingerprint).
+    attachments: Vec<AttachmentInput>,
     // Raw effort as picked in the UI. For claude it's already in the fingerprint (argv);
     // for codex it rides each turn/start (session.begin_turn) and stays out of the fingerprint.
     effort: String,
@@ -726,7 +815,7 @@ async fn run_warm(
     // A process that died silently between turns only surfaces as a write failure — retry once
     // against a fresh spawn. abandon_turn (not detach) keeps the webview stream open for take two.
     let mut attempt = 0;
-    let (session, mut done_rx) = loop {
+    let (session, done_rx) = loop {
         attempt += 1;
         let session = match crate::session::get(key).filter(|s| s.matches(&run.fingerprint)) {
             Some(s) => s,
@@ -750,7 +839,7 @@ async fn run_warm(
         agent_session_keys().lock().unwrap().insert(stream_id.to_string(), key.to_string());
         let done_rx = session.attach_turn(on_event.clone());
         let wrote = session
-            .begin_turn(&run.prompt, &run.images, &run.fingerprint.model, &run.effort, &run.permission_mode)
+            .begin_turn(&run.prompt, &run.attachments, &run.fingerprint.model, &run.effort, &run.permission_mode)
             .await;
         match wrote {
             Ok(()) => break (session, done_rx),
@@ -766,7 +855,20 @@ async fn run_warm(
         }
     };
 
-    // Wait for the turn, polling the shared cancel flag like every pump loop (bounded 300ms).
+    await_turn(key, &session, cancel, done_rx).await;
+    session.touch();
+    Ok(())
+}
+
+// Wait for an attached turn, polling the shared cancel flag like every pump loop (bounded 300ms).
+// Cancel interrupts in-place (process stays warm); a CLI that stays silent for 5s after the
+// interrupt gets killed. Shared by run_warm and agent_attach.
+async fn await_turn(
+    key: &str,
+    session: &Arc<crate::session::AgentSession>,
+    cancel: &crate::stream::CancelGuard,
+    mut done_rx: tokio::sync::oneshot::Receiver<()>,
+) {
     loop {
         if cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
             // Stop the turn but keep the process warm; the CLI acks and closes the turn with an
@@ -780,7 +882,7 @@ async fn run_warm(
                 session.detach_turn();
                 session.kill().await;
                 if let Some(current) = crate::session::get(key) {
-                    if Arc::ptr_eq(&current, &session) {
+                    if Arc::ptr_eq(&current, session) {
                         crate::session::remove(key);
                     }
                 }
@@ -790,6 +892,36 @@ async fn run_warm(
         match tokio::time::timeout(std::time::Duration::from_millis(300), &mut done_rx).await {
             Ok(_) => break, // turn finished (or the session was torn down) — pump sent Done
             Err(_) => continue,
+        }
+    }
+}
+
+// Attach the webview to a CLI-initiated continuation: the warm claude CLI auto-resumed after a
+// background task finished and the pump parked its output (no turn was attached). Replays the
+// parked lines into this stream and rides the rest of the turn like a normal warm turn — same
+// permission flow (stdin registered for agent_respond), same cancel/interrupt semantics.
+#[tauri::command]
+pub async fn agent_attach(
+    session_key: String,
+    stream_id: String,
+    on_event: tauri::ipc::Channel<PipeEvent>,
+) -> Result<(), String> {
+    let cancel = cancel_guard(&stream_id);
+    let session = crate::session::get(&session_key)
+        .filter(|s| s.is_claude() && s.is_alive())
+        .ok_or_else(|| "The background continuation ended before it could be shown (the agent process is gone).".to_string())?;
+    let _stdin_guard = StdinGuard { id: stream_id.clone() };
+    if let Some(stdin) = session.stdin() {
+        agent_stdins().lock().unwrap().insert(stream_id.clone(), stdin);
+    }
+    agent_session_keys().lock().unwrap().insert(stream_id.clone(), session_key.clone());
+    match session.attach_resume(&session_key, on_event.clone()) {
+        crate::session::AttachOutcome::Finished => {
+            // Everything (including the result) was parked — the replay is the whole turn.
+            let _ = on_event.send(PipeEvent::Done);
+        }
+        crate::session::AttachOutcome::Attached(done_rx) => {
+            await_turn(&session_key, &session, &cancel, done_rx).await;
         }
     }
     session.touch();
@@ -939,6 +1071,53 @@ mod tests {
         let mi = argv.iter().position(|a| a == "--model").unwrap();
         assert_eq!(argv[mi + 1], "claude-x");
         assert!(argv.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "plan"));
+    }
+
+    #[test]
+    fn claude_user_line_wraps_pdfs_as_documents_and_images_as_images() {
+        let ats = [
+            AttachmentInput { mime: "image/png".into(), data: "QUJD".into(), name: None },
+            AttachmentInput { mime: "application/pdf".into(), data: "JVBE".into(), name: Some("spec.pdf".into()) },
+        ];
+        let v: serde_json::Value = serde_json::from_str(&claude_user_line("look", &ats)).unwrap();
+        assert_eq!(
+            v["message"]["content"],
+            serde_json::json!([
+                { "type": "text", "text": "look" },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "QUJD" } },
+                { "type": "document", "title": "spec.pdf", "source": { "type": "base64", "media_type": "application/pdf", "data": "JVBE" } },
+            ])
+        );
+        // A PDF alone carries the turn — no empty text block (Anthropic rejects those).
+        let only: serde_json::Value = serde_json::from_str(&claude_user_line("", &ats[1..])).unwrap();
+        assert_eq!(only["message"]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(only["message"]["content"][0]["type"], "document");
+    }
+
+    #[test]
+    fn spill_unsupported_keeps_images_and_hands_pdfs_over_as_paths() {
+        let ats = vec![
+            AttachmentInput { mime: "image/png".into(), data: "QUJD".into(), name: None },
+            AttachmentInput { mime: "application/pdf".into(), data: "JVBERi0=".into(), name: Some("a b/c.pdf".into()) },
+        ];
+        let (prompt, kept) = spill_unsupported("read it", ats).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].mime, "image/png");
+        let path = prompt.lines().last().unwrap().trim_start_matches("- ").to_string();
+        assert!(prompt.starts_with("read it\n\nAttached files (read them):\n"), "{}", prompt);
+        assert_eq!(std::fs::read(&path).unwrap(), b"%PDF-");
+        // The name is sanitized (no separators survive) and keeps its extension.
+        let file = std::path::Path::new(&path).file_name().unwrap().to_string_lossy().to_string();
+        assert!(file.ends_with("-a_b_c.pdf"), "{}", file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn spill_unsupported_leaves_an_image_only_turn_untouched() {
+        let ats = vec![AttachmentInput { mime: "image/png".into(), data: "QUJD".into(), name: None }];
+        let (prompt, kept) = spill_unsupported("hi", ats).unwrap();
+        assert_eq!(prompt, "hi");
+        assert_eq!(kept.len(), 1);
     }
 
     #[test]

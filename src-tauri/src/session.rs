@@ -31,6 +31,14 @@ pub(crate) struct Fingerprint {
     pub harness: String,
     pub model: String,
     pub cwd: String,
+    // Claude only: whether the process was launched in bypassPermissions. That one mode CANNOT be
+    // entered at runtime — the CLI answers set_permission_mode with "Cannot set permission mode to
+    // bypassPermissions because the session was not launched with --dangerously-skip-permissions"
+    // (probe-verified 2.1.220), so a warm session would silently stay in its old mode. Keeping it
+    // in the fingerprint respawns instead (with --resume, so the chat keeps its context).
+    // Codex re-asserts the mode on every turn/start and kimi via session/set_mode, so both stay
+    // false and never respawn for a mode change.
+    pub bypass: bool,
     // Reasoning depth ("" = no flag). Claude-only: argv-only there, so a change respawns.
     // Codex effort is a native per-turn override (turn/start) — always "" in its fingerprint.
     pub effort: String,
@@ -156,6 +164,22 @@ struct ActiveTurn {
     done: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+// App handle for webview events the pump emits outside any invoke (agent-cli-resume).
+static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+pub(crate) fn init(app: tauri::AppHandle) {
+    let _ = APP.set(app);
+}
+
+// Tell the webview a warm CLI started a turn on its own (background-task auto-resume) so it can
+// claim the parked output with agent_attach. Payload = the session key (the code chat id).
+fn notify_resume(key: &str) {
+    use tauri::Emitter;
+    if let Some(app) = APP.get() {
+        let _ = app.emit("agent-cli-resume", key);
+    }
+}
+
 pub(crate) struct AgentSession {
     fingerprint: Fingerprint,
     proto: SessionProto,
@@ -171,6 +195,13 @@ pub(crate) struct AgentSession {
     // Cleared on close/kill/stdout-EOF; a dead session is never reused (fingerprint match requires it).
     alive: AtomicBool,
     last_used: Mutex<Instant>,
+    // Claude lines that arrived with NO turn attached — the CLI auto-resumed after a background
+    // task finished (task-notification) and started a turn on its own. Parked here (instead of
+    // dropped) until the webview claims them via agent_attach; locked after `active`, never before.
+    parked: Mutex<Vec<String>>,
+    // One agent-cli-resume event per park burst: set on the first parked line, cleared when a
+    // turn attaches (which drains the buffer).
+    resume_notified: AtomicBool,
     // The permission mode the CLI currently runs under; reconciled per turn via
     // set_permission_mode when the webview asks for a different one.
     permission_mode: Mutex<String>,
@@ -179,18 +210,26 @@ pub(crate) struct AgentSession {
     stderr_tail: Mutex<String>,
 }
 
-// The CLI emits lines as compact JSON with `type` first; inside strings the quotes would be
-// escaped, so this prefix can't occur mid-string. Only a TOP-LEVEL result ends the turn — the
-// stream-json types allow sidechain (subagent) results carrying parent_tool_use_id, and ending
-// the turn on one would strand the rest of the CLI's output. Result lines are rare, so the
-// confirming JSON parse costs nothing. Centralized: a format change is a one-line fix.
+// The CLI emits compact JSON but the KEY ORDER IS NOT STABLE across versions: ≤2.1.206 put
+// `type` first, 2.1.218 leads the result line with `is_error` (probe-verified) — a prefix check
+// missed it and the turn never ended (UI stuck on "Working"). So: cheap containment scan as the
+// filter (inside JSON strings the quotes are escaped, so the raw `"type":"result"` bytes can't
+// occur mid-string; a nested object could carry them, which the parse disambiguates), then a
+// confirming parse on the rare hit. Only a TOP-LEVEL result ends the turn — the stream-json
+// types allow sidechain (subagent) results carrying parent_tool_use_id, and ending the turn on
+// one would strand the rest of the CLI's output. Centralized: a format change is a one-line fix.
 pub(crate) fn is_result_line(line: &str) -> bool {
-    if !line.starts_with("{\"type\":\"result\"") {
+    if !line.contains("\"type\":\"result\"") {
         return false;
     }
     match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(v) => v.get("parent_tool_use_id").map(|p| p.is_null()).unwrap_or(true),
-        Err(_) => true, // prefix matched but unparseable — fall back to the old behavior
+        Ok(v) => {
+            v.get("type").and_then(|t| t.as_str()) == Some("result")
+                && v.get("parent_tool_use_id").map(|p| p.is_null()).unwrap_or(true)
+        }
+        // Unparseable can only be a truncated/garbled line, not a valid result — don't end the
+        // turn on it (pre-fix behavior only applied when the prefix matched at position 0).
+        Err(_) => line.starts_with("{\"type\":\"result\""),
     }
 }
 
@@ -202,6 +241,16 @@ fn sessions() -> &'static Mutex<HashMap<String, Arc<AgentSession>>> {
 impl AgentSession {
     pub fn matches(&self, fp: &Fingerprint) -> bool {
         self.alive.load(Ordering::SeqCst) && self.fingerprint == *fp
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    // Only the claude stream-json protocol starts turns on its own (background-task auto-resume);
+    // agent_attach refuses the others.
+    pub fn is_claude(&self) -> bool {
+        matches!(self.proto, SessionProto::Claude)
     }
 
     pub fn stdin(&self) -> Option<StdinHandle> {
@@ -220,8 +269,56 @@ impl AgentSession {
         if let Some(old) = guard.take() {
             finish_turn(old);
         }
+        // A user turn racing an unclaimed CLI continuation: forward the parked lines into this
+        // stream instead of stranding them — content and order beat a pristine turn boundary.
+        for l in std::mem::take(&mut *self.parked.lock().unwrap()) {
+            let _ = channel.send(PipeEvent::Line(l));
+        }
+        self.resume_notified.store(false, Ordering::SeqCst);
         *guard = Some(ActiveTurn { channel, done: Some(tx) });
         rx
+    }
+
+    // Claim a CLI-initiated continuation (agent_attach): replay the parked lines into this
+    // stream, then either ride the still-running turn (Attached) or report that a parked line
+    // already ended it (Finished — the caller closes the stream). Lines parked past that result
+    // belong to a NEXT continuation: they stay parked and the webview is re-notified shortly,
+    // after this stream has closed.
+    pub fn attach_resume(&self, key: &str, channel: tauri::ipc::Channel<PipeEvent>) -> AttachOutcome {
+        let mut guard = self.active.lock().unwrap();
+        if let Some(old) = guard.take() {
+            finish_turn(old);
+        }
+        let mut parked = self.parked.lock().unwrap();
+        let mut finished = false;
+        while !parked.is_empty() {
+            let l = parked.remove(0);
+            let end = is_result_line(&l);
+            let _ = channel.send(PipeEvent::Line(l));
+            if end {
+                finished = true;
+                break;
+            }
+        }
+        if finished {
+            let renotify = !parked.is_empty();
+            drop(parked);
+            self.resume_notified.store(renotify, Ordering::SeqCst);
+            if renotify {
+                let key = key.to_string();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    notify_resume(&key);
+                });
+            }
+            AttachOutcome::Finished
+        } else {
+            drop(parked);
+            self.resume_notified.store(false, Ordering::SeqCst);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            *guard = Some(ActiveTurn { channel, done: Some(tx) });
+            AttachOutcome::Attached(rx)
+        }
     }
 
     // Waiter-side turn teardown (cancel paths): close the turn's stream; the process itself is
@@ -282,11 +379,11 @@ impl AgentSession {
 
     // Deliver one user turn over the session's protocol. Err = pipe gone / protocol failure —
     // the caller's write-failed retry respawns once.
-    pub async fn begin_turn(&self, prompt: &str, images: &[crate::agent::ImageInput], model: &str, effort: &str, mode: &str) -> std::io::Result<()> {
+    pub async fn begin_turn(&self, prompt: &str, attachments: &[crate::agent::AttachmentInput], model: &str, effort: &str, mode: &str) -> std::io::Result<()> {
         match &self.proto {
             SessionProto::Claude => {
                 self.reconcile_permission_mode(mode).await?;
-                self.write_line(&crate::agent::claude_user_line(prompt, images)).await
+                self.write_line(&crate::agent::claude_user_line(prompt, attachments)).await
             }
             SessionProto::Codex(rt) => {
                 // Fresh spawn: wait for the thread/start | thread/resume response (the pump fires
@@ -295,7 +392,7 @@ impl AgentSession {
                 let id = rt.open.take_id();
                 *rt.turn_req.lock().unwrap() = Some(id);
                 *rt.turn_id.lock().unwrap() = None;
-                self.write_line(&crate::codex_proto::turn_start_line(id, &thread_id, prompt, images, model, effort, mode))
+                self.write_line(&crate::codex_proto::turn_start_line(id, &thread_id, prompt, attachments, model, effort, mode))
                     .await
             }
             SessionProto::Kimi(rt) => {
@@ -329,7 +426,7 @@ impl AgentSession {
                         .await?;
                     *rt.model_sent.lock().unwrap() = Some(model.to_string());
                 }
-                self.write_line(&crate::kimi_proto::prompt_line(id, &session_id, prompt, images)).await
+                self.write_line(&crate::kimi_proto::prompt_line(id, &session_id, prompt, attachments)).await
             }
         }
     }
@@ -409,6 +506,70 @@ impl AgentSession {
     }
 }
 
+// What claiming a CLI-initiated continuation found (attach_resume).
+pub(crate) enum AttachOutcome {
+    // The turn is still running: parked lines were replayed, live lines now flow; the receiver
+    // fires when the pump sees the result.
+    Attached(tokio::sync::oneshot::Receiver<()>),
+    // A parked line already ended the turn — everything was replayed; nothing live to wait for.
+    Finished,
+}
+
+// request_id of a parked `can_use_tool` control_request — the auto-deny safety net needs it.
+// Containment filter + confirming parse, mirroring is_result_line (key order is not stable
+// across CLI versions). Anything else → None.
+pub(crate) fn stray_can_use_tool(line: &str) -> Option<String> {
+    if !line.contains("\"type\":\"control_request\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type")?.as_str()? != "control_request" {
+        return None;
+    }
+    if v.get("request")?.get("subtype")?.as_str()? != "can_use_tool" {
+        return None;
+    }
+    Some(v.get("request_id")?.as_str()?.to_string())
+}
+
+// The deny control_response for an unattended permission request (same wire shape as
+// permission.ts buildControlResponse — probe-verified 2.1.206).
+pub(crate) fn deny_line(request_id: &str) -> String {
+    serde_json::json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": request_id, "response": {
+            "behavior": "deny",
+            "message": "Modelius: nobody is watching this background continuation, so the permission request was denied automatically. Ask again when the user sends their next message."
+        }}
+    })
+    .to_string()
+}
+
+// Safety net for a permission request parked with no webview attached: if nothing claims it
+// within the grace period, deny it so the CLI's turn can conclude instead of wedging until the
+// process dies (an unanswered can_use_tool blocks the turn indefinitely). An attach inside the
+// window drains the buffer — the timer then finds the request gone and stands down.
+fn arm_auto_deny(session: Arc<AgentSession>, request_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let line = {
+            let guard = session.active.lock().unwrap();
+            if guard.is_some() {
+                return; // a turn attached — the webview shows the card and answers it
+            }
+            let mut parked = session.parked.lock().unwrap();
+            match parked.iter().position(|l| stray_can_use_tool(l).as_deref() == Some(request_id.as_str())) {
+                Some(i) => {
+                    parked.remove(i); // answered here — a later attach must not re-render the card
+                }
+                None => return, // drained (attach in flight) — the webview owns it now
+            }
+            deny_line(&request_id)
+        };
+        let _ = session.write_line(&line).await;
+    });
+}
+
 // Close a turn's stream: Done to the webview, completion to the awaiting agent_run.
 fn finish_turn(mut t: ActiveTurn) {
     let _ = t.channel.send(PipeEvent::Done);
@@ -462,6 +623,8 @@ pub(crate) fn spawn_session(
         gateway,
         alive: AtomicBool::new(true),
         last_used: Mutex::new(Instant::now()),
+        parked: Mutex::new(Vec::new()),
+        resume_notified: AtomicBool::new(false),
         permission_mode: Mutex::new(permission_mode),
         stderr_tail: Mutex::new(String::new()),
     });
@@ -493,9 +656,10 @@ fn lru_victim(entries: impl Iterator<Item = (String, Instant)>, keep: &str) -> O
 
 // Long-lived stdout pump: every line goes to the attached turn; the protocol's turn-end marker
 // ends that turn (transport-side Done + waiter wakeup) but — unlike the per-turn path — leaves
-// stdin open so the CLI idles for the next turn. Stray lines between turns are dropped (codex
-// lifecycle responses are consumed into the runtime first). EOF means the process died: fail any
-// in-flight turn with the stderr tail and drop the registry entry.
+// stdin open so the CLI idles for the next turn. Claude lines between turns are PARKED (the CLI
+// auto-resumes after background tasks — see the else-arm below); codex/kimi strays are dropped
+// (their lifecycle responses are consumed into the runtime first). EOF means the process died:
+// fail any in-flight turn with the stderr tail and drop the registry entry.
 fn spawn_pump(key: String, session: Arc<AgentSession>, stdout: tokio::process::ChildStdout) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -525,6 +689,22 @@ fn spawn_pump(key: String, session: Arc<AgentSession>, stdout: tokio::process::C
                 }
                 if end {
                     finish_turn(guard.take().unwrap());
+                }
+            } else if forward && matches!(session.proto, SessionProto::Claude) {
+                // No turn attached: the CLI started one on its own (auto-resume after a
+                // background task — task-notification). Park the line for the webview to claim
+                // via agent_attach instead of dropping it, and tell the webview once per burst.
+                // A parked permission request arms an auto-deny so an unclaimed continuation
+                // can't wedge the CLI. touch() keeps the reaper off mid-continuation.
+                let deny_req = stray_can_use_tool(&line);
+                session.parked.lock().unwrap().push(line);
+                drop(guard);
+                session.touch();
+                if let Some(req) = deny_req {
+                    arm_auto_deny(session.clone(), req);
+                }
+                if !session.resume_notified.swap(true, Ordering::SeqCst) {
+                    notify_resume(&key);
                 }
             }
         }
@@ -752,14 +932,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stray_can_use_tool_extracts_only_permission_requests() {
+        // the shape the CLI emits (probe-verified 2.1.206)
+        let can = r#"{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#;
+        assert_eq!(stray_can_use_tool(can).as_deref(), Some("req-1"));
+        // key order is not stable across CLI versions — `type` mid-line must still match
+        let reordered = r#"{"request_id":"req-3","type":"control_request","request":{"subtype":"can_use_tool","tool_name":"Read","input":{}}}"#;
+        assert_eq!(stray_can_use_tool(reordered).as_deref(), Some("req-3"));
+        // other control traffic must not arm the auto-deny
+        let ack = r#"{"type":"control_request","request_id":"req-2","request":{"subtype":"interrupt"}}"#;
+        assert_eq!(stray_can_use_tool(ack), None);
+        // ordinary stream lines
+        assert_eq!(stray_can_use_tool(r#"{"type":"assistant","message":{}}"#), None);
+        assert_eq!(stray_can_use_tool(r#"{"type":"result","subtype":"success"}"#), None);
+        assert_eq!(stray_can_use_tool(""), None);
+    }
+
+    #[test]
+    fn deny_line_matches_the_control_response_wire_shape() {
+        let v: serde_json::Value = serde_json::from_str(&deny_line("req-9")).unwrap();
+        assert_eq!(v["type"], "control_response");
+        assert_eq!(v["response"]["subtype"], "success");
+        assert_eq!(v["response"]["request_id"], "req-9");
+        assert_eq!(v["response"]["response"]["behavior"], "deny");
+        assert!(v["response"]["response"]["message"].as_str().unwrap().contains("denied automatically"));
+    }
+
+    #[test]
     fn only_top_level_result_lines_end_the_turn() {
         assert!(is_result_line(r#"{"type":"result","subtype":"success"}"#));
         assert!(is_result_line(r#"{"type":"result","subtype":"success","parent_tool_use_id":null}"#));
+        // 2.1.218 leads with is_error, `type` is mid-line (probe-verified) — must still end the turn
+        assert!(is_result_line(
+            r#"{"is_error":false,"duration_api_ms":2135,"num_turns":1,"stop_reason":"end_turn","session_id":"s1","total_cost_usd":0.12,"type":"result","subtype":"success"}"#
+        ));
         // a subagent's sidechain result must NOT end the turn
         assert!(!is_result_line(r#"{"type":"result","subtype":"success","parent_tool_use_id":"toolu_01x"}"#));
         assert!(!is_result_line(r#"{"type":"assistant","message":{}}"#));
-        // the prefix inside a string value is escaped, so it can't false-positive
+        // the marker inside a string value is escaped, so it can't false-positive
         assert!(!is_result_line(r#"{"type":"user","text":"{\"type\":\"result\""}"#));
+        // a nested object carrying the raw marker must be rejected by the top-level type check
+        assert!(!is_result_line(r#"{"type":"assistant","message":{"content":[{"type":"result"}]}}"#));
         assert!(!is_result_line(""));
     }
 
@@ -769,6 +982,7 @@ mod tests {
             harness: "claude-code".into(),
             model: model.into(),
             cwd: "D:\\proj".into(),
+            bypass: false,
             effort: effort.into(),
             target: None,
             claude_token: token.map(String::from),
@@ -779,8 +993,11 @@ mod tests {
         assert!(fp("opus", "high", None, None) != fp("opus", "max", None, None)); // claude effort is argv-only → respawn
         assert!(fp("opus", "", Some("t1"), None) != fp("opus", "", Some("t2"), None)); // auth rotation → respawn
         assert!(fp("gpt", "", None, Some("a:1")) != fp("gpt", "", None, Some("a:2"))); // codex account rotation → respawn
-        // permission mode is not part of the fingerprint at all (switched in-session);
-        // codex effort is not either (per-turn turn/start override) — agent_run passes "" there
+        // permission mode is not part of the fingerprint at all (switched in-session), EXCEPT the
+        // bypass flag: claude can only enter bypassPermissions at spawn time, so it must respawn.
+        let bypassed = Fingerprint { bypass: true, ..fp("opus", "", None, None) };
+        assert!(bypassed != fp("opus", "", None, None));
+        // codex effort is not part of it either (per-turn turn/start override) — agent_run passes ""
     }
 
     #[test]

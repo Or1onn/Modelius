@@ -32,8 +32,8 @@ import { cached, peek } from "@/shared/lib/modelCache";
 // Messages API needs full ids — bare opus/sonnet/haiku aliases 404. Seeded with
 // current gen, refreshed from /v1/models so the sync Auto path always has a real id.
 const claudeIdByFamily: Record<ClaudeFamily, string> = {
-  opus: "claude-opus-4-8",
-  sonnet: "claude-sonnet-4-6",
+  opus: "claude-opus-5",
+  sonnet: "claude-sonnet-5",
   haiku: "claude-haiku-4-5-20251001",
 };
 

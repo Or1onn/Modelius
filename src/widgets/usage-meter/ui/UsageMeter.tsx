@@ -64,7 +64,7 @@ export function UsageMeter({ used, win, providerKey, model }: { used: number; wi
           {/* Subscription rate-limit windows, one labelled bar each (Claude Code's "Plan usage limits"). */}
           {windows.length > 0 && (
             <div className="ctx-pop-plan">
-              <div className="ctx-pop-plan-head">Plan usage limits</div>
+              <div className="ctx-pop-plan-head">Plan usage limits{fetching ? " · updating…" : ""}</div>
               {windows.map((w, i) => {
                 const u = winUsedPct(w);
                 const reset = fmtReset(w.resetsAt);

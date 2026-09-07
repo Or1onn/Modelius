@@ -63,9 +63,9 @@ export const MODELS: Model[] = [
 // Live current-gen models for connected backends. liveRoutingPool() swaps these in for the
 // demo registry above, so the routed pick is a model the backend can actually serve.
 export const LIVE_ANTHROPIC: Model[] = [
-  { id: "claude-opus-4-8", name: "Claude Opus 4.8", abbr: "Op", provider: "anthropic", cost: 0.009, cap: 99, spd: 62, latency: 1.8, ctx: "1M", vision: true },
-  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", abbr: "Sn", provider: "anthropic", cost: 0.006, cap: 94, spd: 80, latency: 0.9, ctx: "200K", vision: true },
-  { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", abbr: "Hk", provider: "anthropic", cost: 0.002, cap: 84, spd: 92, latency: 0.5, ctx: "200K", vision: true },
+  { id: "claude-opus-5", name: "Claude Opus 5", abbr: "Op", provider: "anthropic", cost: 0.015, cap: 99, spd: 62, latency: 1.8, ctx: "1M", vision: true },
+  { id: "claude-sonnet-5", name: "Claude Sonnet 5", abbr: "Sn", provider: "anthropic", cost: 0.009, cap: 95, spd: 80, latency: 0.9, ctx: "1M", vision: true },
+  { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", abbr: "Hk", provider: "anthropic", cost: 0.003, cap: 84, spd: 92, latency: 0.5, ctx: "200K", vision: true },
 ];
 export const LIVE_CODEX: Model[] = [
   { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", abbr: "56", provider: "openai", cost: 0.008, cap: 98, spd: 66, latency: 1.5, ctx: "400K", vision: true },

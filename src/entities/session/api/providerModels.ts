@@ -11,6 +11,9 @@ export interface RemoteModel {
   // Effort levels the provider advertises, when its model list carries capabilities (Anthropic
   // /v1/models). Empty array = explicitly unsupported; absent = the provider doesn't say.
   efforts?: EffortLevel[];
+  // Context window in tokens, when the provider's model list carries it (Anthropic /v1/models
+  // `max_input_tokens`). Absent = the provider doesn't say.
+  maxInputTokens?: number;
 }
 
 // capabilities.effort → the levels flagged supported, in menu order (probe-verified against
@@ -62,10 +65,13 @@ async function fetchModels(provider: string, key: string): Promise<RemoteModel[]
     });
     if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
     const json = await res.json();
-    return ((json.data || []) as { id: string; display_name?: string; capabilities?: unknown }[]).map((m) => ({
+    return (
+      (json.data || []) as { id: string; display_name?: string; capabilities?: unknown; max_input_tokens?: number }[]
+    ).map((m) => ({
       id: m.id,
       name: m.display_name || m.id,
       efforts: effortsFromCapabilities(m.capabilities),
+      maxInputTokens: m.max_input_tokens,
     }));
   }
 

@@ -12,6 +12,7 @@ import { getOpenAIAuth } from "@/entities/session/model/openaiSession";
 export type ProviderKey = string; // "anthropic" | "chatgpt" | "openai" | compat providerId
 
 export interface LimitWindow {
+  key?: string; // stable identity across snapshots ("u:7d_oi", "cx:primary", …) — merge anchor
   label: string; // "Session (5h)" | "Weekly" | "Requests" | "Tokens"
   usedPct?: number; // 0..1
   remaining?: number;
@@ -99,32 +100,32 @@ const resetMs = (v?: string): number | undefined => {
   return Number.isNaN(t) ? undefined : t;
 };
 
-const mkWindow = (label: string, limit?: number, remaining?: number, reset?: number): LimitWindow | null => {
+const mkWindow = (key: string, label: string, limit?: number, remaining?: number, reset?: number): LimitWindow | null => {
   if (limit == null && remaining == null && reset == null) return null;
   const usedPct = limit && limit > 0 && remaining != null ? Math.max(0, Math.min(1, 1 - remaining / limit)) : undefined;
-  return { label, limit, remaining, usedPct, resetsAt: reset };
+  return { key, label, limit, remaining, usedPct, resetsAt: reset };
 };
 
 // Anthropic key/subscription family: "<prefix>-limit" / "-remaining" / "-reset".
 const suffixWindow = (h: Record<string, string>, prefix: string, label: string): LimitWindow | null =>
-  mkWindow(label, num(h, `${prefix}-limit`), num(h, `${prefix}-remaining`), resetMs(h[`${prefix}-reset`]));
+  mkWindow(`a:${prefix}`, label, num(h, `${prefix}-limit`), num(h, `${prefix}-remaining`), resetMs(h[`${prefix}-reset`]));
 
 // OpenAI family: "x-ratelimit-<field>-<type>" (field before type).
 const openaiWindow = (h: Record<string, string>, type: string, label: string): LimitWindow | null =>
-  mkWindow(label, num(h, `x-ratelimit-limit-${type}`), num(h, `x-ratelimit-remaining-${type}`), resetMs(h[`x-ratelimit-reset-${type}`]));
+  mkWindow(`o:${type}`, label, num(h, `x-ratelimit-limit-${type}`), num(h, `x-ratelimit-remaining-${type}`), resetMs(h[`x-ratelimit-reset-${type}`]));
 
 // Anthropic subscription (OAuth) unified windows use a utilization model, not limit/remaining:
 // "anthropic-ratelimit-unified-<window>-utilization" is a 0..1 used-fraction, "-reset" its epoch.
 // Windows are keyed by suffix ("5h", "7d", …); render whatever the API sends so a future premium
 // window shows without a code change.
-const UNIFIED_LABELS: Record<string, string> = { "5h": "5-hour limit", "7d": "Weekly · all models" };
+const UNIFIED_LABELS: Record<string, string> = { "5h": "5-hour limit", "7d": "Weekly · all models", "7d_oi": "Weekly · Opus" };
 
 function unifiedWindows(h: Record<string, string>): LimitWindow[] {
   const mk = (suffix: string): LimitWindow | null => {
     const util = num(h, `anthropic-ratelimit-unified-${suffix}-utilization`);
     const reset = resetMs(h[`anthropic-ratelimit-unified-${suffix}-reset`]);
     if (util == null && reset == null) return null;
-    return { label: UNIFIED_LABELS[suffix] ?? suffix, usedPct: util != null ? Math.max(0, Math.min(1, util)) : undefined, resetsAt: reset };
+    return { key: `u:${suffix}`, label: UNIFIED_LABELS[suffix] ?? suffix, usedPct: util != null ? Math.max(0, Math.min(1, util)) : undefined, resetsAt: reset };
   };
   const order = Object.keys(UNIFIED_LABELS);
   for (const k of Object.keys(h)) {
@@ -151,7 +152,7 @@ function codexWindows(h: Record<string, string>): LimitWindow[] {
     if (!winMin) return null; // unused slot
     const used = num(h, `x-codex-${slot}-used-percent`);
     const reset = resetMs(h[`x-codex-${slot}-reset-at`]) ?? resetMs(h[`x-codex-${slot}-reset-after-seconds`]);
-    return { label: codexLabel(winMin), usedPct: used != null ? Math.max(0, Math.min(1, used / 100)) : undefined, resetsAt: reset };
+    return { key: `cx:${slot}`, label: codexLabel(winMin), usedPct: used != null ? Math.max(0, Math.min(1, used / 100)) : undefined, resetsAt: reset };
   };
   return [mk("primary"), mk("secondary")].filter((w): w is LimitWindow => w != null);
 }
@@ -172,17 +173,40 @@ function parseWindows(h: Record<string, string>): LimitWindow[] {
 
 const RL_PREFIX = /^(anthropic-ratelimit|x-ratelimit|openai-)/;
 
+// A single response rarely carries every window the account has (e.g. the premium-weekly
+// "7d_oi" headers ride some responses and not others), so replacing the list wholesale made
+// rows flicker. Merge instead: a window present in the new parse is updated, a known one
+// merely absent is kept, and anything whose reset has passed is dropped. Only keyed windows
+// are retained — pre-key cached snapshots age out on their first merge.
+export function mergeWindows(prev: LimitWindow[] | undefined, next: LimitWindow[]): LimitWindow[] {
+  if (!prev?.length) return next;
+  const now = Date.now();
+  const id = (w: LimitWindow) => w.key ?? w.label;
+  const fresh = new Map(next.map((w) => [id(w), w]));
+  const out: LimitWindow[] = [];
+  for (const p of prev) {
+    const n = fresh.get(id(p));
+    if (n) {
+      out.push(n);
+      fresh.delete(id(p));
+    } else if (p.key && p.resetsAt != null && p.resetsAt > now) out.push(p);
+  }
+  out.push(...fresh.values());
+  return out;
+}
+
 // ---- mutations ----
 
 export function recordLimits(key: ProviderKey, headers: Record<string, string>): void {
   const prev = limits.get(key);
   limits.set(key, {
-    windows: parseWindows(headers),
+    windows: mergeWindows(prev?.windows, parseWindows(headers)),
     status: headers["anthropic-ratelimit-unified-status"] || headers["x-ratelimit-status"],
     balanceUsd: prev?.balanceUsd, // balance comes from a separate fetch — don't clobber it
     raw: headers,
     at: Date.now(),
   });
+  lastOk[key] = Date.now(); // fresh data landed (probe or live stream) — probes can stand down
   persistLimits();
   emit();
 }
@@ -212,19 +236,29 @@ export function setChatProvider(chatId: string, key: ProviderKey): void {
 
 // Refresh a provider's usage when the meter opens: OpenRouter → real $ balance; Claude/Codex
 // subscription → session/weekly windows via a direct authenticated request (the CLI hides response
-// headers, so Code mode has no other source). Throttled per provider so opening the popover
-// repeatedly doesn't spam the endpoint. `model` is the chat's model id (needed for the subscription
-// probe). No-op for API-key providers, which populate from real streams.
-const lastFetch: Record<ProviderKey, number> = {};
+// headers, so Code mode has no other source). Staleness-throttled per provider: a probe runs when
+// usage changed since the last good data (markUsageStale, stamped at turn end) or the TTL expired
+// (catches usage burned outside this app); a short attempt floor collapses hover/open/turn-end
+// bursts. `model` is the chat's model id (needed for the subscription probe). No-op for API-key
+// providers, which populate from real streams.
+const lastOk: Record<ProviderKey, number> = {}; // fresh data landed (probe success / stream headers)
+const lastTry: Record<ProviderKey, number> = {}; // probe attempt started — burst guard only
+const staleAt: Record<ProviderKey, number> = {}; // usage last changed (turn end)
 const FETCH_TTL = 120_000;
+const TRY_FLOOR = 5_000;
 
-async function fetchBalance(): Promise<void> {
+// Stamp "usage changed" (a turn just ended) so the next refreshUsage probes regardless of TTL.
+export function markUsageStale(key: ProviderKey | undefined): void {
+  if (key) staleAt[key] = Date.now();
+}
+
+async function fetchBalance(): Promise<boolean> {
   try {
     const apiKey = await getKey("openrouter");
-    if (!apiKey) return;
+    if (!apiKey) return false;
     const r = await invoke<{ data?: { usage?: number; limit?: number | null } }>("openrouter_key_status", { key: apiKey });
     const d = r?.data;
-    if (!d) return;
+    if (!d) return false;
     const prev = limits.get("openrouter");
     limits.set("openrouter", {
       windows: prev?.windows ?? [],
@@ -235,8 +269,10 @@ async function fetchBalance(): Promise<void> {
     });
     persistLimits();
     emit();
+    return true;
   } catch {
     /* balance is best-effort */
+    return false;
   }
 }
 
@@ -253,13 +289,17 @@ const setFetching = (key: ProviderKey, on: boolean): void => {
 export async function refreshUsage(key: ProviderKey | undefined, model?: string): Promise<void> {
   if (!key) return;
   const now = Date.now();
-  if (now - (lastFetch[key] ?? 0) < FETCH_TTL) return;
+  const ok = lastOk[key] ?? 0;
+  // Data newer than the last usage change and inside the TTL — nothing to fetch. A failed
+  // attempt doesn't stamp lastOk, so the next call retries after the short floor.
+  if ((staleAt[key] ?? 0) <= ok && now - ok < FETCH_TTL) return;
+  if (now - (lastTry[key] ?? 0) < TRY_FLOOR) return;
+  lastTry[key] = now;
 
   if (key === "openrouter") {
-    lastFetch[key] = now;
     setFetching(key, true);
     try {
-      await fetchBalance();
+      if (await fetchBalance()) lastOk[key] = Date.now();
     } finally {
       setFetching(key, false);
     }
@@ -268,7 +308,6 @@ export async function refreshUsage(key: ProviderKey | undefined, model?: string)
   if (key === "anthropic" && model) {
     const token = await getAnthropicAccessToken();
     if (!token) return; // API-key-only account: limits come from real streams, not this probe
-    lastFetch[key] = now;
     setFetching(key, true);
     try {
       const headers = await invoke<Record<string, string>>("anthropic_usage", { token, model });
@@ -283,7 +322,6 @@ export async function refreshUsage(key: ProviderKey | undefined, model?: string)
   if (key === "chatgpt" && model) {
     const auth = await getOpenAIAuth();
     if (!auth) return;
-    lastFetch[key] = now;
     setFetching(key, true);
     try {
       const headers = await invoke<Record<string, string>>("chatgpt_usage", { token: auth.token, accountId: auth.accountId, model });

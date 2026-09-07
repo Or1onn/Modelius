@@ -6,7 +6,7 @@ import { Icon } from "@/shared/ui/Icon";
 import { ProviderLogo } from "@/entities/model/ui/ProviderLogo";
 import { PROVIDERS, MODEL_BY_ID } from "@/entities/model/model/registry";
 import {
-  useCodeUsage, computeStats, computeModelUsage, computeHeat, usageFoot,
+  useCodeUsage, computeStats, computeModelUsage, computeHeat,
   STAT_ORDER, type RangeId,
 } from "@/pages/code/model/codeUsage";
 
@@ -32,7 +32,6 @@ export function CodeStats() {
 
   const stats = computeStats(sessions, range, modelName);
   const heat = computeHeat(sessions, range);
-  const foot = usageFoot(sessions, range);
   const models = computeModelUsage(sessions, range);
 
   return (
@@ -71,7 +70,6 @@ export function CodeStats() {
                 </div>
               ))}
             </div>
-            {foot && <div className="cd-stats-foot">{foot}</div>}
           </>
         ) : models.length === 0 ? (
           <div className="cd-stats-foot">No model usage yet.</div>

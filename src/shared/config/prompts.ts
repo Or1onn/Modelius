@@ -45,6 +45,15 @@ export const ROUTE_CLASSIFY_PROMPT =
   "architecture, math or proof. Reply with a single JSON object only, no prose, no code " +
   'fences: {"difficulty": <integer 0-100>, "kind": "trivial|general|code|complex"}.\n\n';
 
+// Name the git branch a Code chat's isolated worktree runs on, from the first prompt alone (the
+// branch is cut before the turn starts, so there is no answer to summarize yet). Output is
+// slugified again on the Rust side, so a stray capital or period is harmless.
+export const BRANCH_PROMPT =
+  "Write a git branch name for the task below. 2–4 words, English regardless of the task's " +
+  "language, lowercase, hyphen-separated, ASCII letters and digits only. Keep identifiers, " +
+  "file names and symbols from the task if they are short. No prefixes like feature/ or fix/, " +
+  "no quotes, no explanation. Reply with the name only.\n\nTask: ";
+
 // Name a new chat from its first exchange. Output used verbatim as the title:
 // title text only (no quotes, fences, or trailing punctuation).
 export const TITLE_PROMPT =

@@ -21,6 +21,8 @@ export interface ChatIndexEntry {
   updatedAt: number;
   pinned?: boolean; // user-pinned → floats to its own section
   cwd?: string; // Code mode only: project folder — the sidebar groups sessions by it
+  msgs?: number; // Code mode only: user-turn count — the usage hero reads these from the index
+  tokens?: number; // Code mode only: estimated transcript tokens (see codeIndexEntryFrom)
 }
 
 // Index-store factory: encrypted localStorage blob + in-RAM cache, reactive via a window event.

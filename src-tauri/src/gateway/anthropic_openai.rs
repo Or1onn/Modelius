@@ -80,7 +80,7 @@ pub(super) fn map_chat_tools(tools: &[Value], params_key: &str, filter: fn(&Valu
 
 
 // Anthropic Messages request → OpenAI chat/completions request.
-fn to_openai_request(req: &Value, base: &str, stream: bool, effort: &str) -> Value {
+pub(super) fn to_openai_request(req: &Value, base: &str, stream: bool, effort: &str) -> Value {
     let mut messages: Vec<Value> = Vec::new();
 
     // system: string or [{type:"text"}] blocks.
@@ -145,6 +145,21 @@ fn to_openai_request(req: &Value, base: &str, stream: bool, effort: &str) -> Val
                                     b.pointer("/source/data").and_then(|v| v.as_str()),
                                 ) {
                                     parts.push(json!({ "type": "image_url", "image_url": { "url": format!("data:{};base64,{}", mt, data) } }));
+                                }
+                            }
+                            // A PDF attachment (claude sends it as a document block) → the OpenAI
+                            // `file` part. Endpoints that can't read files reject it loudly, which
+                            // beats dropping the attachment the user just attached.
+                            Some("document") => {
+                                if let (Some(mt), Some(data)) = (
+                                    b.pointer("/source/media_type").and_then(|v| v.as_str()),
+                                    b.pointer("/source/data").and_then(|v| v.as_str()),
+                                ) {
+                                    let name = b.get("title").and_then(|v| v.as_str()).unwrap_or("document.pdf");
+                                    parts.push(json!({
+                                        "type": "file",
+                                        "file": { "filename": name, "file_data": format!("data:{};base64,{}", mt, data) }
+                                    }));
                                 }
                             }
                             _ => {}

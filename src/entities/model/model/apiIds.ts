@@ -51,20 +51,20 @@ export function toAnthropicModel(model: Model): string {
     "claude-opus-4": "claude-opus-4-20250514",
     "claude-sonnet-4": "claude-sonnet-4-20250514",
     "claude-haiku-3-5": "claude-3-5-haiku-20241022",
-    "claude-opus-4-8": "claude-opus-4-8",
-    "claude-sonnet-4-6": "claude-sonnet-4-6",
+    "claude-opus-5": "claude-opus-5",
+    "claude-sonnet-5": "claude-sonnet-5",
     "claude-haiku-4-5": "claude-haiku-4-5-20251001",
   };
   const byFamily: Record<ClaudeFamily, string> = {
-    opus: "claude-opus-4-8",
-    sonnet: "claude-sonnet-4-6",
+    opus: "claude-opus-5",
+    sonnet: "claude-sonnet-5",
     haiku: "claude-haiku-4-5-20251001",
   };
   return real[model.id] ?? byFamily[claudeFamilyForCap(model.cap)];
 }
 
 // output_config.effort tunes reasoning depth. Model-gated (others 400 on it); null = unsupported.
-// Two tiers by level set, not by family: "opus" is the full five (Opus 4.5–4.8, Sonnet 5,
+// Two tiers by level set, not by family: "opus" is the full five (Opus 4.5–5, Sonnet 5,
 // Fable/Mythos 5), "sonnet" the three older Sonnet 4.6 allows. Fallback only — the live
 // /v1/models capabilities are the source of truth when the model list has been fetched.
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
@@ -72,7 +72,7 @@ export type EffortTier = "opus" | "sonnet";
 
 export function anthropicEffortTier(model: string): EffortTier | null {
   if (/haiku/i.test(model)) return null;
-  if (/opus-4-[5-8]\b|sonnet-5\b|fable-5\b|mythos-5\b/i.test(model)) return "opus";
+  if (/opus-4-[5-8]\b|opus-5\b|sonnet-5\b|fable-5\b|mythos-5\b/i.test(model)) return "opus";
   if (/sonnet-4-6\b/i.test(model)) return "sonnet";
   return null;
 }

@@ -3,9 +3,12 @@
 // command drives the harness and its raw output is decoded into an AI SDK message the transcript
 // renders. Streaming state lives in a module-level Chat (codeChatRegistry) so a run survives a
 // chat/screen switch.
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useChat } from "@ai-sdk/react";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { isTauri } from "@/shared/api/tauri";
 import { Icon } from "@/shared/ui/Icon";
 import { useOutsideClick } from "@/shared/lib/useOutsideClick";
 import { refreshUsage, useUsageLimits, useUsageFetching, useSpend } from "@/entities/session/model/usageLimits";
@@ -17,16 +20,19 @@ import { useHarnessStatuses, refreshHarnessStatuses, installHarness, cliLoggedIn
 import { hasAnthropicOAuth } from "@/entities/session/model/anthropicSession";
 import { hasOpenAIOAuth } from "@/entities/session/model/openaiSession";
 import { AuthModal } from "@/pages/code/ui/AuthModal";
-import { choiceKey, codeContextTokens, defaultModelForHarness, type CodeModelChoice } from "@/entities/agent/model/codeModel";
+import { choiceKey, codeContextTokens, codeProviderKey, defaultModelForHarness, type CodeModelChoice } from "@/entities/agent/model/codeModel";
 import { ModelMenu, type ModelMenuItem } from "@/entities/model/ui/ModelMenu";
 import { peekCodeModelGroups, listCodeModelGroups, type CodeModelGroup } from "@/entities/agent/model/codeModels";
 import { clearModelCache } from "@/shared/lib/modelCache";
 import { useGateways } from "@/entities/agent/model/gateways";
 import { GatewayModal } from "@/pages/code/ui/GatewayModal";
-import { listBranches, checkoutBranch } from "@/entities/agent/model/git";
-import { getCodeChat, getCodeConfig, getCodeTitle, setCodeConfig, subscribeCodeConfig, isEmptyCodeChat, codeEffortInfo } from "@/features/run-agent/lib/codeChatRegistry";
+import { listBranches, checkoutBranch, createWorktree } from "@/entities/agent/model/git";
+import { generateBranchName } from "@/features/run-agent/lib/branchName";
+import { WorktreePanel } from "@/pages/code/ui/WorktreePanel";
+import { getCodeChat, getCodeConfig, getCodeTitle, setCodeConfig, subscribeCodeConfig, isEmptyCodeChat, isCodeChatLoaded, codeEffortInfo, effectiveCwd } from "@/features/run-agent/lib/codeChatRegistry";
 import { fmtTokens } from "@/pages/code/model/codeUsage";
 import { getTurnStatus, subscribeTurnStatus } from "@/features/run-agent/lib/turnStatus";
+import { getPromptSuggestion, setPromptSuggestion, subscribePromptSuggestion } from "@/features/run-agent/lib/promptSuggestion";
 import { codeToMarkdown } from "@/features/export-chat/model/serializeCode";
 import { copyToClipboard } from "@/features/export-chat/lib/save";
 import { AssistantMessage } from "@/pages/code/ui/messageParts";
@@ -38,9 +44,12 @@ import { basename } from "@/shared/lib/paths";
 import { lastOfRole } from "@/shared/lib/lastOfRole";
 import { readDataUrl } from "@/pages/chat/lib/files";
 
-// A staged image attachment (base64 for the model, data URL for the chip thumbnail) — same shape
-// as Chat's ImageRef.
-interface StagedImage { name: string; mime: string; data: string; dataUrl: string }
+// A staged inline attachment — an image or a PDF (base64 for the model, data URL for the chip
+// thumbnail). Images extend Chat's ImageRef shape; PDFs render as a named chip instead.
+interface StagedAttachment { name: string; mime: string; data: string; dataUrl: string }
+
+// The MIME types that ride the turn inline; everything else is attached by path (pickFiles).
+const INLINE_MIME = (t: string) => t.startsWith("image/") || t === "application/pdf";
 
 const EFFORT_LABEL: Record<EffortLevel, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "X-high", max: "Max", ultra: "Ultra" };
 
@@ -127,16 +136,6 @@ function Picker({ label, logo, items, onSelect, onOpen, down, btnClass, menuHead
   );
 }
 
-// The account key this code chat's model bills against (for the usage meter). Native CLI logins map
-// to their subscription account; a connected key uses its provider id. Others (gateway/Ollama) have
-// no first-class usage surface here.
-function codeProviderKey(model: CodeModelChoice): string | undefined {
-  if (model.kind === "anthropic") return "anthropic";
-  if (model.kind === "codex") return "chatgpt";
-  if (model.kind === "connected") return model.providerId;
-  return undefined;
-}
-
 // Context-window fill ring (Claude Code Desktop style): an arc that fills as the prompt grows.
 function ContextRing({ tokens, limit, cost, modelName, providerKey, modelId }: { tokens: number; limit: number; cost: number | null; modelName: string; providerKey?: string; modelId?: string }) {
   const [open, setOpen] = useState(false);
@@ -187,7 +186,7 @@ function ContextRing({ tokens, limit, cost, modelName, providerKey, modelId }: {
           {/* Subscription rate-limit windows, one labelled bar each (Claude Code's "Plan usage limits"). */}
           {windows.length > 0 && (
             <div className="cd-ctx-plan">
-              <div className="cd-ctx-plan-head">Plan usage limits</div>
+              <div className="cd-ctx-plan-head">Plan usage limits{fetching ? " · updating…" : ""}</div>
               {windows.map((w, i) => {
                 const used = winUsedPct(w);
                 const reset = fmtReset(w.resetsAt);
@@ -239,14 +238,19 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const subscribe = useCallback((cb: () => void) => subscribeCodeConfig(chatId, cb), [chatId]);
   const getSnapshot = useCallback(() => getCodeConfig(chatId), [chatId]);
   const config = useSyncExternalStore(subscribe, getSnapshot);
-  const { harness: harnessId, model, cwd, permissionMode, effort } = config;
+  const { harness: harnessId, model, cwd, permissionMode, effort, worktreeArmed, worktreeBase, worktree } = config;
+  // Where the harness actually runs — the isolated checkout once this chat has one.
+  const runCwd = effectiveCwd(config);
   // Generated chat name (shares the config listener set); falls back to the first-message snippet.
   const genTitle = useSyncExternalStore(subscribe, useCallback(() => getCodeTitle(chatId), [chatId]));
+  // Body restore settled — until then render neither hero nor transcript (prevents the hero
+  // flashing, and its usage aggregation running, on every open of a saved chat).
+  const loaded = useSyncExternalStore(subscribe, useCallback(() => isCodeChatLoaded(chatId), [chatId]));
 
   const [input, setInput] = useState("");
-  // Staged attachments for the next turn: images (sent as native vision blocks) and files (sent by
-  // absolute path — the agent reads them in place). Cleared on send.
-  const [images, setImages] = useState<StagedImage[]>([]);
+  // Staged attachments for the next turn: inline ones (images as native vision blocks, PDFs as
+  // document blocks) and files (sent by absolute path — the agent reads them in place). Cleared on send.
+  const [inline, setInline] = useState<StagedAttachment[]>([]);
   const [files, setFiles] = useState<{ name: string; path: string }[]>([]);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -276,6 +280,9 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const [recents, setRecents] = useState<string[]>(() => getRecentFolders());
   const [branches, setBranches] = useState<string[]>([]);
   const [branch, setBranch] = useState("");
+  const [wtOpen, setWtOpen] = useState(false); // the worktree changes panel
+  const [wtError, setWtError] = useState(""); // creation failed — shown above the composer
+  const [wtBusy, setWtBusy] = useState(false); // naming + cutting the checkout, before the turn starts
   const [modelGroups, setModelGroups] = useState<CodeModelGroup[]>(() => peekCodeModelGroups(harnessId));
   const [gatewaysOpen, setGatewaysOpen] = useState(false);
   const [authNeed, setAuthNeed] = useState<NativeKind | null>(null);
@@ -290,6 +297,28 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true); // at bottom → follow the stream; scrolling up unpins so the user can read back
   const [atBottom, setAtBottom] = useState(true); // mirrors pinnedRef for the floating scroll-to-bottom button
+
+  // Windowed transcript: mount only the newest messages; scrolling near the top (or the button)
+  // reveals earlier ones from the already-loaded array. A render window only — resume ids, usage
+  // and export still read the full message list. The window counts from the tail, so the chat
+  // opens at its (visible) bottom exactly as before.
+  const WINDOW = 20;
+  const [visibleCount, setVisibleCount] = useState(WINDOW);
+  const scrollAnchor = useRef<{ h: number; top: number } | null>(null); // pre-grow scroll geometry
+  const showEarlier = () => {
+    const el = scrollRef.current;
+    if (!el || scrollAnchor.current) return; // one grow per layout pass
+    scrollAnchor.current = { h: el.scrollHeight, top: el.scrollTop };
+    setVisibleCount((c) => c + WINDOW);
+  };
+  // Older messages mount ABOVE the viewport — restore the distance to the bottom so the content
+  // the user was reading doesn't jump (scroll anchoring is suppressed at scrollTop ≈ 0).
+  useLayoutEffect(() => {
+    const a = scrollAnchor.current;
+    const el = scrollRef.current;
+    if (a && el) el.scrollTop = el.scrollHeight - a.h + a.top;
+    scrollAnchor.current = null;
+  }, [visibleCount]);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const hintRef = useRef<HTMLDivElement>(null);
   const [showHint, setShowHint] = useState(false);
@@ -310,6 +339,15 @@ export function CodeScreen({ chatId }: { chatId: string }) {
   }, [busy]);
   const silentMs = turnStatus.activityAt ? Date.now() - turnStatus.activityAt : 0;
   const workNote = busy ? (turnStatus.note ?? (silentMs > 15_000 ? "waiting for the model…" : null)) : null;
+
+  // The CLI's predicted next prompt (claude only — see promptSuggestion.ts). Offered as the
+  // composer's placeholder and accepted with Tab, but only into an empty composer: overwriting
+  // text the user is already typing would be worse than not suggesting at all.
+  const suggestion = useSyncExternalStore(
+    useCallback((cb: () => void) => subscribePromptSuggestion(chatId, cb), [chatId]),
+    useCallback(() => getPromptSuggestion(chatId), [chatId])
+  );
+  const ghost = !busy && cwd && !input ? suggestion : "";
 
   // Prompt-token fill + cost from the last assistant turn that carries usage — a cancelled or
   // errored turn may have no token metadata; falling back keeps the ring from resetting to 0.
@@ -394,17 +432,18 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     void listBranches(cwd).then((info) => {
       if (!alive) return;
       setBranches(info.branches);
+      setBranch(info.current);
+      // An isolated chat works on its own branch elsewhere — never move the folder's HEAD for it.
+      if (worktree) return;
       // Restore the branch this folder was last left on (checkout may fail on a dirty tree → revert).
       const remembered = getFolderBranch(cwd);
       if (remembered && remembered !== info.current && info.branches.includes(remembered)) {
         setBranch(remembered);
         checkoutBranch(cwd, remembered).catch(() => setBranch(info.current));
-      } else {
-        setBranch(info.current);
       }
     });
     return () => { alive = false; };
-  }, [cwd]);
+  }, [cwd, worktree]);
 
   const autosize = useAutosize(taRef, 200);
 
@@ -432,12 +471,30 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     });
   }
 
+  // One control, two meanings: with isolation armed the list picks the *base* to branch from (no
+  // checkout happens); otherwise it switches the folder's branch as before.
   function selectBranch(next: string) {
-    if (busy || next === branch) return;
+    if (busy || worktree) return;
+    if (worktreeArmed) {
+      setCodeConfig(chatId, { worktreeBase: next });
+      return;
+    }
+    if (next === branch) return;
     const prev = branch;
     setBranch(next);
     setFolderBranch(cwd, next);
     checkoutBranch(cwd, next).catch(() => setBranch(prev));
+  }
+
+  // Arming is a pre-flight choice: the checkout is cut on the first send, and the CLI process is
+  // spawned with that path — hence empty chats only.
+  function toggleWorktree() {
+    if (active || worktree) return;
+    setWtError("");
+    setCodeConfig(chatId, {
+      worktreeArmed: !worktreeArmed,
+      worktreeBase: worktreeArmed ? "" : worktreeBase || branch,
+    });
   }
 
   // Native picks run on the CLI's own account: true when the send must wait for a login step
@@ -460,17 +517,55 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     return true;
   }
 
-  // Stage image files (drop/paste/pick) → base64 for the model + a data URL for the chip thumbnail.
-  // Non-images are ignored here (files go through pickFiles by path).
-  async function addImages(list: ArrayLike<File>) {
+  // Stage images and PDFs (drop/paste/pick) → base64 for the model + a data URL for the chip.
+  // Other types are ignored here (they go through pickFiles by path).
+  async function addInline(list: ArrayLike<File>) {
     for (const file of Array.from(list)) {
-      if (!file.type.startsWith("image/")) continue;
+      if (!INLINE_MIME(file.type)) continue;
       const url = await readDataUrl(file).catch(() => "");
       const data = url.split(",")[1];
       if (!data) continue;
-      setImages((p) => (p.some((x) => x.dataUrl === url) ? p : [...p, { name: file.name, mime: file.type, data, dataUrl: url }]));
+      setInline((p) => (p.some((x) => x.dataUrl === url) ? p : [...p, { name: file.name, mime: file.type, data, dataUrl: url }]));
     }
   }
+
+  // Files dropped on the window arrive as paths (see the drag-drop effect). Images and PDFs are
+  // read into the turn as content blocks; everything else — and anything too big or unreadable —
+  // falls back to a path attachment, exactly like the Files picker.
+  const addDroppedPaths = useCallback(async (paths: string[]) => {
+    for (const path of paths) {
+      const file = await invoke<{ name: string; mime: string; data: string }>("attachment_read", { path }).catch(() => null);
+      if (file) {
+        const dataUrl = `data:${file.mime};base64,${file.data}`;
+        setInline((p) => (p.some((x) => x.dataUrl === dataUrl) ? p : [...p, { name: file.name, mime: file.mime, data: file.data, dataUrl }]));
+      } else {
+        setFiles((p) => (p.some((f) => f.path === path) ? p : [...p, { name: basename(path), path }]));
+      }
+    }
+  }, []);
+
+  // Tauri owns the OS drag-drop, so on Windows the webview never sees HTML drop events — the paths
+  // come through this webview event instead. `enter`/`over` drive the drop affordance; the HTML
+  // handlers on the composer stay for the browser dev build, where this event never fires.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let stop: (() => void) | undefined;
+    let gone = false;
+    void getCurrentWebview()
+      .onDragDropEvent((e) => {
+        if (e.payload.type === "drop") {
+          setDragging(false);
+          void addDroppedPaths(e.payload.paths);
+        } else {
+          setDragging(e.payload.type !== "leave");
+        }
+      })
+      .then((un) => (gone ? un() : (stop = un)));
+    return () => {
+      gone = true;
+      stop?.();
+    };
+  }, [addDroppedPaths]);
 
   // Attach files by absolute path (Tauri dialog) — the agent's CLI reads them in place, so any type
   // or size works without copying bytes into the prompt.
@@ -485,21 +580,50 @@ export function CodeScreen({ chatId }: { chatId: string }) {
     });
   }
 
+  // Tab (or the hint chip) fills the composer with the CLI's suggested prompt — it lands as
+  // ordinary editable text, so it can be reworded before sending. Consumed once.
+  function acceptSuggestion() {
+    if (!ghost) return;
+    setInput(ghost);
+    setPromptSuggestion(chatId, "");
+    taRef.current?.focus();
+    setTimeout(autosize, 0); // after React paints the new value, so scrollHeight is real
+  }
+
   // `force` = user chose "continue anyway" in the sign-in gate.
   async function send(force = false) {
     const text = input.trim();
-    if (busy) return;
+    if (busy || wtBusy) return;
     if (!cwd) { pokeFolder(); return; }
-    if (!text && images.length === 0 && files.length === 0) return;
+    if (!text && inline.length === 0 && files.length === 0) return;
     if (!force && (await needsLoginGate())) return;
+    // First send of an isolated chat: cut the branch and its checkout now, so the CLI process —
+    // whose cwd is fixed for the life of the session — starts inside the worktree. The branch name
+    // comes from a cheap model (English whatever the prompt's language); when that misses, the raw
+    // prompt goes through and Rust transliterates it.
+    if (worktreeArmed && !worktree) {
+      setWtBusy(true);
+      let created: Awaited<ReturnType<typeof createWorktree>> | null = null;
+      try {
+        const named = await generateBranchName(text);
+        created = await createWorktree(cwd, worktreeBase, named || text || "session");
+      } catch (e: unknown) {
+        setWtError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setWtBusy(false);
+      }
+      if (!created) return;
+      setWtError("");
+      setCodeConfig(chatId, { worktree: created });
+    }
     // Attached files ride the prompt as a path list; the agent reads them with its own tools.
     const fileNote = files.length ? "\n\nAttached files (read them):\n" + files.map((f) => "- " + f.path).join("\n") : "";
     const fullText = text + fileNote;
-    // Images become AI SDK `file` parts (data URL) → persisted + rendered, and extracted for the CLI
-    // in resolveSend.
-    const imgParts = images.map((im) => ({ type: "file" as const, mediaType: im.mime, filename: im.name, url: im.dataUrl }));
+    // Images/PDFs become AI SDK `file` parts (data URL) → persisted + rendered, and extracted for
+    // the CLI in resolveSend.
+    const imgParts = inline.map((at) => ({ type: "file" as const, mediaType: at.mime, filename: at.name, url: at.dataUrl }));
     setInput("");
-    setImages([]);
+    setInline([]);
     setFiles([]);
     setTimeout(() => { if (taRef.current) taRef.current.style.height = "auto"; }, 0);
     if (imgParts.length) void sendMessage({ text: fullText, files: imgParts });
@@ -532,22 +656,36 @@ export function CodeScreen({ chatId }: { chatId: string }) {
 
   return (
     <div className="cd-wrap">
-      {/* Once a session is under way the folder chip lives in a slim top bar with the chat title. */}
-      {active && (
-        <header className="cd-top" data-tauri-drag-region>
-          <span className="cd-top-title" title={chatTitle}>{chatTitle}</span>
-          <button className="cd-top-folder" onClick={pickFolder} title="Change project folder">
-            <Icon name="folder" size={14} />
-            {basename(cwd)}
-          </button>
-          <button className="cd-top-act" onClick={exportChat} title="Copy transcript as Markdown (test)">
-            <Icon name={exported ? "check" : "copy"} size={16} />
-          </button>
-          <button className={"cd-top-act" + (termOpen ? " on" : "")} onClick={toggleTerm} title="Toggle terminal">
-            <Icon name="terminal" size={16} />
-          </button>
-        </header>
-      )}
+      {/* Once a session is under way the folder chip lives in a slim top bar with the chat title.
+          Before that the bar stays as a bare strip so the window is still draggable by its top edge. */}
+      <header className={"cd-top" + (active ? "" : " bare")} data-tauri-drag-region>
+        {active && (
+          <>
+            <span className="cd-top-title" title={chatTitle}>{chatTitle}</span>
+            <button
+              className="cd-top-folder"
+              onClick={pickFolder}
+              disabled={!!worktree}
+              title={worktree ? "This session is bound to a worktree of this folder" : "Change project folder"}
+            >
+              <Icon name="folder" size={14} />
+              {basename(cwd)}
+            </button>
+            {worktree && (
+              <button className="cd-top-folder" onClick={() => setWtOpen(true)} title={worktree.path}>
+                <Icon name="gitBranch" size={14} />
+                {worktree.branch}
+              </button>
+            )}
+            <button className="cd-top-act" onClick={exportChat} title="Copy transcript as Markdown (test)">
+              <Icon name={exported ? "check" : "copy"} size={16} />
+            </button>
+            <button className={"cd-top-act" + (termOpen ? " on" : "")} onClick={toggleTerm} title="Toggle terminal">
+              <Icon name="terminal" size={16} />
+            </button>
+          </>
+        )}
+      </header>
 
       {/* Transcript */}
       <div className="cd-thread-scroll">
@@ -559,30 +697,52 @@ export function CodeScreen({ chatId }: { chatId: string }) {
           const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
           pinnedRef.current = pinned;
           setAtBottom(pinned);
+          if (el.scrollTop < 300 && messages.length > visibleCount) showEarlier();
         }}
       >
         <div className="cd-thread-inner">
-          {messages.length === 0 && !busy && <CodeStats />}
-          {messages.map((m, i) =>
+          {messages.length === 0 && !busy && loaded && <CodeStats />}
+          {messages.length > visibleCount && (
+            <button className="cd-earlier" onClick={showEarlier}>
+              Show {messages.length - visibleCount} earlier {messages.length - visibleCount === 1 ? "message" : "messages"}
+            </button>
+          )}
+          {messages.slice(-visibleCount).map((m, i, shown) =>
             m.role === "user" ? (
+              (m.metadata as { cliResume?: boolean } | undefined)?.cliResume ? (
+                // Synthetic turn claiming a CLI-initiated continuation (background agent
+                // finished while the chat was idle) — a note, not a user bubble.
+                <div key={m.id} className="cd-resume-note" role="status">
+                  <span className="cd-work-dot" />
+                  <span>Background agent finished — session resumed</span>
+                </div>
+              ) : (
               <div key={m.id} className="cd-user">
                 <div className="cd-user-bubble">
-                  {userImages(m).length > 0 && (
+                  {userAttachments(m).length > 0 && (
                     <div className="cd-user-imgs">
-                      {userImages(m).map((src, k) => (
-                        <img key={k} src={src} alt="" />
-                      ))}
+                      {userAttachments(m).map((at, k) =>
+                        at.mime.startsWith("image/") ? (
+                          <img key={k} src={at.url} alt="" />
+                        ) : (
+                          <span className="cd-user-doc" key={k} title={at.name}>
+                            <Icon name="attach" size={13} />
+                            {at.name}
+                          </span>
+                        )
+                      )}
                     </div>
                   )}
                   {userText(m) && <span className="cd-user-text">{userText(m)}</span>}
                 </div>
               </div>
+              )
             ) : (
               <AssistantMessage
                 key={m.id}
                 message={m}
-                streaming={busy && i === messages.length - 1}
-                onApprovePlan={!busy && i === messages.length - 1 ? approvePlan : undefined}
+                streaming={busy && i === shown.length - 1}
+                onApprovePlan={!busy && i === shown.length - 1 ? approvePlan : undefined}
                 chatId={chatId}
               />
             )
@@ -625,9 +785,48 @@ export function CodeScreen({ chatId }: { chatId: string }) {
 
       {/* Composer */}
       <div className="cd-composer-wrap">
-        <div className="cd-plate">
+        <div className={"cd-plate" + (dragging ? " dragging" : "")}>
+          {dragging && (
+            // Drop affordance — the whole plate is the target while a file hovers the window.
+            <div className="cd-drop-veil" role="status">
+              <div className="cd-drop-card">
+                <span className="cd-drop-icon"><Icon name="upload" size={19} /></span>
+                <span className="cd-drop-title">Drop to attach</span>
+                <span className="cd-drop-sub">Images and PDFs ride the turn — other files attach by path</span>
+              </div>
+            </div>
+          )}
           {/* Workspace folder selector — enveloping plate wrapping the prompt input (new session only) */}
-          {!active && <div className="cd-plate-head">{folderPicker}</div>}
+          {!active && (
+            <div className="cd-plate-head">
+              {folderPicker}
+              {/* Isolation toggle — only meaningful in a git repo, and only before the session's
+                  CLI process (whose cwd is fixed) exists. */}
+              {branches.length > 0 && (
+                <button
+                  className={"cd-wt-toggle" + (worktreeArmed ? " on" : "")}
+                  onClick={toggleWorktree}
+                  title="Work on a new branch in a separate checkout — your folder keeps its branch and its uncommitted work"
+                >
+                  <span className="cd-wt-switch" />
+                  <Icon name="gitBranch" size={13} />
+                  <span>Isolate in worktree</span>
+                </button>
+              )}
+            </div>
+          )}
+          {wtError && (
+            <div className="cd-turn-error" role="alert">
+              <Icon name="close" size={13} />
+              <span>{wtError}</span>
+            </div>
+          )}
+          {wtBusy && (
+            <div className="cd-wt-status" role="status">
+              <span className="cd-wt-status-spin" />
+              <span>Naming the branch and cutting the worktree…</span>
+            </div>
+          )}
           {showHint && !cwd && (
             <div className="cd-folder-hint" role="status" ref={hintRef}>
               <div className="cd-folder-hint-txt">
@@ -638,21 +837,35 @@ export function CodeScreen({ chatId }: { chatId: string }) {
             </div>
           )}
           <div
-            className={"cd-composer" + (busy ? " busy" : "") + (dragging ? " dragover" : "")}
+            className={"cd-composer" + (busy ? " busy" : "")}
             onDragOver={(e) => { e.preventDefault(); if (!dragging) setDragging(true); }}
             onDragLeave={(e) => { if (e.currentTarget === e.target) setDragging(false); }}
-            onDrop={(e) => { e.preventDefault(); setDragging(false); if (e.dataTransfer.files.length) void addImages(e.dataTransfer.files); }}
+            onDrop={(e) => { e.preventDefault(); setDragging(false); if (e.dataTransfer.files.length) void addInline(e.dataTransfer.files); }}
           >
-          {(images.length > 0 || files.length > 0) && (
+          {(inline.length > 0 || files.length > 0) && (
             <div className="composer-chips">
-              {images.map((im, k) => (
-                <div className="image-chip" key={"img" + k}>
-                  <img src={im.dataUrl} alt={im.name} title={im.name} />
-                  <button className="image-chip-x" onClick={() => setImages((p) => p.filter((_, j) => j !== k))} title="Remove">
-                    <Icon name="close" size={11} />
-                  </button>
-                </div>
-              ))}
+              {inline.map((at, k) =>
+                at.mime.startsWith("image/") ? (
+                  <div className="image-chip" key={"img" + k}>
+                    <img src={at.dataUrl} alt={at.name} title={at.name} />
+                    <button className="image-chip-x" onClick={() => setInline((p) => p.filter((_, j) => j !== k))} title="Remove">
+                      <Icon name="close" size={11} />
+                    </button>
+                  </div>
+                ) : (
+                  // A PDF has no thumbnail — show it as a named chip, like a path attachment.
+                  <div className="paste-chip" key={"img" + k}>
+                    <span className="paste-chip-body" title={at.name}>
+                      <Icon name="attach" size={13} />
+                      <span className="paste-chip-title">{at.name}</span>
+                      <span className="paste-chip-sub">PDF</span>
+                    </span>
+                    <button className="paste-chip-x" onClick={() => setInline((p) => p.filter((_, j) => j !== k))} title="Remove">
+                      <Icon name="close" size={12} />
+                    </button>
+                  </div>
+                )
+              )}
               {files.map((f, k) => (
                 <div className="paste-chip" key={"file" + k}>
                   <span className="paste-chip-body" title={f.path}>
@@ -668,24 +881,29 @@ export function CodeScreen({ chatId }: { chatId: string }) {
           )}
           <textarea
             ref={taRef}
+            className={ghost ? "has-ghost" : undefined}
             value={input}
             readOnly={busy}
-            placeholder={busy ? "Agent is working…" : cwd ? "Describe a change, a bug, or a task…" : "Select a project folder first…"}
+            placeholder={busy ? "Agent is working…" : ghost || (cwd ? "Describe a change, a bug, or a task…" : "Select a project folder first…")}
             rows={1}
             onChange={(e) => { setInput(e.target.value); autosize(); }}
             onPaste={(e) => {
-              const imgs = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith("image/"));
-              if (imgs.length) { e.preventDefault(); void addImages(imgs); }
+              const pasted = Array.from(e.clipboardData.files).filter((f) => INLINE_MIME(f.type));
+              if (pasted.length) { e.preventDefault(); void addInline(pasted); }
             }}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }}
+            onKeyDown={(e) => {
+              // Tab accepts the suggestion when there is one; otherwise it keeps moving focus.
+              if (e.key === "Tab" && !e.shiftKey && ghost) { e.preventDefault(); acceptSuggestion(); return; }
+              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
+            }}
           />
           <input
             ref={imgInputRef}
             type="file"
-            accept="image/*"
+            accept="image/*,application/pdf"
             multiple
             style={{ display: "none" }}
-            onChange={(e) => { if (e.target.files?.length) void addImages(e.target.files); e.target.value = ""; }}
+            onChange={(e) => { if (e.target.files?.length) void addInline(e.target.files); e.target.value = ""; }}
           />
           <div className="cd-comp-bar">
             <div className="comp-add-wrap" ref={addMenuRef}>
@@ -700,7 +918,7 @@ export function CodeScreen({ chatId }: { chatId: string }) {
                 <div className="comp-add-menu">
                   <button className="model-menu-item" onClick={() => { setAddMenuOpen(false); imgInputRef.current?.click(); }}>
                     <span className="model-menu-logo"><Icon name="image" size={15} /></span>
-                    <span style={{ flex: 1 }}>Images &amp; media</span>
+                    <span style={{ flex: 1 }}>Images &amp; PDFs</span>
                   </button>
                   <button className="model-menu-item" onClick={() => { setAddMenuOpen(false); void pickFiles(); }}>
                     <span className="model-menu-logo"><Icon name="attach" size={15} /></span>
@@ -762,13 +980,19 @@ export function CodeScreen({ chatId }: { chatId: string }) {
               onOpen={() => void refreshHarnessStatuses()}
             />
             <span style={{ flex: 1 }} />
+            {ghost && (
+              <button className="cd-ghost-hint" onClick={acceptSuggestion} title={ghost}>
+                <span className="cd-ghost-key">Tab</span>
+                <span>use suggestion</span>
+              </button>
+            )}
             <button
-              className={"cd-send" + (busy ? " stop" : (input.trim() || images.length || files.length) && cwd ? " on" : "")}
+              className={"cd-send" + (busy ? " stop" : wtBusy || ((input.trim() || inline.length || files.length) && cwd) ? " on" : "")}
               onClick={() => (busy ? stop() : void send())}
-              disabled={!busy && !(input.trim() || images.length || files.length)}
-              title={busy ? "Stop" : "Send"}
+              disabled={!busy && !wtBusy && !(input.trim() || inline.length || files.length)}
+              title={busy ? "Stop" : wtBusy ? "Preparing the worktree…" : "Send"}
             >
-              {busy ? <span className="cd-send-spin" /> : <Icon name="arrowUp" size={16} />}
+              {busy || wtBusy ? <span className="cd-send-spin" /> : <Icon name="arrowUp" size={16} />}
             </button>
           </div>
         </div>
@@ -795,28 +1019,52 @@ export function CodeScreen({ chatId }: { chatId: string }) {
             />
           )}
           <span style={{ flex: 1 }} />
-          {branches.length > 0 && (
+          {/* Same slot, three states: the worktree's own branch (opens the changes panel), the base
+              to branch from once isolation is armed, or the plain folder branch switcher. */}
+          {worktree ? (
+            <button className="cd-model-pick cd-wt-chip" onClick={() => setWtOpen(true)} title={worktree.path}>
+              <Icon name="gitBranch" size={13} />
+              <span style={{ fontWeight: 520 }}>{worktree.branch}</span>
+              <span className="cd-wt-chip-sub">changes</span>
+            </button>
+          ) : branches.length > 0 ? (
             <Picker
-              label={branch || "branch"}
+              label={worktreeArmed ? `Base: ${worktreeBase || branch || "HEAD"}` : branch || "branch"}
               logo={<Icon name="gitBranch" size={13} />}
-              items={branches.map((b) => ({ id: b, label: b, check: b === branch }))}
+              menuHeader={worktreeArmed ? "Branch from" : undefined}
+              items={branches.map((b) => ({
+                id: b,
+                label: b,
+                check: b === (worktreeArmed ? worktreeBase || branch : branch),
+              }))}
               onSelect={selectBranch}
             />
-          )}
+          ) : null}
           <ContextRing tokens={contextTokens} limit={codeContextTokens(model)} cost={cost} modelName={model.label} providerKey={codeProviderKey(model)} modelId={model.id} />
         </div>
       </div>
 
       {/* Bottom terminal — real PTY, docked below the composer so the chat sits above it. */}
-      {termOpen && cwd && (
+      {termOpen && runCwd && (
         <TerminalPanel
-          cwd={cwd}
+          cwd={runCwd}
           onClose={() => { setTermOpen(false); setTermCmd(null); }}
           zoom={zoom}
           bootstrapCommand={termCmd ?? undefined}
         />
       )}
 
+      {wtOpen && worktree && (
+        <WorktreePanel
+          worktree={worktree}
+          title={chatTitle}
+          busy={busy}
+          onClose={() => setWtOpen(false)}
+          // The checkout is gone (merged, kept as a branch, or discarded) — the chat falls back to
+          // the project folder for any further turn.
+          onCleared={() => setCodeConfig(chatId, { worktree: null, worktreeArmed: false })}
+        />
+      )}
       {gatewaysOpen && <GatewayModal onClose={() => setGatewaysOpen(false)} />}
       {authNeed && (
         <AuthModal
@@ -839,9 +1087,10 @@ function userText(m: { parts: { type: string }[] }): string {
     .join("\n");
 }
 
-// Data URLs of image `file` parts on a user message — rendered as thumbnails in the bubble.
-function userImages(m: { parts: { type: string }[] }): string[] {
+// Inline `file` parts on a user message — images render as thumbnails in the bubble, PDFs as a
+// named chip (there is nothing to show for them).
+function userAttachments(m: { parts: { type: string }[] }): { url: string; mime: string; name: string }[] {
   return (m.parts as any[])
-    .filter((p) => p.type === "file" && typeof p.url === "string" && String(p.mediaType ?? "").startsWith("image/"))
-    .map((p) => p.url as string);
+    .filter((p) => p.type === "file" && typeof p.url === "string" && INLINE_MIME(String(p.mediaType ?? "")))
+    .map((p) => ({ url: p.url as string, mime: String(p.mediaType ?? ""), name: typeof p.filename === "string" ? p.filename : "document.pdf" }));
 }

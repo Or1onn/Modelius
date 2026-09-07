@@ -4,7 +4,7 @@
 //  - ≥3 consecutive exploration tools (Read/Grep/Glob/Web*) collapse into one "Explored N" group;
 //  - when a final text answer follows the tools, the tools fold behind an "N steps" toggle and the
 //    answer renders prominently.
-import { useState, type ReactNode } from "react";
+import { memo, useState, type ReactNode } from "react";
 import type { UIMessage } from "ai";
 import { Icon } from "@/shared/ui/Icon";
 import { Markdown } from "@/shared/lib/markdown";
@@ -322,11 +322,12 @@ interface AgentQuestion {
 // the permission answer carries `updatedInput.answers` ({question → chosen label, multiSelect
 // joined with ", "}). Every question also gets an "Other…" free-text answer (CLI parity — the
 // tool contract promises the user can always type a custom reply). Deny = skip the question.
+// Discuss = deny with a steering message: explain the options in prose instead of re-asking.
 function QuestionCard({ data }: { data: PermissionRequestData }) {
   const [picked, setPicked] = useState<Record<string, string[]>>({});
   const [custom, setCustom] = useState<Record<string, string>>({});
   const [otherOn, setOtherOn] = useState<Record<string, boolean>>({});
-  const [answered, setAnswered] = useState<"allowed" | "denied" | null>(null);
+  const [answered, setAnswered] = useState<"allowed" | "denied" | "discuss" | null>(null);
   const [open, setOpen] = useState(false); // re-expand an answered (collapsed) card
   const questions = (Array.isArray((data.input as { questions?: unknown }).questions)
     ? (data.input as { questions: AgentQuestion[] }).questions
@@ -377,7 +378,7 @@ function QuestionCard({ data }: { data: PermissionRequestData }) {
             {questions.length === 1 ? questions[0].question : `${questions.length} questions`}
           </span>
         )}
-        {answered && <span className="cd-perm-verdict">{answered === "allowed" ? "answered" : "skipped"}</span>}
+        {answered && <span className="cd-perm-verdict">{answered === "allowed" ? "answered" : answered === "discuss" ? "discussing" : "skipped"}</span>}
         {answered && <span className={"cd-tool-chev" + (open ? " open" : "")}><Icon name="chevronD" size={13} /></span>}
       </button>
       {!collapsed && questions.map((q) => (
@@ -410,6 +411,7 @@ function QuestionCard({ data }: { data: PermissionRequestData }) {
       ))}
       {!answered && (
         <div className="cd-perm-actions">
+          <button className="cd-perm-btn deny" title="Ask the agent to explain each option in chat instead" onClick={() => { setAnswered("discuss"); void denyPermission(data, "The user wants to discuss before choosing. Do NOT call AskUserQuestion again — explain each option in plain text (pros, cons, trade-offs), give a recommendation, and wait for the user's reply in chat."); }}>Discuss</button>
           <button className="cd-perm-btn deny" onClick={() => { setAnswered("denied"); void denyPermission(data, "User skipped the question — proceed with your best judgment."); }}>Skip</button>
           {needsSubmit && (
             <button className="cd-perm-btn allow" disabled={!complete} onClick={() => submit(picked)}>Answer</button>
@@ -529,7 +531,10 @@ function renderNodes(nodes: Node[], streaming: boolean, keyBase: string, chatId?
   return out;
 }
 
-export function AssistantMessage({ message, streaming, onApprovePlan, chatId }: { message: UIMessage; streaming: boolean; onApprovePlan?: () => void; chatId?: string }) {
+// Memoized: while a turn streams, the screen re-renders every ~50ms — historic messages keep
+// their object identity across those updates, so memo skips re-deriving their nodes (diff rows,
+// markdown trees) and only the live streaming message pays the recompute.
+export const AssistantMessage = memo(function AssistantMessage({ message, streaming, onApprovePlan, chatId }: { message: UIMessage; streaming: boolean; onApprovePlan?: () => void; chatId?: string }) {
   const nodes = toNodes(message.parts, streaming);
   if (!nodes.length) return null;
 
@@ -555,4 +560,4 @@ export function AssistantMessage({ message, streaming, onApprovePlan, chatId }: 
       {renderNodes(final, false, `${message.id}-f`)}
     </>
   );
-}
+});

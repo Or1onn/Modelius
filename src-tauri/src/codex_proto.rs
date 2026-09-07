@@ -8,8 +8,9 @@ use serde_json::json;
 
 // Modelius permission mode → codex-native (approvalPolicy, thread/start sandbox mode,
 // turn/start SandboxPolicy object). No Claude emulation: plan explores read-only and surfaces
-// escalations as approval cards; default/acceptEdits auto-allow workspace writes via the sandbox
-// (escalations still ask); bypass = codex's own danger-full-access + never.
+// escalations as approval cards; default/acceptEdits/auto auto-allow workspace writes via the
+// sandbox (escalations still ask — under "auto" the app answers the safe ones itself, see
+// features/run-agent/lib/autoApprove.ts); bypass = codex's own danger-full-access + never.
 pub(crate) fn codex_mode(mode: &str) -> (&'static str, &'static str, serde_json::Value) {
     match mode {
         "plan" => ("on-request", "read-only", json!({ "type": "readOnly" })),
@@ -54,15 +55,18 @@ pub(crate) fn thread_open_line(id: u64, resume: Option<&str>, model: &str, cwd: 
 // switch free (the codex analog of claude's set_permission_mode), and effort changes never respawn.
 // Attached images ride the `input` array as `{type:"image", image_url}` items with an inline data
 // URL — the app-server InputItem shape (remote HTTP urls are rejected; a data URL is accepted).
-pub(crate) fn turn_start_line(id: u64, thread_id: &str, text: &str, images: &[crate::agent::ImageInput], model: &str, effort: &str, mode: &str) -> String {
+// Its variants are text/image/localImage/audio/localAudio/skill/mention — there is no document
+// item, so non-image attachments never reach here (agent.rs spill_unsupported turns them into
+// temp-file paths in the prompt).
+pub(crate) fn turn_start_line(id: u64, thread_id: &str, text: &str, attachments: &[crate::agent::AttachmentInput], model: &str, effort: &str, mode: &str) -> String {
     let (approval, _, sandbox_policy) = codex_mode(mode);
     let mut input = Vec::new();
-    // Omit an empty text item when an image carries the turn; keep it otherwise so input is never empty.
-    if !text.is_empty() || images.is_empty() {
-        input.push(json!({ "type": "text", "text": text }));
+    for at in attachments.iter().filter(|a| a.mime.starts_with("image/")) {
+        input.push(json!({ "type": "image", "image_url": format!("data:{};base64,{}", at.mime, at.data) }));
     }
-    for im in images {
-        input.push(json!({ "type": "image", "image_url": format!("data:{};base64,{}", im.mime, im.data) }));
+    // Omit an empty text item when an image carries the turn; keep it otherwise so input is never empty.
+    if !text.is_empty() || input.is_empty() {
+        input.insert(0, json!({ "type": "text", "text": text }));
     }
     let mut params = json!({
         "threadId": thread_id,
@@ -225,7 +229,7 @@ mod tests {
 
     #[test]
     fn turn_start_appends_image_items_as_data_urls() {
-        let imgs = [crate::agent::ImageInput { mime: "image/png".into(), data: "QUJD".into() }];
+        let imgs = [crate::agent::AttachmentInput { mime: "image/png".into(), data: "QUJD".into(), name: None }];
         let v: serde_json::Value =
             serde_json::from_str(&turn_start_line(5, "t-1", "look", &imgs, "", "", "default")).unwrap();
         assert_eq!(
